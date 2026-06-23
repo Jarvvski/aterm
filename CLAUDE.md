@@ -70,7 +70,7 @@ The owner uses **Jujutsu exclusively** in a colocated repo. **Never invoke `git`
 
 **Versioning & changelog.** The version of record is `[workspace.package].version` in the root `Cargo.toml`. Semver: PATCH for fixes, MINOR otherwise; **never bump to 1.0.0 (or any MAJOR) without the owner's explicit approval - do not auto-bump.** A user-visible change adds a dated `CHANGELOG.md` entry (newest first) in the same commit; skip pure internal refactors. Push with `jj git push --bookmark main` (`--allow-new` the first time a bookmark is pushed).
 
-Remote: `origin` = `https://github.com/Jarvvski/aterm`. `gh` auto-detection fails in jj workspaces - always pass `-R Jarvvski/aterm`.
+Remote: `origin` = `Jarvvski/aterm` (SSH: `git@github.com:Jarvvski/aterm.git` - SSH avoids the OAuth `workflow`-scope gate on pushing `.github/workflows/`). `gh` auto-detection fails in jj workspaces - always pass `-R Jarvvski/aterm`.
 
 ## Testing conventions
 
