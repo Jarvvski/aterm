@@ -11,11 +11,14 @@
 pub mod app;
 pub mod fonts;
 pub mod gpu;
+pub mod present;
 pub mod renderer;
 pub mod widgets;
+pub mod window;
 
 pub use app::{run, AtermApp, HeadlessCallbacks, UiCallbacks};
 pub use gpu::GpuRenderer;
+pub use present::{FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
 pub use renderer::{Frame, RenderError, Renderer};
 
 // Re-export the winit key types the host app needs for input routing.

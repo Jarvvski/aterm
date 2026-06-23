@@ -9,6 +9,19 @@ until the owner explicitly approves it - never auto-bump. The version of record 
 `[workspace.package].version` in the root `Cargo.toml`. New entries go on top, under
 the next version (or an `## Unreleased` heading until a version is cut).
 
+## Unreleased
+
+### Changed
+
+- **Frame pacing (render loop).** The window now presents on a keep-warm schedule
+  instead of a continuous redraw spin: after any activity (a keystroke, a resize, or
+  newly published shell output) it presents every vsync - `Fifo`-locked to the panel
+  refresh - for ~1s, then idles to **zero drawn frames** until the next activity.
+  Idle CPU drops to ~0, and the pacing is driven by a pure, unit-tested keep-warm
+  scheduler (ticket T-1.5). The precise self-bridged `CADisplayLink` vsync source the
+  60fps floor targets is layered on behind a seam (opt-in, validated on ProMotion
+  hardware).
+
 ## 0.1.0 - 2026-06-23
 
 ### Added

@@ -2,12 +2,28 @@
 //! renderer, and runs the event loop. This is the UI crate's runnable surface;
 //! `aterm-app` reuses it and feeds the terminal snapshot + input through the
 //! [`UiCallbacks`] seam.
+//!
+//! ## Frame pacing (ticket T-1.5)
+//!
+//! The loop is driven by the [`PresentScheduler`] keep-warm state machine, not a
+//! free-running spin. After any activity (a keystroke, a resize, or a newly
+//! published grid snapshot) we present every vsync for ~1s; the surface present
+//! mode is `Fifo`, so each present blocks until the display's vsync and the redraw
+//! cadence is paced to the panel refresh with no busy loop. Once activity has been
+//! quiet for the keep-warm window we stop drawing entirely (`decide` → `Idle`) and
+//! drop to a coarse idle wake that draws zero frames until the next activity or a
+//! freshly published snapshot - the "idle to zero frames" requirement.
+//!
+//! The *precise ProMotion vsync source* the locked decision calls for - a
+//! self-bridged `CADisplayLink` - is layered on top of this in the macOS interop
+//! module (ticket T-1.5, second change) behind a seam; this default winit-driven
+//! loop is the portable, fully-reasoned baseline it refines.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -16,7 +32,22 @@ use aterm_core::Snapshot;
 use aterm_tokens::{Theme, ThemeKind};
 
 use crate::gpu::GpuRenderer;
+use crate::present::PresentScheduler;
 use crate::renderer::{Frame, Renderer};
+use crate::window::{grid_dims, window_attributes};
+
+/// Anti-busy-spin wake floor while warm. Shorter than a 120Hz frame (8.3ms) so we
+/// never under-shoot a vsync, but long enough that an occluded window (whose
+/// present does not block) cannot spin a CPU. The real cadence while warm is set
+/// by the `Fifo` present blocking on vsync, not by this timer.
+const WARM_WAKE: Duration = Duration::from_millis(4);
+
+/// Idle wake interval. Once the keep-warm window has elapsed we draw nothing, but
+/// poll the published snapshot version this coarsely so output produced while idle
+/// (a background process printing with no recent input) still appears within a
+/// beat. Drawn frames stay at zero while idle; this is a few cheap version reads a
+/// second, not a render. A true model→render wake mailbox is a clean follow-up.
+const IDLE_WAKE: Duration = Duration::from_millis(100);
 
 /// Hooks the host app implements to drive the UI. All are optional-ish: the UI
 /// crate can run standalone with a no-op implementation ([`HeadlessCallbacks`]).
@@ -27,6 +58,14 @@ pub trait UiCallbacks {
     /// Provide the terminal snapshot to draw this frame (or `None` to just clear).
     fn snapshot(&mut self) -> Option<Snapshot> {
         None
+    }
+
+    /// The version of the latest published snapshot, read *cheaply* (no grid
+    /// clone). The pacing loop calls this every wake to detect new output and
+    /// (re)arm keep-warm without paying for a full [`Self::snapshot`] when it is
+    /// only going to idle. Defaults to 0 (a host with no engine never advances).
+    fn snapshot_version(&mut self) -> u64 {
+        0
     }
 
     /// A key was pressed; return bytes to forward to the PTY (Shell mode), if any.
@@ -43,13 +82,15 @@ pub trait UiCallbacks {
 pub struct HeadlessCallbacks;
 impl UiCallbacks for HeadlessCallbacks {}
 
-/// The application: owns the window, renderer, theme, and host callbacks.
+/// The application: owns the window, renderer, theme, host callbacks, and the
+/// keep-warm present scheduler.
 pub struct AtermApp<C: UiCallbacks> {
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
     theme: Theme,
     callbacks: C,
     title: String,
+    scheduler: PresentScheduler,
 }
 
 impl<C: UiCallbacks> AtermApp<C> {
@@ -60,19 +101,12 @@ impl<C: UiCallbacks> AtermApp<C> {
             theme: *Theme::for_kind(theme_kind),
             callbacks,
             title: "aterm".to_string(),
+            scheduler: PresentScheduler::default(),
         }
     }
 
-    /// Approximate the grid cell size for the active grid type style, in physical
-    /// pixels. Used to translate a pixel resize into a cols x rows PTY resize.
-    fn cell_px(&self, scale: f32) -> (f32, f32) {
-        let g = aterm_tokens::type_scale::GRID;
-        // iM Writing Mono advance is ~0.6em; line box = size * line_height.
-        let w = g.size_pt * 0.6 * scale;
-        let h = g.size_pt * g.line_height * scale;
-        (w.max(1.0), h.max(1.0))
-    }
-
+    /// Draw exactly one frame: clear to the canvas color and, if the host has a
+    /// snapshot, the grid text. Called only when the scheduler says to present.
     fn redraw(&mut self) {
         let snapshot = self.callbacks.snapshot();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -85,6 +119,18 @@ impl<C: UiCallbacks> AtermApp<C> {
             }
         }
     }
+
+    /// Set the control flow for the next wait based on the scheduler state: a tight
+    /// guard while warm (cadence is really the `Fifo` vsync), a coarse poll while
+    /// idle (draws nothing, just notices new output). Called from `about_to_wait`.
+    fn schedule_next_wake(&self, event_loop: &ActiveEventLoop, now: Instant) {
+        let interval = if self.scheduler.is_warm(now) {
+            WARM_WAKE
+        } else {
+            IDLE_WAKE
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(now + interval));
+    }
 }
 
 impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
@@ -92,10 +138,7 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title(&self.title)
-            .with_inner_size(LogicalSize::new(960.0, 600.0));
-        let window = match event_loop.create_window(attrs) {
+        let window = match event_loop.create_window(window_attributes(&self.title)) {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 log::error!("failed to create window: {e}");
@@ -112,6 +155,9 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
             }
         }
         self.callbacks.on_ready(window.clone());
+        // Window creation is activity: arm keep-warm so the first ~1s presents
+        // (the window paints immediately and holds the refresh rate on open).
+        self.scheduler.note_activity(Instant::now());
         window.request_redraw();
         self.window = Some(window);
     }
@@ -128,11 +174,11 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     .as_ref()
                     .map(|w| w.scale_factor() as f32)
                     .unwrap_or(1.0);
-                let (cw, ch) = self.cell_px(scale);
-                let cols = ((size.width as f32) / cw).floor().max(1.0) as u16;
-                let rows = ((size.height as f32) / ch).floor().max(1.0) as u16;
+                let (cols, rows) = grid_dims(size.width, size.height, scale);
                 self.callbacks
                     .on_resize(cols, rows, size.width, size.height);
+                // A resize is activity: re-arm and repaint promptly.
+                self.scheduler.note_activity(Instant::now());
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();
                 }
@@ -151,32 +197,53 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     Key::Named(n) => Some(*n),
                     _ => None,
                 };
-                if named == Some(NamedKey::Escape) {
-                    // Esc closes for the scaffold; the app overrides this to
-                    // toggle modes once input routing is wired.
-                }
                 let txt = text.as_ref().map(|t| t.as_str());
                 if let Some(bytes) = self.callbacks.on_key(txt, named) {
                     // Forwarding happens inside the callback (it owns the PTY);
                     // the returned bytes let a headless host observe input.
                     let _ = bytes;
                 }
+                // A keystroke is activity: re-arm keep-warm and repaint.
+                self.scheduler.note_activity(Instant::now());
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();
                 }
             }
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                // Cheaply notice newly published output and (re)arm keep-warm
+                // before deciding - so a frame produced by the model thread keeps
+                // the panel warm without a keystroke.
+                let version = self.callbacks.snapshot_version();
+                self.scheduler.observe_version(version, now);
+                // Only pay for the snapshot clone + GPU work when actually warm.
+                if self.scheduler.decide(now).is_present() {
+                    self.redraw();
+                }
+            }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Continuous redraw keeps the frame cadence; a real build gates this on
-        // PTY activity + a DisplayLink to honor the 60fps floor without spinning.
-        // TODO(ticket EPIC-1.5): drive redraws off a CVDisplayLink, not a spin.
-        if let Some(w) = self.window.as_ref() {
-            w.request_redraw();
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        // Our scheduled wake elapsed (warm guard or idle poll): ask for a redraw so
+        // `RedrawRequested` re-evaluates the scheduler. `Poll` is included for
+        // completeness if a host ever forces it; `Wait`/`WaitCancelled` (woken by
+        // input or OS) already drive their own redraws from `window_event`.
+        if matches!(
+            cause,
+            StartCause::ResumeTimeReached { .. } | StartCause::Poll
+        ) {
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Pick the next wake from the scheduler state. Rendering is NOT driven from
+        // here (winit warns against it) - only the control-flow cadence is.
+        self.schedule_next_wake(event_loop, Instant::now());
     }
 }
 
@@ -187,7 +254,9 @@ pub fn run<C: UiCallbacks>(
     callbacks: C,
 ) -> Result<(), winit::error::EventLoopError> {
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Start in `Wait`; the scheduler arms a `WaitUntil` cadence from `resumed`
+    // onward. (Idle floor: when nothing is happening the loop truly sleeps.)
+    event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = AtermApp::new(theme_kind, callbacks);
     event_loop.run_app(&mut app)
 }

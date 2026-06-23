@@ -83,12 +83,19 @@ impl UiCallbacks for Session {
         self.window = Some(window);
     }
 
+    fn snapshot_version(&mut self) -> u64 {
+        // Cheap: an Arc clone under a short lock, then a field read. The pacing
+        // loop calls this every wake to detect new output before deciding whether
+        // to pay for the full grid clone in `snapshot`.
+        self.engine.latest_snapshot().version
+    }
+
     fn snapshot(&mut self) -> Option<Snapshot> {
         self.drain_terminal_events();
         // The engine's model thread owns the parse loop; here we just read the
         // latest published snapshot. Cloning out of the `Arc` satisfies the
-        // current owned-`Option<Snapshot>` callback contract; ticket T-1.5 will
-        // change the renderer to hold the `Arc` directly (no per-frame clone).
+        // current owned-`Option<Snapshot>` callback contract; a later change can
+        // hand the renderer the `Arc` directly to drop this per-frame clone.
         Some((*self.engine.latest_snapshot()).clone())
     }
 
