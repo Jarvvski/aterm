@@ -40,3 +40,25 @@ Spawn a hidden login shell on a PTY in `aterm-core`, with a clean owned API for 
 - The reader thread + channels (T-1.3).
 - Shell-integration env injection (T-2.2).
 - Signal-to-foreground-pgroup and PtyWrite reply (T-1.9).
+
+# Notes
+
+2026-06-23 (agent): Landed. `aterm-core::pty` is now the owned facade the ticket
+specifies - `spawn(program, args, dims, env)` (env is the T-2.2 hook, applied over
+`TERM`/`ATERM` defaults), `spawn_login_shell` (login default + config seam),
+`resize`, `take_writer`/`try_clone_reader`, child accessors
+`process_id`/`try_wait`/`wait`/`kill`/`clone_killer`, and `master_fd()` retained via
+`as_raw_fd` for T-1.9. The baked-in reader thread the scaffold had was removed (it
+is T-1.3 scope); a clearly-marked stopgap reader now lives in `aterm-app::session`.
+Five `#[cfg(unix)]` integration tests cover the four acceptance criteria.
+
+Two changes beyond the literal AC, driven by an adversarial review: (1) added an
+`impl Drop for Pty` doing best-effort `kill` + `wait`, because a spawned shell is a
+session leader and `std::process::Child` does not reap on drop - without it a
+dropped `Pty` would orphan the shell and leak a zombie, contradicting the ticket
+goal's "reaping the child"; covered by `drop_terminates_child`. (2) deleted the
+scaffold's `pty::channel()` and moved `crossbeam-channel` to `aterm-core`
+dev-dependencies - the public ctor leaked T-1.3's channel concern into core and,
+being *unbounded*, contradicted the bounded-backpressure decision in ADR-0010. No
+version bump / CHANGELOG entry: internal engine API, no user-visible behaviour
+change.

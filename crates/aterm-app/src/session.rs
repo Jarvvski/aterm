@@ -9,6 +9,7 @@
 //! session, and (3) an agent runtime thread (not spawned in the scaffold).
 //! TODO(ticket EPIC-1.3): formalize the agent thread + a coalescing pump.
 
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
@@ -23,6 +24,9 @@ use aterm_core::{InputEvent, InputModel, InputOutcome};
 /// One terminal session.
 pub struct Session {
     pty: Pty,
+    /// The child's stdin (taken once from the pty master). Shell-mode keystrokes
+    /// are written here; the model thread (T-1.3) will eventually own this.
+    writer: Box<dyn Write + Send>,
     pty_rx: Receiver<PtyEvent>,
     terminal: Terminal,
     osc: OscScanner,
@@ -43,10 +47,46 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let (tx, rx) = aterm_core::pty::channel();
-        let pty = Pty::spawn_login_shell(dims, tx)?;
+        let pty = Pty::spawn_login_shell(dims)?;
+        let writer = pty.take_writer()?;
+        // Stopgap reader thread: drains the pty master into a channel the model
+        // side drains each frame. T-1.1 deliberately keeps `Pty` thread-free; the
+        // bounded reader/model/render split is ticket T-1.3, which replaces this.
+        // TODO(T-1.3): replace with the bounded reader thread + coalescing pump.
+        // T-1.3 owns the channel + its (bounded) backpressure contract, so the
+        // stopgap builds an unbounded channel locally rather than via a core API.
+        let (tx, rx) = crossbeam_channel::unbounded::<PtyEvent>();
+        let mut reader = pty.try_clone_reader()?;
+        std::thread::Builder::new()
+            .name("aterm-pty-reader".into())
+            .spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = tx.send(PtyEvent::Exited);
+                            break;
+                        }
+                        Ok(n) => {
+                            if tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
+                                break; // receiver gone
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            // An I/O fault on the master is not a clean exit; log it
+                            // so it is not silently conflated with a normal EOF.
+                            log::warn!("pty reader error: {e}");
+                            let _ = tx.send(PtyEvent::Exited);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(aterm_core::PtyError::Io)?;
         Ok(Self {
             pty,
+            writer,
             pty_rx: rx,
             terminal: Terminal::new(rows as usize, cols as usize),
             osc: OscScanner::untrusted(),
@@ -91,7 +131,11 @@ impl Session {
     fn route_outcome(&mut self, outcome: InputOutcome) {
         match outcome {
             InputOutcome::ToPty(bytes) => {
-                if let Err(e) = self.pty.write(&bytes) {
+                if let Err(e) = self
+                    .writer
+                    .write_all(&bytes)
+                    .and_then(|()| self.writer.flush())
+                {
                     log::warn!("pty write failed: {e}");
                 }
             }
@@ -149,8 +193,10 @@ impl UiCallbacks for Session {
         let _ = self.pty.resize(PtyDimensions {
             cols,
             rows,
-            pixel_width: width as u16,
-            pixel_height: height as u16,
+            // Pixel dims are advisory (TIOCSWINSZ ws_xpixel/ypixel); clamp rather
+            // than silently wrap if a surface somehow exceeds u16.
+            pixel_width: u16::try_from(width).unwrap_or(u16::MAX),
+            pixel_height: u16::try_from(height).unwrap_or(u16::MAX),
         });
     }
 }
