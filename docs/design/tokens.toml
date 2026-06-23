@@ -1,0 +1,188 @@
+# aterm design tokens — machine-readable mirror of docs/design/design-system.md
+#
+# The aterm-tokens crate reifies this file as typed Rust constants (leaf crate,
+# no internal deps). Values here MUST stay identical to design-system.md; that
+# doc owns intent, this file owns values.
+#
+# Derived from 07-ia-design-language.md (iA visual language) and
+# 08-text-glyph-rendering.md (text pipeline). Two themes ship day one:
+# "paper" light + dark, from one hue family so ANSI output and UI never clash.
+#
+# OWNER CONFIRMATION REQUIRED: accent.primary (#1A93E8 light / #4DA6F0 dark) is
+# DERIVED and WCAG-checked, NOT sampled from the live iA Writer app. All
+# contrast ratios are computed estimates; re-validate against final hexes with a
+# real WCAG library before locking.
+
+schema_version = 1
+
+# ---------------------------------------------------------------------------
+# Fonts. Mono NFM for the grid (constant advance, mandatory). Duo/Quattro are
+# proportional and are NOT yet vendored (prior prototype shipped Mono only);
+# until added, prose/ui fall back to the platform proportional UI face.
+# ---------------------------------------------------------------------------
+[font]
+grid  = "iM Writing Mono Nerd Font Mono"   # terminal grid: input echo, output, code, diffs
+prose = "iM Writing Duo"                    # agent prose / transcript body
+ui    = "iM Writing Quattro"                # dense chrome: status strip, chips, palette
+fallback_proportional = "system-ui"         # used until Duo/Quattro are bundled
+weight_regular  = 400
+weight_medium   = 500
+weight_semibold = 600
+weight_bold     = 700
+
+# ---------------------------------------------------------------------------
+# Type scale. size_pt = logical points (renderer scales by backing factor).
+# line_height = unitless multiplier. measure_ch caps prose width (grid uncapped).
+# ---------------------------------------------------------------------------
+[type]
+measure_ch = 72   # iA middle line-length option (64/72/80); prose only, never the grid
+
+[type.grid]
+size_pt = 13.0
+line_height = 1.30
+font = "grid"
+
+[type.body]
+size_pt = 14.0
+line_height = 1.50
+font = "prose"
+
+[type.heading]
+size_pt = 16.0
+line_height = 1.35
+font = "prose"
+weight = 500
+
+[type.label]
+size_pt = 11.0
+line_height = 1.30
+font = "ui"
+
+[type.caption]
+size_pt = 10.5
+line_height = 1.30
+font = "ui"
+
+# ---------------------------------------------------------------------------
+# Semantic colors — light "paper". sRGB hex.
+# ---------------------------------------------------------------------------
+[color.light]
+bg_canvas           = "#FAF9F6"
+bg_surface          = "#F1F0EC"
+bg_surface_alt      = "#E9E7E1"
+fg_primary          = "#2A2A28"
+fg_secondary        = "#5C5B57"
+fg_muted            = "#8A8984"
+fg_faint            = "#B5B4AE"
+accent_primary      = "#1A93E8"   # DERIVED — owner confirm
+accent_primary_text = "#1577C2"   # accent for small body text (AA on canvas)
+accent_primary_weak = "#D6EAFB"
+hairline            = "#E0DED8"
+hairline_strong     = "#C9C7C0"
+selection_bg        = "#CFE3F7"
+success             = "#1E8E5A"
+caution             = "#B0820E"
+danger              = "#C2185B"
+info                = "#1A93E8"   # = accent_primary (one blue, reused)
+
+# ---------------------------------------------------------------------------
+# Semantic colors — dark. sRGB hex.
+# ---------------------------------------------------------------------------
+[color.dark]
+bg_canvas           = "#1C1C1C"
+bg_surface          = "#262626"
+bg_surface_alt      = "#303030"
+fg_primary          = "#E6E5E1"
+fg_secondary        = "#B8B7B2"
+fg_muted            = "#7A7A75"
+fg_faint            = "#4A4A46"
+accent_primary      = "#4DA6F0"   # DERIVED — owner confirm
+accent_primary_text = "#4DA6F0"   # same as accent_primary (AA body on dark canvas)
+accent_primary_weak = "#1E3A52"
+hairline            = "#343433"
+hairline_strong     = "#454544"
+selection_bg        = "#34465A"
+success             = "#5FD7A7"
+caution             = "#E0B341"
+danger              = "#E85A95"
+info                = "#4DA6F0"
+
+# ---------------------------------------------------------------------------
+# ANSI 16-color palette — light "paper". Index 0..15.
+# On light bg, index 7 (white) is dark text, index 0 (black) is darkest.
+# ---------------------------------------------------------------------------
+[ansi.light]
+black          = "#2A2A28"
+red            = "#C30771"
+green          = "#10A778"
+yellow         = "#A8800E"
+blue           = "#1A6FB0"
+magenta        = "#7C3F9E"
+cyan           = "#138D9E"
+white          = "#5C5B57"
+bright_black   = "#5C5B57"
+bright_red     = "#E0306F"
+bright_green   = "#1EB886"
+bright_yellow  = "#C39A14"
+bright_blue    = "#1A93E8"
+bright_magenta = "#9B5BC0"
+bright_cyan    = "#20A5BA"
+bright_white   = "#2A2A28"
+
+# ---------------------------------------------------------------------------
+# ANSI 16-color palette — dark. Index 0..15.
+# ---------------------------------------------------------------------------
+[ansi.dark]
+black          = "#1C1C1C"
+red            = "#E85A95"
+green          = "#5FD7A7"
+yellow         = "#E0B341"
+blue           = "#4DA6F0"
+magenta        = "#B893BE"
+cyan           = "#4FB8CC"
+white          = "#E6E5E1"
+bright_black   = "#5A5A55"
+bright_red     = "#F277A8"
+bright_green   = "#7DE6BC"
+bright_yellow  = "#F3E430"
+bright_blue    = "#74BFF7"
+bright_magenta = "#CBAAD0"
+bright_cyan    = "#6FCFE0"
+bright_white   = "#FFFFFF"
+
+# ---------------------------------------------------------------------------
+# Spacing scale (px, 4px base) + radii. Borders are hairline (1px), never >=2px.
+# ---------------------------------------------------------------------------
+[space]
+s0  = 0
+s1  = 4    # inline gaps (chip padding)
+s2  = 8    # label-to-value, icon-to-text
+s3  = 12   # intra-block padding
+s4  = 16   # block content padding / horizontal gutter
+s6  = 24   # between blocks (vertical rhythm)
+s8  = 32   # section breaks, agent-card outer margin
+s12 = 48   # top/bottom canvas breathing room
+radius_sm = 4   # chips, badges
+radius_md = 6   # agent card
+hairline_width = 1
+
+# ---------------------------------------------------------------------------
+# Motion. Durations in ms. <=3 animation kinds, all <=220ms, decelerate easing.
+# Must never threaten the 60fps floor (120fps ProMotion).
+# ---------------------------------------------------------------------------
+[motion]
+fast = 90    # gate badge cross-fade, routing-chip toggle
+base = 140   # block insert (fade + 4px rise)
+slow = 220   # focus-mode dim ramp
+easing = "cubic-bezier(0.2, 0, 0, 1)"
+
+# ---------------------------------------------------------------------------
+# Caret. Default = thin blue bar; honor DECSCUSR block/underline in raw apps.
+# ---------------------------------------------------------------------------
+[caret]
+default_style = "bar"          # bar | block | underline
+bar_width_px = 2
+color = "accent_primary"        # token name, resolved per theme
+block_opacity = 0.70            # block caret fill; glyph drawn in bg_canvas (inverse)
+blink_soft = true               # opacity ramp, not hard toggle
+blink_suppress_while_typing = true

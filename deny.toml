@@ -1,0 +1,47 @@
+# cargo-deny configuration — the GPUI-contamination / license guard.
+#
+# aterm is GPL-3.0-or-later. The point of this file is to catch an accidental
+# AGPL-3.0 (or otherwise GPL-incompatible) transitive dependency creeping in -
+# e.g. a GPUI fork - before it can taint the license story. Run with
+# `cargo deny check licenses` (not run in CI by default; it may be uninstalled).
+
+[licenses]
+# Permissive + the copyleft licenses we are compatible with.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Zlib",
+    "CC0-1.0",
+    "GPL-3.0",
+    "GPL-3.0-or-later",
+]
+# Anything not in `allow` is denied. The licenses that MUST stay out (and would
+# otherwise be the contamination risk) are AGPL and bare GPL-2.0-only:
+#   AGPL-3.0, AGPL-3.0-only, AGPL-3.0-or-later, GPL-2.0-only
+# They are simply absent from `allow`, so they are rejected.
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# The bundled iA / iM Writing faces are OFL-1.1 (already allowed); listed here to
+# document intent if a stricter policy is layered on later.
+allow = ["OFL-1.1"]
+name = "aterm-ui"
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

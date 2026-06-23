@@ -1,0 +1,33 @@
+# mise — runtime + task runner for aterm.
+# Install mise (https://mise.jdx.dev), then `mise install` to pin the toolchain.
+
+[tools]
+rust = "1.96"
+
+[tasks.run]
+description = "Run the aterm binary"
+run = "cargo run -p aterm-app"
+
+[tasks.build]
+description = "Build the whole workspace"
+run = "cargo build --workspace"
+
+[tasks.check]
+description = "Type-check the whole workspace"
+run = "cargo check --workspace"
+
+[tasks.test]
+description = "Run all workspace tests"
+run = "cargo test --workspace"
+
+[tasks.fmt]
+description = "Format all code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Clippy across all targets"
+run = "cargo clippy --workspace --all-targets"
+
+[tasks.bench]
+description = "Run the criterion benches"
+run = "cargo bench -p aterm-bench"

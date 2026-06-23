@@ -1,0 +1,40 @@
+//! The renderer SEAM. `Renderer` is the swappable interface the app calls once
+//! per frame; the wgpu implementation lives in [`crate::gpu`]. Keeping this a
+//! trait means a future software/test renderer (or a different GPU backend) can
+//! drop in without touching the app's frame loop, and keeps the 60fps fast-path
+//! behind a stable surface.
+
+use aterm_core::Snapshot;
+use aterm_tokens::Theme;
+
+/// Errors a renderer can surface during a frame.
+#[derive(Debug, thiserror::Error)]
+pub enum RenderError {
+    #[error("surface lost or outdated; reconfigure needed")]
+    SurfaceLost,
+    #[error("surface out of memory")]
+    OutOfMemory,
+    #[error("render backend error: {0}")]
+    Backend(String),
+}
+
+/// One frame's worth of input to the renderer.
+///
+/// For the scaffold the only required content is the active theme (used for the
+/// clear color). The terminal grid `snapshot` is optional: when present and the
+/// renderer has a text fast-path, it is drawn; otherwise it is ignored (the
+/// window still clears to the paper background).
+pub struct Frame<'a> {
+    pub theme: &'a Theme,
+    pub snapshot: Option<&'a Snapshot>,
+}
+
+/// The swappable renderer seam.
+pub trait Renderer {
+    /// React to a window resize (reconfigure the surface / viewport).
+    fn resize(&mut self, width: u32, height: u32);
+
+    /// Render exactly one frame. Must clear to `frame.theme`'s canvas color even
+    /// when there is nothing else to draw.
+    fn render(&mut self, frame: Frame<'_>) -> Result<(), RenderError>;
+}

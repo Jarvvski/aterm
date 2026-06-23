@@ -1,0 +1,20 @@
+[package]
+name = "aterm-agent"
+description = "aterm agent: LlmProvider trait, risk gate, secrets, sanitizer, sandbox, turn loop."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aterm-core.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

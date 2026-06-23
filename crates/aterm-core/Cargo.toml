@@ -1,0 +1,19 @@
+[package]
+name = "aterm-core"
+description = "aterm engine: PTY, VT/grid, block model, OSC-133/OSC-7 marks. No UI, no LLM."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+portable-pty.workspace = true
+alacritty_terminal.workspace = true
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+log.workspace = true

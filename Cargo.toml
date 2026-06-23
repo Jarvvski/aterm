@@ -1,0 +1,74 @@
+# aterm — native macOS GPU terminal. Virtual workspace manifest.
+#
+# Dependency direction (NO cycles):
+#   app -> {ui, agent}
+#   ui  -> {core, tokens}
+#   agent -> core
+#   bench -> {core}
+#
+# resolver = "2" is mandatory for the wgpu/winit feature-unification story.
+[workspace]
+resolver = "2"
+members = [
+    "crates/aterm-core",
+    "crates/aterm-tokens",
+    "crates/aterm-agent",
+    "crates/aterm-ui",
+    "crates/aterm-app",
+    "crates/aterm-bench",
+]
+
+# Shared package metadata. Each crate sets `xxx.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["aterm contributors"]
+repository = "https://github.com/aterm/aterm"
+rust-version = "1.96"
+
+# Centralized external dependency versions. Crates opt in with
+# `dep.workspace = true` (plus per-crate features where they differ).
+# Caret ranges; cargo resolves the latest compatible patch.
+[workspace.dependencies]
+# --- core: pty + vt ---
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+# --- async + http (agent; no network calls yet) ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# --- errors ---
+thiserror = "2"
+anyhow = "1"
+# --- channels ---
+crossbeam-channel = "0.5"
+# --- ui: window + gpu ---
+# winit 0.30 + wgpu 29 + glyphon 0.11 are a mutually-aligned trio (glyphon 0.11
+# pins wgpu 29; wgpu 29 targets winit 0.30). This is the #1 alignment to keep.
+winit = "0.30"
+wgpu = "29"
+glyphon = "0.11"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+# --- logging ---
+log = "0.4"
+env_logger = "0.11"
+# --- internal crates ---
+aterm-core = { path = "crates/aterm-core" }
+aterm-tokens = { path = "crates/aterm-tokens" }
+aterm-agent = { path = "crates/aterm-agent" }
+aterm-ui = { path = "crates/aterm-ui" }
+
+# Workspace-wide lints. Crates opt in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+# Thin release profile knobs (perf-oriented; 60fps floor is the headline NFR).
+[profile.release]
+lto = "thin"
+codegen-units = 1

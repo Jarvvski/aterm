@@ -1,0 +1,23 @@
+[package]
+name = "aterm-ui"
+description = "aterm renderer seam: winit window, wgpu device/surface, Renderer trait, widgets."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aterm-core.workspace = true
+aterm-tokens.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+thiserror.workspace = true
