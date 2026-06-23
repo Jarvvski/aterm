@@ -7,6 +7,7 @@
 //! ([`input`]). Everything above (rendering, agent) consumes these types.
 
 pub mod block;
+pub mod engine;
 pub mod input;
 pub mod osc;
 pub mod pty;
@@ -15,6 +16,7 @@ pub mod terminal;
 
 // Re-export the load-bearing public types at the crate root for ergonomics.
 pub use block::{Block, BlockList, BlockSegmenter, OutputSpan};
+pub use engine::{Engine, EngineMetrics, ToModel};
 pub use input::{InputEvent, InputMode, InputModel, InputOutcome};
 pub use osc::{Mark, OscScanner, PromptKind, ScanResult};
 pub use pty::{Pty, PtyDimensions, PtyError, PtyEvent};

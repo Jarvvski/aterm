@@ -35,6 +35,15 @@ use crossbeam_channel::{Receiver, Sender};
 /// dossier; surfaced as a config knob via [`Terminal::with_scrollback`].
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
 
+/// Bound on the VT window-event channel (title/bell/clipboard/`PtyWrite`/...). The
+/// channel is drained by the app at frame rate, but the VT engine *produces* into
+/// it synchronously on the model thread while parsing, so an adversarial child (a
+/// tight `\x1b[6n` DSR or bell loop) could otherwise enqueue events without bound.
+/// A bounded channel plus drop-on-full (see [`ChannelListener::send_event`]) keeps
+/// engine memory bounded by construction (ticket T-1.3). Generous enough that a
+/// legitimate burst (a TUI redraw's handful of title/cursor events) never drops.
+pub(crate) const EVENT_CHANNEL_CAP: usize = 1_024;
+
 /// Color of a cell as resolved by the VT engine, in a renderer-neutral form.
 ///
 /// We deliberately keep alacritty's `Color` semantics (named / indexed / true
@@ -105,6 +114,12 @@ pub struct CursorPos {
 /// An immutable snapshot of the visible grid for one frame.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    /// Monotonic publish version, assigned by the engine's model thread on each
+    /// publish (ticket T-1.3) so a consumer can tell two successive snapshots
+    /// apart and detect a missed frame. A snapshot produced by a bare
+    /// [`Terminal::snapshot`] (no engine) is version `0`; the engine stamps
+    /// `1, 2, 3, ...` as it publishes.
+    pub version: u64,
     pub rows: usize,
     pub cols: usize,
     /// Row-major: `cells[row * cols + col]`.
@@ -120,6 +135,24 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// An empty `rows` x `cols` snapshot of blank default cells at version 0.
+    ///
+    /// Used to seed the engine's publish handle before the model thread has
+    /// produced its first real snapshot (ticket T-1.3), so a consumer that polls
+    /// early sees a coherent (blank) grid rather than a sentinel.
+    pub fn empty(rows: usize, cols: usize) -> Self {
+        let (rows, cols) = (rows.max(1), cols.max(1));
+        Self {
+            version: 0,
+            rows,
+            cols,
+            cells: vec![SnapshotCell::default(); rows * cols],
+            cursor: CursorPos::default(),
+            display_offset: 0,
+            alt_screen: false,
+        }
+    }
+
     /// Borrow the cells of `row` (0-based from viewport top).
     pub fn row(&self, row: usize) -> &[SnapshotCell] {
         let start = row * self.cols;
@@ -190,7 +223,8 @@ fn map_event(event: Event) -> Option<TerminalEvent> {
 }
 
 /// The `EventListener` alacritty calls synchronously during parsing; it forwards
-/// mapped events over a channel. Cheap to clone (just clones the `Sender`).
+/// mapped events over a *bounded* channel. Cheap to clone (just clones the
+/// `Sender`).
 #[derive(Clone)]
 struct ChannelListener {
     tx: Sender<TerminalEvent>,
@@ -199,8 +233,18 @@ struct ChannelListener {
 impl EventListener for ChannelListener {
     fn send_event(&self, event: Event) {
         if let Some(ev) = map_event(event) {
-            // The receiver is dropped only on teardown; ignore send errors then.
-            let _ = self.tx.send(ev);
+            // `try_send`, never blocking. This runs synchronously inside the VT
+            // parser on the model thread, which is also the only guaranteed
+            // drainer - so a *blocking* send on a full channel could deadlock the
+            // model thread against itself. Under an adversarial control-sequence
+            // flood (a tight DSR/bell/title loop) we therefore DROP rather than
+            // grow the queue without bound, keeping engine memory bounded by
+            // construction (ticket T-1.3). The forwarded events are latest-wins or
+            // coalescable (Title/Bell/CursorBlink), and `PtyWrite` query replies
+            // degrade gracefully for a child querying faster than we can answer
+            // (the reply path is ticket T-1.9). `Err` (Full or Disconnected) is
+            // the intended drop.
+            let _ = self.tx.try_send(ev);
         }
     }
 }
@@ -246,7 +290,7 @@ impl Terminal {
     pub fn with_scrollback(rows: usize, cols: usize, scrollback: usize) -> Self {
         // alacritty's grid underflows on a 0 dimension; a terminal is at least 1x1.
         let (rows, cols) = (rows.max(1), cols.max(1));
-        let (tx, events_rx) = crossbeam_channel::unbounded();
+        let (tx, events_rx) = crossbeam_channel::bounded(EVENT_CHANNEL_CAP);
         let dims = GridDims { rows, cols };
         let config = Config {
             scrolling_history: scrollback,
@@ -366,6 +410,9 @@ impl Terminal {
             .unwrap_or_default();
 
         Snapshot {
+            // The engine stamps the real publish version (T-1.3); a bare
+            // snapshot has no publish identity, so it is version 0.
+            version: 0,
             rows,
             cols,
             cells,
