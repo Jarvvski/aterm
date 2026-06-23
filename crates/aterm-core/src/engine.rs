@@ -176,7 +176,6 @@ impl Engine {
             osc: OscScanner::untrusted(),
             segmenter: BlockSegmenter::new(),
             blocks: BlockList::new(),
-            stream_offset: 0,
             version: 0,
             latest: Arc::clone(&latest),
             back,
@@ -269,8 +268,6 @@ struct Model {
     osc: OscScanner,
     segmenter: BlockSegmenter,
     blocks: BlockList,
-    /// Running byte offset into the logical output stream (for block spans).
-    stream_offset: usize,
     /// Monotonic publish counter; stamped into each published snapshot.
     version: u64,
     latest: Arc<Mutex<Arc<Snapshot>>>,
@@ -295,17 +292,15 @@ impl Model {
         }
     }
 
-    /// Scan for OSC marks, segment blocks, and feed the passthrough bytes to the
-    /// VT parser. (The real nonce-gated OSC-133/7 *filter* is ticket T-2.1; this
-    /// reuses the existing scanner, relocated here from the app's stopgap so the
-    /// model thread - which owns the `BlockList` - does the segmentation.)
+    /// Scan for OSC marks (nonce-gated, split-sequence-aware - ticket T-2.1),
+    /// segment blocks at each mark's clean-stream offset, and feed the passthrough
+    /// bytes to the VT parser. The scanner owns the cumulative clean-stream
+    /// position, so marks already carry absolute offsets.
     fn process_output(&mut self, bytes: &[u8]) {
         let scan = self.osc.scan(bytes);
-        for mark in &scan.marks {
-            self.segmenter
-                .apply(mark, self.stream_offset, &mut self.blocks);
+        for (offset, mark) in &scan.marks {
+            self.segmenter.apply(mark, *offset, &mut self.blocks);
         }
-        self.stream_offset += scan.passthrough.len();
         self.terminal.feed(&scan.passthrough);
         self.metrics
             .bytes_drained

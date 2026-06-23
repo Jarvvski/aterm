@@ -37,11 +37,14 @@ fn bench_vt_parse(c: &mut Criterion) {
 
 fn bench_osc_scan(c: &mut Criterion) {
     let data = sample_stream();
-    let scanner = OscScanner::untrusted();
     let mut group = c.benchmark_group("osc_scan");
     group.throughput(Throughput::Bytes(data.len() as u64));
     group.bench_function("scan", |b| {
+        // A fresh scanner per iteration: scanning is stateful (it carries a
+        // partial buffer + cumulative clean position), and we want each iteration
+        // to measure the same fixed work.
         b.iter(|| {
+            let mut scanner = OscScanner::untrusted();
             let r = scanner.scan(black_box(&data));
             black_box(r.marks.len())
         });
@@ -51,17 +54,15 @@ fn bench_osc_scan(c: &mut Criterion) {
 
 fn bench_block_segmentation(c: &mut Criterion) {
     let data = sample_stream();
-    let scanner = OscScanner::untrusted();
+    let mut scanner = OscScanner::untrusted();
     let scan = scanner.scan(&data);
     let mut group = c.benchmark_group("block_segmentation");
     group.bench_function("segment", |b| {
         b.iter(|| {
             let mut list = BlockList::new();
             let mut seg = BlockSegmenter::new();
-            let mut offset = 0usize;
-            for mark in &scan.marks {
-                seg.apply(black_box(mark), offset, &mut list);
-                offset += 8;
+            for (offset, mark) in &scan.marks {
+                seg.apply(black_box(mark), *offset, &mut list);
             }
             black_box(list.len())
         });

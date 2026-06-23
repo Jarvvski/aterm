@@ -137,6 +137,11 @@ impl BlockSegmenter {
     /// Apply one mark at byte `offset` in the logical stream, mutating `list`.
     pub fn apply(&mut self, mark: &Mark, offset: usize, list: &mut BlockList) {
         match mark {
+            Mark::CommandLine(_cmd) => {
+                // The decoded command line (OSC 133 `C;cmdline=` / OSC 633 `E`).
+                // Capturing it into `Block.command` is the lifecycle state
+                // machine's job (ticket T-2.5); T-2.1 only detects + decodes it.
+            }
             Mark::Cwd(path) => {
                 self.pending_cwd = Some(path.clone());
                 // If a block is open, update its cwd too.

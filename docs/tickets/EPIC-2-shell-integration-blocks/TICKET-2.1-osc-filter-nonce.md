@@ -37,3 +37,58 @@ Implement the pre-parser byte filter that intercepts OSC 133 (A/B/C/D) + OSC 7 m
 
 - Installing the shims that emit the marks (T-2.2, T-2.3).
 - The BlockList + lifecycle state machine (T-2.4, T-2.5).
+
+# Notes
+
+2026-06-24 (agent): Landed. Rebuilt `aterm-core::osc` from the stateless per-chunk
+scaffold into a stateful pre-parser filter that closes the real gaps vs the ACs:
+
+- **Per-mark offsets** - `ScanResult.marks` is now `Vec<(usize, Mark)>`; the scanner
+  tracks a cumulative clean-stream position so each mark carries an absolute offset
+  into the logical output the emulator sees (keeps marks in lockstep with the grid
+  for T-2.5). The engine's `Model::process_output` passes these straight to the
+  segmenter; the redundant `stream_offset` field was removed.
+- **Cross-chunk split stitching** - `scan(&mut self)` carries a bounded `partial`
+  buffer (`MAX_OSC_LEN = 8192`; over-long unterminated sequences flush to passthrough,
+  where alacritty's own OSC bound takes over). Handles the ESC|`]` boundary split.
+- **OSC 633 (VS Code)** ingest - A/B/C/D -> prompt kinds, `E` -> command line with
+  `\xHH`/`\\` decoding (the AC), `P;Cwd=` -> cwd; **OSC 1337** recognized as telemetry
+  (no mark). **OSC 133** `C[;cmdline=]` emits a `CommandLine` mark; `D[;exit]` parses
+  the exit code. New `Mark::CommandLine(String)`; the `BlockSegmenter` arm is a no-op
+  (capturing into `Block.command` is T-2.5).
+- **Nonce gate** via an exact `;`-delimited `aterm_nonce=<nonce>` field; untrusted
+  mode (the engine's default until the T-2.2 shim handshake) trusts any well-formed
+  mark. BEL + ST terminators both parse.
+
+**Adversarial review found a CRITICAL security flaw (now fixed; this is why the
+ticket exists).** `read_osc` originally terminated a body only on BEL or `ESC \`,
+absorbing an embedded `ESC ]` (a fresh OSC introducer) as a body byte. Combined with
+the cross-chunk stitch, untrusted command output could print an UNTERMINATED OSC and
+absorb the shell's next genuine nonce-stamped mark, either (a) **leaking the secret
+nonce** into the passthrough (grid/scrollback the agent's LLM reads) when the
+swallowing OSC was non-strippable (e.g. OSC 7), or (b) **forging a trusted mark** by
+borrowing the genuine mark's nonce (the whole merged body was nonce-checked) - both
+collapse the prompt-injection defense, with zero knowledge of the secret. Four
+reviewer agents independently reproduced it.
+
+Fix: `read_osc` now returns `Done | Aborted | Incomplete`; a fresh `ESC` that is not
+the `ESC \` ST aborts the in-progress OSC (per ECMA-48), and `scan` discards the
+malformed prefix and re-anchors at the embedded `ESC`, so a following genuine mark is
+parsed as its OWN body and nonce-checked in isolation. The invariant: a new `ESC ]`
+can never be merged into a prior OSC body. `contains_nonce` was also tightened from
+an unanchored substring search to an exact `;`-delimited field (defense-in-depth -
+not independently exploitable, but removes the `notaterm_nonce=`/prefix-value
+footgun). Five security regression tests encode the exact reproduced PoCs
+(exfiltration, nonce-borrow forgery, untrusted desync, single-chunk embedded-ESC,
+anchored-nonce). A focused re-verification (200k-iteration randomized split-feed fuzz
++ ~18 framing-attack traces) could not break the fixed code.
+
+**Contract for T-2.2 (flagged by review):** the shim MUST emit each nonce-bearing
+mark atomically with its `ESC ]` introducer - never the nonce value as raw bytes
+detached from an introducer - and T-2.2 should assert this in the shim's tests. The
+filter's guarantee depends on it.
+
+67 `aterm-core` tests pass (21 OSC), `fmt`/`clippy`/`build`/`test` all green, no
+flakiness across reruns. No version bump / CHANGELOG entry: internal engine filter,
+no user-visible behaviour change yet (the engine still runs in untrusted mode until
+T-2.2 wires the nonce).
