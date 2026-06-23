@@ -18,4 +18,7 @@ pub use block::{Block, BlockList, BlockSegmenter, OutputSpan};
 pub use input::{InputEvent, InputMode, InputModel, InputOutcome};
 pub use osc::{Mark, OscScanner, PromptKind, ScanResult};
 pub use pty::{Pty, PtyDimensions, PtyError, PtyEvent};
-pub use terminal::{CellColor, CursorPos, Snapshot, SnapshotCell, Terminal};
+pub use terminal::{
+    CellColor, CursorPos, Damage, LineDamage, Snapshot, SnapshotCell, Terminal, TerminalEvent,
+    DEFAULT_SCROLLBACK,
+};

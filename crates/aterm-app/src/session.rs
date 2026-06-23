@@ -113,11 +113,29 @@ impl Session {
                             .apply(mark, self.stream_offset, &mut self.blocks);
                     }
                     self.stream_offset += scan.passthrough.len();
-                    self.terminal.advance(&scan.passthrough);
+                    self.terminal.feed(&scan.passthrough);
                 }
                 PtyEvent::Exited => {
                     log::info!("shell exited");
                 }
+            }
+        }
+        self.drain_terminal_events();
+    }
+
+    /// Drain the VT engine's window events so the unbounded channel does not grow.
+    /// Most are surfaced for later wiring (title -> window title, PtyWrite -> the
+    /// PTY reply path in T-1.9); for now we log and otherwise discard them.
+    fn drain_terminal_events(&mut self) {
+        use aterm_core::TerminalEvent;
+        while let Ok(event) = self.terminal.events().try_recv() {
+            match event {
+                TerminalEvent::Title(title) => log::debug!("title: {title}"),
+                TerminalEvent::Bell => log::debug!("bell"),
+                TerminalEvent::PtyWrite(_reply) => {
+                    // TODO(T-1.9): write DA/DSR/CPR replies back to the PTY master.
+                }
+                other => log::trace!("terminal event: {other:?}"),
             }
         }
     }

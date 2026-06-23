@@ -39,3 +39,40 @@ Wire `alacritty_terminal`'s `Term` + `vte::ansi::Processor` into `aterm-core` so
 - OSC-133/7 interception (T-2.1) and the block model (Epic 2).
 - Threading/coalescing (T-1.3, T-1.4).
 - PtyWrite reply + pgid (T-1.9).
+
+# Notes
+
+2026-06-23 (agent): Landed. `aterm-core::terminal` now: replaces `VoidListener`
+with a `ChannelListener` that maps the VT engine's `Event`s to a renderer-neutral
+`TerminalEvent` (Title/ResetTitle/Bell/ClipboardStore/ClipboardLoad/PtyWrite/
+CursorBlinkingChange/Exit) over a `crossbeam` channel drained by the app; renames
+`advance` -> `feed` (accepts already-OSC-filtered bytes, the T-2.1 filter sits in
+front with marks on a side channel); adds `is_alt_screen()`, config-surfaced
+scrollback (`with_scrollback`, default `DEFAULT_SCROLLBACK = 10_000`), and a
+neutral `take_damage() -> Damage` (Full | Lines) surfacing `TermDamage` for T-1.8.
+The pinned 0.26 `Handler`/`RenderableContent`/`damage`/`mode` signatures are
+recorded in the module doc-comment per the AC. Thirteen tests cover SGR-256 +
+truecolor, unicode/CJK wide chars, alt-screen toggle + redraw/restore, OSC-0/2
+Title events, 200x60 reflow, scrollback config, damage reset semantics, and named
+vs default colours.
+
+**Design decision on the `renderable_content()` AC** (the implementation note says
+"Expose `renderable_content() -> RenderableContent`"): kept the scaffold's
+renderer-neutral `Snapshot` as the public read path rather than re-exporting
+alacritty's `RenderableContent`, but the snapshot is now *built via*
+`term.renderable_content()` (so it honours `display_offset` and the alt-screen
+flag). This keeps `aterm-ui` from importing alacritty types, which preserves the
+"renderer stays swappable behind the `aterm-ui` seam" locked decision; ADR-0007
+only says alacritty *provides* `RenderableContent`, it does not mandate leaking it
+across the crate boundary, so this is an implementation choice, not an ADR
+contradiction. The AC (assert cells/mode/reflow/Title) are all met via `Snapshot`.
+
+Two review-surfaced fixes beyond the literal scaffold: (1) `CellColor::Named` was
+`u8` and `map_color` did `named as u8`, which truncated the non-contiguous
+`NamedColor` discriminants - `Foreground=256`/`Background=257` aliased onto
+Black/Red, corrupting the default colour of essentially every cell. Widened to
+`u16`; `SnapshotCell::default` now uses the Foreground/Background slots. (2) Clamp
+grid dimensions to a 1x1 minimum in `with_scrollback`/`resize` (alacritty's grid
+underflow-panics on a 0 dimension). Also added `wide`/`wide_spacer` flags to
+`SnapshotCell` for the T-1.6 glyph grid. No version bump / CHANGELOG entry:
+internal engine API, no user-visible behaviour change.

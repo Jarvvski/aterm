@@ -14,10 +14,8 @@ workspace = true
 [dependencies]
 portable-pty.workspace = true
 alacritty_terminal.workspace = true
+# Used in production for the terminal's window-event channel (T-1.2) and in tests
+# for the PTY reader helper. The *bounded* reader/model byte channel is T-1.3.
+crossbeam-channel.workspace = true
 thiserror.workspace = true
 log.workspace = true
-
-[dev-dependencies]
-# Test-only: the PTY tests drain a reader on a helper thread with a timeout. The
-# *production* bounded reader/model channel is introduced in ticket T-1.3.
-crossbeam-channel.workspace = true

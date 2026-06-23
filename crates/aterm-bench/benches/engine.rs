@@ -28,7 +28,7 @@ fn bench_vt_parse(c: &mut Criterion) {
     group.bench_function("advance_80x24", |b| {
         b.iter(|| {
             let mut term = Terminal::new(24, 80);
-            term.advance(black_box(&data));
+            term.feed(black_box(&data));
             black_box(term.snapshot());
         });
     });
