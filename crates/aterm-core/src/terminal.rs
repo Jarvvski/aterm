@@ -366,10 +366,22 @@ impl Terminal {
     /// Produce a renderer-neutral snapshot of the current visible viewport, built
     /// from `renderable_content()` so it honours the scrollback display offset.
     ///
-    /// Allocates a fresh `rows * cols` cell buffer per call and intentionally
-    /// drops selection/true-color-palette for now; the zero-per-frame-allocation
-    /// buffer reuse arrives with the coalescer (tickets T-1.3 / T-1.4).
+    /// Allocates a fresh `rows * cols` cell buffer; the zero-allocation path that
+    /// reuses a buffer across publishes is [`Terminal::snapshot_into`] (the engine
+    /// uses it from T-1.4). Intentionally drops selection/true-color-palette for
+    /// now (added with the renderer in Epic 1.5/1.6).
     pub fn snapshot(&self) -> Snapshot {
+        let mut out = Snapshot::empty(self.rows, self.cols);
+        self.snapshot_into(&mut out);
+        out
+    }
+
+    /// Render the current viewport into `out` **in place**, reusing its `cells`
+    /// buffer (it reallocates only when the grid dimensions grow past capacity).
+    /// This is the zero-per-publish-allocation path the engine's double-buffer
+    /// pool drives (ticket T-1.4). The `version` field is left untouched - the
+    /// engine stamps the publish version after rendering.
+    pub fn snapshot_into(&self, out: &mut Snapshot) {
         let rows = self.rows;
         let cols = self.cols;
 
@@ -378,7 +390,15 @@ impl Terminal {
         let alt_screen = content.mode.contains(TermMode::ALT_SCREEN);
         let cursor_point = content.cursor.point;
 
-        let mut cells = vec![SnapshotCell::default(); rows * cols];
+        out.rows = rows;
+        out.cols = cols;
+        out.display_offset = display_offset;
+        out.alt_screen = alt_screen;
+
+        // Reuse the existing allocation: clear to length 0 (capacity retained)
+        // then refill with blank cells, so a same-size grid never reallocates.
+        out.cells.clear();
+        out.cells.resize(rows * cols, SnapshotCell::default());
         for indexed in content.display_iter {
             let Some(vp) = point_to_viewport(display_offset, indexed.point) else {
                 continue;
@@ -389,7 +409,7 @@ impl Terminal {
             }
             let cell = indexed.cell;
             let flags = cell.flags;
-            cells[row * cols + col] = SnapshotCell {
+            out.cells[row * cols + col] = SnapshotCell {
                 c: cell.c,
                 fg: map_color(cell.fg),
                 bg: map_color(cell.bg),
@@ -402,24 +422,12 @@ impl Terminal {
             };
         }
 
-        let cursor = point_to_viewport(display_offset, cursor_point)
+        out.cursor = point_to_viewport(display_offset, cursor_point)
             .map(|vp| CursorPos {
                 row: vp.line,
                 col: vp.column.0,
             })
             .unwrap_or_default();
-
-        Snapshot {
-            // The engine stamps the real publish version (T-1.3); a bare
-            // snapshot has no publish identity, so it is version 0.
-            version: 0,
-            rows,
-            cols,
-            cells,
-            cursor,
-            display_offset,
-            alt_screen,
-        }
     }
 }
 
@@ -622,5 +630,50 @@ mod tests {
         t.resize(0, 0);
         assert_eq!((t.rows(), t.cols()), (1, 1));
         let _ = t.snapshot();
+    }
+
+    #[test]
+    fn snapshot_into_reuses_buffer_at_stable_dims() {
+        // The zero-per-publish-allocation guarantee (ticket T-1.4): re-rendering
+        // into the same buffer at unchanged dimensions must NOT reallocate the
+        // cells Vec - same capacity, same backing pointer.
+        let mut t = Terminal::new(10, 40);
+        t.feed(b"hello");
+        let mut snap = Snapshot::empty(10, 40);
+        t.snapshot_into(&mut snap);
+        let cap0 = snap.cells.capacity();
+        let ptr0 = snap.cells.as_ptr() as usize;
+        assert_eq!(snap.row(0)[0].c, 'h');
+
+        for i in 0..200 {
+            t.feed(format!("\r\n{i}").as_bytes());
+            t.snapshot_into(&mut snap);
+        }
+        assert_eq!(
+            snap.cells.capacity(),
+            cap0,
+            "cells capacity must be stable across re-renders (no realloc)"
+        );
+        assert_eq!(
+            snap.cells.as_ptr() as usize,
+            ptr0,
+            "cells buffer must be reused in place at stable dims"
+        );
+        assert_eq!(snap.rows, 10);
+        assert_eq!(snap.cols, 40);
+    }
+
+    #[test]
+    fn snapshot_into_matches_snapshot() {
+        // snapshot() must be a thin wrapper over snapshot_into(): identical cells.
+        let mut t = Terminal::new(5, 20);
+        t.feed("\x1b[1mBold\x1b[0m and 你好".as_bytes());
+        let owned = t.snapshot();
+        let mut into = Snapshot::empty(5, 20);
+        t.snapshot_into(&mut into);
+        assert_eq!(owned.cells, into.cells);
+        assert_eq!(owned.cursor, into.cursor);
+        assert_eq!(owned.alt_screen, into.alt_screen);
+        assert_eq!(owned.display_offset, into.display_offset);
     }
 }
