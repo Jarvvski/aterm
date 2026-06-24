@@ -14,8 +14,15 @@ ATERM_INTEGRATION_LOADED=1
 
 __aterm_nonce="__ATERM_NONCE__"
 
-# Emit an OSC-133 mark atomically: introducer + body + nonce in one printf.
-__aterm_mark() { printf '\033]133;%s;aterm_nonce=%s\007' "$1" "$__aterm_nonce"; }
+# Emit an OSC-133 mark atomically: introducer + body + nonce in one printf. The `A`
+# (prompt start) also carries the zsh version (ticket T-2.3 AC2) so aterm can name it.
+__aterm_mark() {
+  if [[ "$1" == A ]]; then
+    printf '\033]133;A;aterm_ver=%s;aterm_nonce=%s\007' "$ZSH_VERSION" "$__aterm_nonce"
+  else
+    printf '\033]133;%s;aterm_nonce=%s\007' "$1" "$__aterm_nonce"
+  fi
+}
 
 # Emit OSC 7 (cwd as file://host/path), atomically.
 __aterm_cwd() { printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "$PWD"; }

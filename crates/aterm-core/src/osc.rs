@@ -53,6 +53,12 @@ pub enum Mark {
     /// decoded. The block lifecycle (ticket T-2.5) captures this into the block;
     /// this filter only detects and decodes it.
     CommandLine(String),
+    /// The shell's self-reported version string, carried on the first prompt's `A`
+    /// mark as `aterm_ver=<version>` (ticket T-2.3 AC2 / T-2.6): bash `$BASH_VERSION`,
+    /// zsh `$ZSH_VERSION`, fish `$version`. Nonce-gated (only our shim emits it) and
+    /// length-bounded + sanitized to a version-like token, so the engine can surface
+    /// "bash 3.2 - upgrade for reliable blocks" to the integration indicator.
+    ShellVersion(String),
 }
 
 /// Result of scanning a chunk: the bytes that continue to the VT parser (aterm's
@@ -250,7 +256,17 @@ impl OscScanner {
             return;
         };
         let kind = match first {
-            b'A' => PromptKind::PromptStart,
+            b'A' => {
+                // `A` may carry `;aterm_ver=<version>` (ticket T-2.3 AC2): the shell's
+                // self-reported version, emitted once on the first prompt. Trusted +
+                // sanitized so the indicator can surface "bash 3.2".
+                if trusted {
+                    if let Some(ver) = extract_shell_version(rest) {
+                        out.marks.push((offset, Mark::ShellVersion(ver)));
+                    }
+                }
+                PromptKind::PromptStart
+            }
             b'B' => PromptKind::CommandStart,
             b'C' => {
                 // `C` may carry `;cmdline=ENC`; emit the command line first so the
@@ -377,6 +393,29 @@ fn extract_cmdline(rest: &[u8]) -> Option<String> {
     rest.split(|&c| c == b';')
         .find_map(|f| f.strip_prefix(b"cmdline="))
         .map(percent_decode)
+}
+
+/// Maximum length of a sanitized shell-version token (ticket T-2.3). Generous for any
+/// real version string (`5.2.15(1)-release`, `5.9`, `3.7.1`); bounds an adversarial
+/// nonce-leak attempt from bloating the published string.
+const MAX_SHELL_VERSION_LEN: usize = 48;
+
+/// Extract `aterm_ver=<version>` from an OSC-133 `A` body and sanitize it to a short
+/// version-like token (ticket T-2.3 AC2). Even though it is nonce-gated (only our shim
+/// emits it), the value is shell-expanded, so we keep only printable, non-`;` ASCII and
+/// cap the length - it is surfaced verbatim in the UI's "why?" string.
+fn extract_shell_version(rest: &[u8]) -> Option<String> {
+    let raw = rest
+        .split(|&c| c == b';')
+        .find_map(|f| f.strip_prefix(b"aterm_ver="))?;
+    let cleaned: String = raw
+        .iter()
+        .filter(|&&b| b.is_ascii_graphic() || b == b' ')
+        .take(MAX_SHELL_VERSION_LEN)
+        .map(|&b| b as char)
+        .collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Decode an OSC-633 `E;<escaped-cmd>[;<nonce>]` body to the command text.
@@ -860,5 +899,58 @@ mod tests {
         stream.extend(osc("133;C;aterm_nonce=DEADBEEF")); // exact: accepted
         let r = s.scan(&stream);
         assert_eq!(marks_only(&r), vec![Mark::Prompt(PromptKind::OutputStart)]);
+    }
+
+    #[test]
+    fn osc133_a_with_version_emits_shell_version_then_prompt_start() {
+        // T-2.3 AC2: the shell reports its version on the first prompt's `A`.
+        let mut s = OscScanner::untrusted();
+        let r = s.scan(&osc("133;A;aterm_ver=5.2.15(1)-release"));
+        assert_eq!(
+            marks_only(&r),
+            vec![
+                Mark::ShellVersion("5.2.15(1)-release".to_string()),
+                Mark::Prompt(PromptKind::PromptStart),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_version_is_trimmed_and_length_bounded() {
+        let mut s = OscScanner::untrusted();
+        let r = s.scan(&osc("133;A;aterm_ver=  5.9  ")); // surrounding spaces trimmed
+        assert!(
+            matches!(marks_only(&r).first(), Some(Mark::ShellVersion(v)) if v == "5.9"),
+            "version is trimmed: {:?}",
+            marks_only(&r)
+        );
+
+        let long = "9".repeat(200);
+        let mut s2 = OscScanner::untrusted();
+        let r2 = s2.scan(&osc(&format!("133;A;aterm_ver={long}")));
+        match marks_only(&r2).first() {
+            Some(Mark::ShellVersion(v)) => assert!(v.len() <= MAX_SHELL_VERSION_LEN),
+            other => panic!("expected a bounded ShellVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_version_rides_the_nonce_trust_gate() {
+        // The version is nonce-gated like every other mark: a forged `A;aterm_ver`
+        // without the session nonce yields nothing; with it, the version is trusted.
+        let mut s = OscScanner::with_nonce("SECRET");
+        let forged = s.scan(&osc("133;A;aterm_ver=6.6.6"));
+        assert!(
+            marks_only(&forged).is_empty(),
+            "an un-nonced version mark must be dropped"
+        );
+        let good = s.scan(&osc("133;A;aterm_ver=5.2;aterm_nonce=SECRET"));
+        assert_eq!(
+            marks_only(&good),
+            vec![
+                Mark::ShellVersion("5.2".to_string()),
+                Mark::Prompt(PromptKind::PromptStart),
+            ]
+        );
     }
 }

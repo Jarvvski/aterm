@@ -29,7 +29,9 @@ __aterm_nonce="__ATERM_NONCE__"
 # Static A/B marks for PS1: zero-width (\[...\]) so bash's line-length accounting
 # stays correct; \e -> ESC and \a -> BEL are decoded by bash at prompt-display time.
 # No `$(...)` here, so redrawing the prompt never triggers the DEBUG trap below.
-__aterm_a='\[\e]133;A;aterm_nonce='"$__aterm_nonce"'\a\]'
+# The `A` (prompt start) carries the bash version (ticket T-2.3 AC2), baked in once at
+# load - no per-prompt command substitution, preserving the no-$()-in-PS1 property.
+__aterm_a='\[\e]133;A;aterm_ver='"$BASH_VERSION"';aterm_nonce='"$__aterm_nonce"'\a\]'
 __aterm_b='\[\e]133;B;aterm_nonce='"$__aterm_nonce"'\a\]'
 
 # Emit OSC 7 (cwd as file://host/path), atomically.

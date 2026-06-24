@@ -339,6 +339,10 @@ mod tests {
             "idempotency guard present"
         );
         assert!(s.contains("cmdline="), "C carries the encoded command line");
+        assert!(
+            s.contains("aterm_ver=") && s.contains("ZSH_VERSION"),
+            "A reports the zsh version (ticket T-2.3 AC2)"
+        );
     }
 
     #[test]
@@ -447,6 +451,10 @@ mod tests {
             s.contains("BASH_VERSINFO"),
             "version-branched on BASH_VERSINFO"
         );
+        assert!(
+            s.contains("aterm_ver=") && s.contains("BASH_VERSION"),
+            "A reports the bash version so the indicator can flag the 3.2 tier (T-2.3 AC2)"
+        );
         assert!(s.contains("PS0="), "bash >= 5.3 tier installs a PS0 hook");
         assert!(
             s.contains("DEBUG"),
@@ -532,6 +540,10 @@ mod tests {
             "data dir substituted for the XDG cleanup"
         );
         assert!(s.contains("]7;file://"), "emits OSC 7 cwd");
+        assert!(
+            s.contains("aterm_ver=") && s.contains("$version"),
+            "A reports the fish version (ticket T-2.3 AC2)"
+        );
         assert!(
             s.contains("--on-event fish_prompt"),
             "A on the prompt event"

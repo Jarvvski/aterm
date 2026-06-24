@@ -30,9 +30,14 @@ if status is-interactive
         set -e __aterm_kept
     end
 
-    # Emit an OSC-133 mark atomically: introducer + body + nonce in one printf.
+    # Emit an OSC-133 mark atomically: introducer + body + nonce in one printf. The `A`
+    # (prompt start) also carries the fish version (ticket T-2.3 AC2) so aterm can name it.
     function __aterm_mark
-        printf '\033]133;%s;aterm_nonce=%s\007' $argv[1] $__aterm_nonce
+        if test "$argv[1]" = A
+            printf '\033]133;A;aterm_ver=%s;aterm_nonce=%s\007' "$version" $__aterm_nonce
+        else
+            printf '\033]133;%s;aterm_nonce=%s\007' $argv[1] $__aterm_nonce
+        end
     end
 
     # fish_prompt event: a prompt is about to be drawn -> refresh cwd (OSC 7) and

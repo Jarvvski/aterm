@@ -164,6 +164,11 @@ pub struct Engine {
     /// command). Feeds the T-2.6 integration indicator (Integrated / Heuristic /
     /// None) together with [`Engine::integration_active`].
     shell_kind: ShellKind,
+    /// The shell's self-reported version (ticket T-2.3 AC2), captured from the first
+    /// nonce-matched `A;aterm_ver=` mark and published here for the T-2.6 indicator's
+    /// "why?" string (e.g. "bash 3.2 - upgrade for reliable blocks"). `None` until the
+    /// shell reports it (an unintegrated shell never does).
+    shell_version: Arc<Mutex<Option<String>>>,
     /// Whether a nonce-armed integration shim was actually installed this session.
     integration_active: bool,
     /// The current [`Integration`] state, published lock-free by the model thread as
@@ -368,6 +373,8 @@ impl Engine {
         // The block-list publish slot (T-2.7): seeded empty so a consumer that reads
         // before the first block opens sees a coherent (empty) list, not a sentinel.
         let latest_blocks = Arc::new(Mutex::new(Arc::new(BlockList::new())));
+        // The shell-version slot (T-2.3 AC2): filled from the first `aterm_ver=` mark.
+        let shell_version = Arc::new(Mutex::new(None::<String>));
 
         // Integration indicator state (T-2.6). The monitor's decision logic is pure;
         // the model thread drives it (confirm on a nonce-matched A, time out the
@@ -397,6 +404,7 @@ impl Engine {
             blocks_touched: false,
             capture_buf: Vec::new(),
             capturing: false,
+            shell_version: Arc::clone(&shell_version),
             integration: monitor,
             integration_code: Arc::clone(&integration_code),
             confirm_window,
@@ -424,6 +432,7 @@ impl Engine {
             integration_active: shim_installed,
             _integration: integration,
             shell_kind,
+            shell_version,
             integration_code,
             reader: Some(reader_handle),
             model: Some(model_handle),
@@ -489,6 +498,18 @@ impl Engine {
     #[must_use]
     pub fn shell_kind(&self) -> ShellKind {
         self.shell_kind
+    }
+
+    /// The shell's self-reported version string, if it has reported one (ticket
+    /// T-2.3 AC2). With [`Self::shell_kind`] this lets the integration indicator name
+    /// the exact shell + version (e.g. "bash 3.2 - upgrade for reliable blocks"). Read
+    /// cheaply under a short lock; `None` until the first `aterm_ver=` mark arrives.
+    #[must_use]
+    pub fn shell_version(&self) -> Option<String> {
+        self.shell_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Whether a nonce-armed integration shim was installed for this session. `false`
@@ -617,6 +638,9 @@ struct Model {
     /// `D`). Cleared - and the buffer discarded - if the command turns out to be a
     /// full-screen (alt-screen) app, which has no captured output.
     capturing: bool,
+    /// The handle's shell-version slot (ticket T-2.3 AC2); filled once from the first
+    /// `aterm_ver=` mark.
+    shell_version: Arc<Mutex<Option<String>>>,
     /// Integration-indicator decision machine (ticket T-2.6). The model confirms it
     /// on a nonce-matched `A` and times it out via the confirmation-window timer in
     /// [`run_model`], publishing the result through `integration_code`.
@@ -697,6 +721,14 @@ impl Model {
                 && matches!(mark, Mark::Prompt(PromptKind::PromptStart))
             {
                 self.integration.confirm();
+            }
+            // The shell's self-reported version (ticket T-2.3 AC2), emitted once on the
+            // first `A`. Only nonce-trusted marks reach here, so it is safe to surface.
+            if let Mark::ShellVersion(ver) = mark {
+                let mut guard = self.shell_version.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.is_none() {
+                    *guard = Some(ver.clone());
+                }
             }
             // Finished-block output capture (ticket T-2.7): buffer this command's clean
             // output from its `C`, capture it by replay on `D`. Gated OFF the alt screen
@@ -1898,5 +1930,35 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn shell_version_is_surfaced_from_the_first_prompt() {
+        // T-2.3 AC2: the shell reports its version on the first `A` (aterm_ver=); the
+        // engine surfaces it through `shell_version()` for the indicator.
+        let nonce = "ATERMVER0000";
+        let script =
+            format!("printf '\\033]133;A;aterm_ver=5.2.15;aterm_nonce={nonce}\\007'; sleep 2");
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", &script],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            Some(nonce),
+            Duration::from_secs(5),
+        )
+        .expect("spawn sh reporting its version");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.shell_version().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            engine.shell_version().as_deref(),
+            Some("5.2.15"),
+            "the engine should surface the shell's reported version"
+        );
+        drop(engine);
     }
 }

@@ -521,6 +521,9 @@ impl BlockSegmenter {
                 // the block that opens next.
                 self.pending_command = Some(cmd.clone());
             }
+            // The shell version (ticket T-2.3 AC2) is consumed by the engine for the
+            // integration indicator, not by block segmentation - ignore it here.
+            Mark::ShellVersion(_) => {}
             Mark::Cwd(path) => {
                 self.pending_cwd = Some(path.clone());
                 // If a block is open, update its cwd too.
