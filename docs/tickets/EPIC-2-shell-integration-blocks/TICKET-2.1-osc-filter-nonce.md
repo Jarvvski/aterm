@@ -2,7 +2,7 @@
 id: T-2.1
 epic: EPIC-2-shell-integration-blocks
 title: OSC-133/OSC-7 pre-parser filter with nonce gating
-status: ready-for-agent
+status: done
 labels: [core, shell-integration]
 depends_on: [T-1.2]
 ---
@@ -92,3 +92,15 @@ filter's guarantee depends on it.
 flakiness across reruns. No version bump / CHANGELOG entry: internal engine filter,
 no user-visible behaviour change yet (the engine still runs in untrusted mode until
 T-2.2 wires the nonce).
+
+2026-06-25 (agent): Status flipped `ready-for-agent` -> `done` (the label was
+stale - implementation landed 2026-06-24 per the entry above). Re-audited every AC
+against a passing test before flipping: AC1 `prompt_lifecycle_marks_at_correct_offsets_and_stripped`
+(asserts exact clean-stream offsets + zero-width strip), AC2 `mark_split_across_two_chunks_is_stitched`
++ `split_at_esc_bracket_boundary_is_stitched`, AC3 `both_terminators_parse`, AC4
+`nonce_gating_trusts_strips_only_our_marks` (trusted `with_nonce` mode, both
+directions: absent/wrong dropped + passed through, correct stripped) +
+`nonce_match_is_anchored_to_full_field`, AC5 `osc633_e_decodes_vscode_escaping`
+(real `\x3b`/`\\`/`\xAB` decode), AC6 = 26 OSC tests green under
+`cargo test -p aterm-core`. Scanner confirmed wired into `engine.rs`
+(`self.osc.scan(bytes)` in `Model::process_output`).
