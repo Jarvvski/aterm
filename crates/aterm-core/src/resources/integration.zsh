@@ -22,15 +22,20 @@ __aterm_cwd() { printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "$PWD"; }
 
 # Percent-encode a command line for the cmdline= field: keep the RFC-3986
 # unreserved set, encode everything else (crucially ';' and controls, so the
-# command text can never break out of the OSC).
+# command text can never break out of the OSC). `local LC_ALL=C` forces a BYTE view,
+# so a multibyte UTF-8 character is encoded as its constituent bytes (matching the
+# bash/fish shims and what osc.rs percent_decode round-trips) rather than producing a
+# value > 0xFF for the whole character.
 __aterm_encode() {
-  local s=$1 out= c i
+  local s=$1 out= c i n LC_ALL=C
   for (( i = 1; i <= ${#s}; i++ )); do
     c=${s[i]}
     if [[ "$c" == [A-Za-z0-9._~-] ]]; then
       out+=$c
     else
-      out+=$(printf '%%%02X' "'$c")
+      # Mask to a byte so a sign-extended high byte can never widen the %02X.
+      printf -v n '%d' "'$c"
+      out+=$(printf '%%%02X' "$(( n & 0xFF ))")
     fi
   done
   printf '%s' "$out"

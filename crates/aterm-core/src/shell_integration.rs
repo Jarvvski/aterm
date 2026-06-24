@@ -1,19 +1,32 @@
-//! Shell-integration shim extraction (ticket T-2.2).
+//! Shell-integration shim extraction (tickets T-2.2 zsh, T-2.3 bash + fish).
 //!
-//! aterm injects a tiny zsh snippet that emits nonce-stamped OSC-133 marks
+//! aterm injects a tiny per-shell snippet that emits nonce-stamped OSC-133 marks
 //! (A/B/C/D) and OSC 7 (cwd) around the prompt and command, so [`crate::osc`] can
 //! segment blocks reliably regardless of the user's prompt theme. The injection is
-//! zero dotfile-edits: at spawn we materialize a per-session `ZDOTDIR` dir (a `.zshenv`
-//! bootstrap + the integration script) and point the child's `$ZDOTDIR` at it; the
-//! bootstrap restores the real `ZDOTDIR`, re-sources the user's startup files, and
-//! installs our integration last. The temp dir is removed when [`IntegrationDir`]
-//! drops.
+//! zero dotfile-edits, with a per-shell load mechanism (research 04 section 2):
+//!
+//! - **zsh** ([`IntegrationDir::install_zsh`]): a per-session `ZDOTDIR` dir (a
+//!   `.zshenv` bootstrap + the integration script); the child's `$ZDOTDIR` points at
+//!   it; the bootstrap drives the user's startup files by explicit path, then loads
+//!   our integration last (and re-pins `ZDOTDIR` so it survives `exec zsh`).
+//! - **bash** ([`IntegrationDir::install_bash`]): launched non-login with
+//!   `--rcfile <bootstrap>`; the bootstrap reconstructs the login+interactive startup
+//!   sequence (preserving `/etc/profile`) then loads our integration last. The
+//!   integration version-branches: `PS0` + `PROMPT_COMMAND` on bash >= 5.3, a minimal
+//!   `DEBUG`-trap preexec emulation on 3.2 - 5.2.
+//! - **fish** ([`IntegrationDir::install_fish`]): our dir is prepended to
+//!   `XDG_DATA_DIRS`; fish auto-sources `fish/vendor_conf.d/*.fish`; the script
+//!   cleans the env var back up. Hooks use the `fish_prompt`/`fish_preexec`/
+//!   `fish_postexec` events.
+//!
+//! In all cases the per-session temp dir is removed when [`IntegrationDir`] drops.
 //!
 //! The shim sets a per-session [`ShimNonce`] into every mark, which the OSC filter
 //! ([`crate::osc::OscScanner::with_nonce`]) requires - so a foreign program's marks
 //! (or an attacker echoing OSC-133) are dropped. The scripts emit each mark with a
-//! single `printf`, so the nonce is never written detached from its `ESC ]`
-//! introducer (the T-2.1 contract). Only zsh is handled here; bash/fish are T-2.3.
+//! single `printf` (or, for the static zsh/bash A/B marks, a single literal prompt
+//! string), so the nonce is never written detached from its `ESC ]` introducer (the
+//! T-2.1 contract).
 
 use std::fs;
 use std::io;
@@ -25,6 +38,15 @@ const INTEGRATION_ZSH: &str = include_str!("resources/integration.zsh");
 /// The embedded `.zshenv` bootstrap. `__ATERM_INTEGRATION_PATH__` is substituted
 /// with the absolute path of the materialized integration script.
 const ZSHENV_BOOTSTRAP: &str = include_str!("resources/zshenv");
+/// The embedded bash integration script (version-branched marks logic).
+/// `__ATERM_NONCE__` is substituted per session.
+const INTEGRATION_BASH: &str = include_str!("resources/integration.bash");
+/// The embedded bash `--rcfile` bootstrap. `__ATERM_INTEGRATION_PATH__` is
+/// substituted with the absolute path of the materialized integration script.
+const BASH_BOOTSTRAP: &str = include_str!("resources/bash-bootstrap.bash");
+/// The embedded fish `vendor_conf.d` script. `__ATERM_NONCE__` and
+/// `__ATERM_FISH_DATA_DIR__` are substituted per session.
+const INTEGRATION_FISH: &str = include_str!("resources/integration.fish");
 
 /// A per-session nonce stamped into every mark the shim emits, so the OSC scanner
 /// trusts *our* marks and ignores a foreign terminal's integration (or an attacker
@@ -83,6 +105,32 @@ pub fn zsh_integration_script(nonce: &ShimNonce) -> String {
     INTEGRATION_ZSH.replace("__ATERM_NONCE__", &nonce.0)
 }
 
+/// The bash integration script for `nonce` (version-branched marks logic).
+#[must_use]
+pub fn bash_integration_script(nonce: &ShimNonce) -> String {
+    INTEGRATION_BASH.replace("__ATERM_NONCE__", &nonce.0)
+}
+
+/// The bash `--rcfile` bootstrap, pointing at `integration_path` (the absolute path
+/// of the materialized [`bash_integration_script`]).
+#[must_use]
+pub fn bash_bootstrap_script(integration_path: &Path) -> String {
+    BASH_BOOTSTRAP.replace(
+        "__ATERM_INTEGRATION_PATH__",
+        &integration_path.to_string_lossy(),
+    )
+}
+
+/// The fish `vendor_conf.d` integration script for `nonce`. `data_dir` is the dir
+/// aterm prepends to `XDG_DATA_DIRS`; the script removes it again so child processes
+/// do not inherit the injection.
+#[must_use]
+pub fn fish_integration_script(nonce: &ShimNonce, data_dir: &Path) -> String {
+    INTEGRATION_FISH
+        .replace("__ATERM_NONCE__", &nonce.0)
+        .replace("__ATERM_FISH_DATA_DIR__", &data_dir.to_string_lossy())
+}
+
 /// Whether to inject the zsh shim given the user's original `$ZDOTDIR`.
 ///
 /// The standard case (no custom `ZDOTDIR`, so zsh reads `$HOME`) always injects.
@@ -100,35 +148,43 @@ pub fn should_inject_zsh(orig_zdotdir: Option<&str>) -> bool {
     }
 }
 
-/// A materialized per-session zsh `ZDOTDIR` shim directory. Holds the temp dir +
-/// the user's original `$ZDOTDIR`; [`Drop`] removes the temp dir.
+/// Create a fresh, owned, 0700 per-session temp dir named `<prefix>-<pid>-<nonce>`.
+///
+/// `create_dir` (NOT `create_dir_all`) so a pre-existing dir is an error, never
+/// silently trusted: we point a SHELL at this dir, so we must own it. The 32-char
+/// nonce makes a collision/pre-seed practically impossible; this closes the window
+/// regardless (an attacker would have to win the race AND guess the nonce). The
+/// 0700 (best-effort) keeps another user from injecting into our shell.
+fn make_session_dir(prefix: &str, nonce: &ShimNonce) -> io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), nonce.0));
+    fs::create_dir(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+    Ok(dir)
+}
+
+/// A materialized per-session shell-integration shim directory. Knows which
+/// [`ShellKind`] it is for and carries the precomputed env vars + spawn args the
+/// child shell needs to load it; [`Drop`] removes the temp dir.
 #[derive(Debug)]
 pub struct IntegrationDir {
     dir: PathBuf,
-    orig_zdotdir: Option<String>,
+    kind: ShellKind,
+    env: Vec<(String, String)>,
+    args: Vec<String>,
 }
 
 impl IntegrationDir {
-    /// Materialize a zsh `ZDOTDIR` shim for `nonce` into a fresh per-session temp
-    /// dir: a `.zshenv` bootstrap + the integration script. `orig_zdotdir` is the
-    /// user's pre-existing `$ZDOTDIR` (`None` = the default `$HOME`), preserved so
-    /// the bootstrap can restore it.
+    /// Materialize a zsh `ZDOTDIR` shim for `nonce`: a `.zshenv` bootstrap + the
+    /// integration script. `orig_zdotdir` is the user's pre-existing `$ZDOTDIR`
+    /// (`None` = the default `$HOME`), preserved so the bootstrap can restore it.
+    /// Spawn args: `-l` (login); env: `ZDOTDIR` -> the shim (kept pinned so the
+    /// integration survives `exec zsh`) + `ATERM_REAL_ZDOTDIR` when one existed.
     pub fn install_zsh(nonce: &ShimNonce, orig_zdotdir: Option<String>) -> io::Result<Self> {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-zdotdir-{}-{}", std::process::id(), nonce.0));
-        // `create_dir` (NOT `create_dir_all`) so a pre-existing dir is an error,
-        // never silently trusted: we point a SHELL at this dir, so we must own it.
-        // The 32-char nonce makes a collision/pre-seed practically impossible; this
-        // closes the window regardless (an attacker would have to win the race AND
-        // guess the nonce). 0700 follows immediately.
-        fs::create_dir(&dir)?;
-        // Best-effort 0700: the shim dir holds only our scripts, but it should not
-        // be world-writable (another user could otherwise inject into our zsh).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-        }
+        let dir = make_session_dir("aterm-zdotdir", nonce)?;
 
         let integration_path = dir.join("aterm-integration.zsh");
         fs::write(&integration_path, zsh_integration_script(nonce))?;
@@ -139,35 +195,100 @@ impl IntegrationDir {
         );
         fs::write(dir.join(".zshenv"), zshenv)?;
 
-        Ok(Self { dir, orig_zdotdir })
+        let mut env = vec![("ZDOTDIR".to_string(), dir.to_string_lossy().into_owned())];
+        if let Some(orig) = orig_zdotdir {
+            env.push(("ATERM_REAL_ZDOTDIR".to_string(), orig));
+        }
+        Ok(Self {
+            dir,
+            kind: ShellKind::Zsh,
+            env,
+            args: vec!["-l".to_string()],
+        })
     }
 
-    /// The shim dir (the value to set as the child's `$ZDOTDIR`).
+    /// Materialize a bash shim for `nonce`: the integration script + a `--rcfile`
+    /// bootstrap. bash is launched NON-login + interactive with `--rcfile <bootstrap>`
+    /// (the bootstrap reconstructs the login startup it thereby skips, preserving
+    /// `/etc/profile`). No env vars are needed - the bootstrap path is a spawn arg.
+    pub fn install_bash(nonce: &ShimNonce) -> io::Result<Self> {
+        let dir = make_session_dir("aterm-bash", nonce)?;
+
+        let integration_path = dir.join("aterm-integration.bash");
+        fs::write(&integration_path, bash_integration_script(nonce))?;
+
+        let bootstrap_path = dir.join("aterm-bootstrap.bash");
+        fs::write(&bootstrap_path, bash_bootstrap_script(&integration_path))?;
+
+        let args = vec![
+            "--rcfile".to_string(),
+            bootstrap_path.to_string_lossy().into_owned(),
+            "-i".to_string(),
+        ];
+        Ok(Self {
+            dir,
+            kind: ShellKind::Bash,
+            env: Vec::new(),
+            args,
+        })
+    }
+
+    /// Materialize a fish shim for `nonce`: a `fish/vendor_conf.d/aterm.fish` script.
+    /// fish is launched login + interactive; our dir is prepended to `XDG_DATA_DIRS`
+    /// so fish auto-sources it (the script then removes the dir again).
+    /// `orig_xdg_data_dirs` is the user's pre-existing `$XDG_DATA_DIRS` (`None` ->
+    /// the XDG spec default `/usr/local/share:/usr/share`).
+    pub fn install_fish(nonce: &ShimNonce, orig_xdg_data_dirs: Option<String>) -> io::Result<Self> {
+        let dir = make_session_dir("aterm-fish-data", nonce)?;
+
+        // fish searches `<XDG_DATA_DIR>/fish/vendor_conf.d/*.fish`.
+        let conf_d = dir.join("fish").join("vendor_conf.d");
+        fs::create_dir_all(&conf_d)?;
+        fs::write(
+            conf_d.join("aterm.fish"),
+            fish_integration_script(nonce, &dir),
+        )?;
+
+        let rest = orig_xdg_data_dirs.unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+        let xdg = format!("{}:{}", dir.to_string_lossy(), rest);
+        Ok(Self {
+            dir,
+            kind: ShellKind::Fish,
+            env: vec![("XDG_DATA_DIRS".to_string(), xdg)],
+            args: vec!["-l".to_string(), "-i".to_string()],
+        })
+    }
+
+    /// The shim dir (also the value the zsh shim sets as `$ZDOTDIR`).
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.dir
     }
 
-    /// The env vars to set on the spawned zsh: `ZDOTDIR` -> the shim dir (kept
-    /// pinned there for the whole session so the integration survives `exec zsh`),
-    /// and (when the user had one) `ATERM_REAL_ZDOTDIR` -> their original config dir,
-    /// which the bootstrap drives the user's startup files from by explicit path.
+    /// Which shell this shim is for.
+    #[must_use]
+    pub fn kind(&self) -> ShellKind {
+        self.kind
+    }
+
+    /// The env vars to set on the spawned shell (zsh: `ZDOTDIR` [+ real];
+    /// fish: `XDG_DATA_DIRS`; bash: none).
     #[must_use]
     pub fn env_vars(&self) -> Vec<(String, String)> {
-        let mut v = vec![(
-            "ZDOTDIR".to_string(),
-            self.dir.to_string_lossy().into_owned(),
-        )];
-        if let Some(orig) = &self.orig_zdotdir {
-            v.push(("ATERM_REAL_ZDOTDIR".to_string(), orig.clone()));
-        }
-        v
+        self.env.clone()
+    }
+
+    /// The argv (after the program name) the shell must be spawned with to load the
+    /// shim (zsh: `-l`; bash: `--rcfile <bootstrap> -i`; fish: `-l -i`).
+    #[must_use]
+    pub fn shell_args(&self) -> Vec<String> {
+        self.args.clone()
     }
 }
 
 impl Drop for IntegrationDir {
     fn drop(&mut self) {
-        // Best-effort: the dir holds only our two scripts; ignore errors (e.g. the
+        // Best-effort: the dir holds only our own scripts; ignore errors (e.g. the
         // temp root was already swept).
         let _ = fs::remove_dir_all(&self.dir);
     }
@@ -301,5 +422,188 @@ mod tests {
         fs::write(empty.join(".zshrc"), "# user rc\n").unwrap();
         assert!(should_inject_zsh(Some(&empty.to_string_lossy())));
         let _ = fs::remove_dir_all(&empty);
+    }
+
+    // ---- bash (T-2.3) ----------------------------------------------------------
+
+    #[test]
+    fn bash_integration_script_carries_nonce_marks_and_both_version_tiers() {
+        let nonce = ShimNonce("BASHABC123".into());
+        let s = bash_integration_script(&nonce);
+        assert!(s.contains("BASHABC123"), "nonce substituted");
+        assert!(!s.contains("__ATERM_NONCE__"), "placeholder fully replaced");
+        assert!(s.contains("]7;file://"), "emits OSC 7 cwd");
+        assert!(s.contains("cmdline="), "C carries the encoded command line");
+        assert!(
+            s.contains("ATERM_INTEGRATION_LOADED"),
+            "idempotency guard present"
+        );
+        assert!(
+            s.contains("PROMPT_COMMAND"),
+            "drives precmd via PROMPT_COMMAND"
+        );
+        // Both version-branched tiers are present (research 04 section 2).
+        assert!(
+            s.contains("BASH_VERSINFO"),
+            "version-branched on BASH_VERSINFO"
+        );
+        assert!(s.contains("PS0="), "bash >= 5.3 tier installs a PS0 hook");
+        assert!(
+            s.contains("DEBUG"),
+            "bash 3.2 - 5.2 tier installs a DEBUG-trap preexec emulation"
+        );
+    }
+
+    #[test]
+    fn bash_marks_are_atomic_with_their_introducer() {
+        // T-2.1 contract: every line that emits a 133 mark carrying the nonce must
+        // also carry the `ESC ]` introducer (printf `\033]` for C/D, or the `\e]`
+        // prompt escape for the static A/B PS1 marks) - the nonce is never detached.
+        let nonce = ShimNonce("BNONCE9".into());
+        let s = bash_integration_script(&nonce);
+        for line in s.lines() {
+            if line.contains("]133;") && line.contains("aterm_nonce=") {
+                assert!(
+                    line.contains("\\033") || line.contains("\\e"),
+                    "a mark line must include the ESC introducer with the nonce \
+                     (atomicity); offending line: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bash_bootstrap_reconstructs_startup_and_loads_integration_last() {
+        let s = bash_bootstrap_script(Path::new("/shim/aterm-integration.bash"));
+        // Preserves system + login startup the --rcfile launch would otherwise skip.
+        assert!(s.contains("/etc/profile"), "preserves /etc/profile");
+        assert!(s.contains(".bash_profile"));
+        assert!(s.contains(".bashrc"));
+        // Loads our integration LAST, by the substituted absolute path.
+        assert!(!s.contains("__ATERM_INTEGRATION_PATH__"));
+        assert!(s.contains("/shim/aterm-integration.bash"));
+    }
+
+    #[test]
+    fn install_bash_materializes_rcfile_bootstrap_and_cleans_up_on_drop() {
+        let nonce = ShimNonce("BASHINSTALL01".into());
+        let path = {
+            let shim = IntegrationDir::install_bash(&nonce).expect("materialize bash shim");
+            assert_eq!(shim.kind(), ShellKind::Bash);
+            let dir = shim.path().to_path_buf();
+            let integ = dir.join("aterm-integration.bash");
+            let boot = dir.join("aterm-bootstrap.bash");
+            assert!(integ.is_file(), "integration script written");
+            assert!(boot.is_file(), "bootstrap written");
+            // The bootstrap points at the integration script's absolute path.
+            let boot_src = fs::read_to_string(&boot).unwrap();
+            assert!(boot_src.contains(&integ.to_string_lossy().into_owned()));
+            // No env vars; launched non-login + interactive via --rcfile <bootstrap>.
+            assert!(shim.env_vars().is_empty(), "bash needs no env vars");
+            let args = shim.shell_args();
+            assert_eq!(args.first().map(String::as_str), Some("--rcfile"));
+            assert!(args
+                .iter()
+                .any(|a| a == &boot.to_string_lossy().into_owned()));
+            assert!(args.iter().any(|a| a == "-i"));
+            assert!(
+                !args.iter().any(|a| a == "-l"),
+                "bash is launched NON-login; the bootstrap reconstructs the login files"
+            );
+            dir
+        };
+        assert!(!path.exists(), "shim dir removed when IntegrationDir drops");
+    }
+
+    // ---- fish (T-2.3) ----------------------------------------------------------
+
+    #[test]
+    fn fish_integration_script_carries_nonce_marks_events_and_url_encoding() {
+        let nonce = ShimNonce("FISHABC123".into());
+        let s = fish_integration_script(&nonce, Path::new("/data/aterm-fish-xyz"));
+        assert!(s.contains("FISHABC123"), "nonce substituted");
+        assert!(!s.contains("__ATERM_NONCE__"), "nonce placeholder replaced");
+        assert!(
+            !s.contains("__ATERM_FISH_DATA_DIR__"),
+            "data-dir placeholder replaced"
+        );
+        assert!(
+            s.contains("/data/aterm-fish-xyz"),
+            "data dir substituted for the XDG cleanup"
+        );
+        assert!(s.contains("]7;file://"), "emits OSC 7 cwd");
+        assert!(
+            s.contains("--on-event fish_prompt"),
+            "A on the prompt event"
+        );
+        assert!(
+            s.contains("--on-event fish_preexec"),
+            "C on the preexec event"
+        );
+        assert!(
+            s.contains("--on-event fish_postexec"),
+            "D on the postexec event"
+        );
+        assert!(
+            s.contains("string escape --style=url"),
+            "cmdline percent-encoded so it cannot break out of the OSC"
+        );
+        assert!(s.contains("ATERM_INTEGRATION_LOADED"), "idempotency guard");
+    }
+
+    #[test]
+    fn fish_marks_are_atomic_with_their_introducer() {
+        let nonce = ShimNonce("FNONCE7".into());
+        let s = fish_integration_script(&nonce, Path::new("/d"));
+        for line in s.lines() {
+            if line.contains("]133;") && line.contains("aterm_nonce=") {
+                assert!(
+                    line.contains("\\033") || line.contains("\\e"),
+                    "a mark line must include the ESC introducer with the nonce \
+                     (atomicity); offending line: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn install_fish_materializes_vendor_conf_d_and_prepends_xdg() {
+        let nonce = ShimNonce("FISHINSTALL01".into());
+        let path = {
+            let shim = IntegrationDir::install_fish(&nonce, Some("/opt/share".into()))
+                .expect("materialize fish shim");
+            assert_eq!(shim.kind(), ShellKind::Fish);
+            let dir = shim.path().to_path_buf();
+            // fish auto-sources `<XDG_DATA_DIR>/fish/vendor_conf.d/*.fish`.
+            let script = dir.join("fish").join("vendor_conf.d").join("aterm.fish");
+            assert!(script.is_file(), "vendor_conf.d/aterm.fish written");
+            // XDG_DATA_DIRS prepends our dir, preserving the user's existing entries.
+            let env = shim.env_vars();
+            let (_, xdg) = env
+                .iter()
+                .find(|(k, _)| k == "XDG_DATA_DIRS")
+                .expect("XDG_DATA_DIRS set");
+            assert!(xdg.starts_with(&dir.to_string_lossy().into_owned()));
+            assert!(xdg.ends_with(":/opt/share"));
+            // fish is launched login + interactive.
+            assert_eq!(shim.shell_args(), vec!["-l".to_string(), "-i".to_string()]);
+            dir
+        };
+        assert!(!path.exists(), "shim dir removed when IntegrationDir drops");
+    }
+
+    #[test]
+    fn install_fish_defaults_xdg_when_user_has_none() {
+        let nonce = ShimNonce("FISHDEFXDG".into());
+        let shim = IntegrationDir::install_fish(&nonce, None).expect("materialize");
+        let env = shim.env_vars();
+        let (_, xdg) = env
+            .iter()
+            .find(|(k, _)| k == "XDG_DATA_DIRS")
+            .expect("XDG_DATA_DIRS set");
+        assert!(
+            xdg.ends_with(":/usr/local/share:/usr/share"),
+            "falls back to the XDG spec default base dirs; got {xdg}"
+        );
     }
 }

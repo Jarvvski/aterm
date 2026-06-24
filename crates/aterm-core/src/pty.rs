@@ -638,6 +638,246 @@ mod tests {
         let _ = std::fs::remove_dir_all(&user_zdotdir);
     }
 
+    /// Drive a real `bash` through the materialized shim and assert it emits
+    /// nonce-stamped OSC-133 marks (with the encoded command line on `C`) that the
+    /// T-2.1 filter accepts. Exercises whichever version tier `bash` is - the macOS
+    /// system `/bin/bash` (3.2, DEBUG-trap tier) and a Homebrew bash 5.3+ (PS0 tier).
+    fn assert_bash_shim_emits_marks(bash: &str) {
+        use crate::osc::OscScanner;
+        use crate::shell_integration::{IntegrationDir, ShimNonce};
+
+        let nonce = ShimNonce("ATERMBASHNONCE0123456".into());
+        // Isolate from the runner's own bash config: an empty HOME so no user
+        // .bash_profile/.bashrc loads and the test is deterministic.
+        let home = std::env::temp_dir().join(format!("aterm-bash-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        let shim = IntegrationDir::install_bash(&nonce).expect("materialize bash shim");
+        let mut env = shim.env_vars();
+        env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+        let arg_strings = shim.shell_args();
+        let args: Vec<&str> = arg_strings.iter().map(String::as_str).collect();
+
+        let pty = Pty::spawn(
+            bash,
+            &args,
+            small(),
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .expect("spawn bash");
+        let rx = reader_channel(pty.try_clone_reader().expect("clone reader"));
+        let mut writer = pty.take_writer().expect("take writer");
+
+        std::thread::sleep(Duration::from_millis(400));
+        writer
+            .write_all(b"echo aterm-bash-marker\n")
+            .expect("write command");
+        writer.flush().expect("flush");
+
+        // The C mark carries the percent-encoded command line; matching the full
+        // encoded form confirms a nonce'd C fired for THIS command.
+        let needle = "cmdline=echo%20aterm-bash-marker";
+        let out = read_until(&rx, needle, Duration::from_secs(15));
+        assert!(
+            out.contains(needle),
+            "{bash} should emit a nonce'd C mark with the encoded command line; \
+             captured: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("aterm_nonce={}", nonce.0)),
+            "{bash} marks must carry the session nonce; captured: {out:?}"
+        );
+        let mut scanner = OscScanner::with_nonce(nonce.0.clone());
+        let scan = scanner.scan(out.as_bytes());
+        assert!(
+            !scan.marks.is_empty(),
+            "the with_nonce scanner should accept {bash}'s marks; captured: {out:?}"
+        );
+
+        drop(pty);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Behavioral regression guard (the content-only tests cannot catch these). Drive
+    /// a real `bash` through a SEQUENCE - a command, two empty Enters, a pipeline, a
+    /// UTF-8 command - and assert: (a) the empty Enters emit NO C (no phantom blocks);
+    /// (b) the pipeline's FULL command line is captured; (c) a UTF-8 command line
+    /// round-trips byte-correctly through the encoder + osc.rs `percent_decode`. Runs
+    /// with a multi-command user `PROMPT_COMMAND` - the hardest case for the bash
+    /// 3.2 - 5.2 DEBUG-trap tier, whose own hook commands also trip the trap.
+    fn assert_bash_lifecycle_behaviors(bash: &str) {
+        use crate::osc::{Mark, OscScanner};
+        use crate::shell_integration::{IntegrationDir, ShimNonce};
+
+        let nonce = ShimNonce("ATERMBASHPHANTOM0123".into());
+        let home = std::env::temp_dir().join(format!(
+            "aterm-bash-beh-{}-{}",
+            std::process::id(),
+            bash.replace('/', "_")
+        ));
+        let _ = std::fs::create_dir_all(&home);
+        std::fs::write(
+            home.join(".bash_profile"),
+            "upc1() { :; }\nupc2() { :; }\nPROMPT_COMMAND=\"upc1; echo -n; upc2\"\n",
+        )
+        .expect("write .bash_profile");
+
+        let shim = IntegrationDir::install_bash(&nonce).expect("materialize bash shim");
+        let mut env = shim.env_vars();
+        env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+        let arg_strings = shim.shell_args();
+        let args: Vec<&str> = arg_strings.iter().map(String::as_str).collect();
+
+        let pty = Pty::spawn(
+            bash,
+            &args,
+            small(),
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .expect("spawn bash");
+        let rx = reader_channel(pty.try_clone_reader().expect("clone reader"));
+        let mut writer = pty.take_writer().expect("take writer");
+
+        std::thread::sleep(Duration::from_millis(400));
+        // echo ONE | empty | empty | pipeline | UTF-8 (caf\xc3\xa9) | sentinel.
+        for line in [
+            &b"echo ONE\n"[..],
+            b"\n",
+            b"\n",
+            b"echo two | cat\n",
+            b"echo caf\xc3\xa9\n",
+            b"echo PHANTOMDONE\n",
+        ] {
+            writer.write_all(line).expect("write");
+            writer.flush().expect("flush");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        let out = read_until(&rx, "cmdline=echo%20PHANTOMDONE", Duration::from_secs(15));
+        let c_mark = format!("133;C;aterm_nonce={}", nonce.0);
+        let c_count = out.matches(&c_mark).count();
+        assert_eq!(
+            c_count, 4,
+            "{bash}: exactly 4 C marks (echo ONE, the pipeline, the UTF-8 echo, \
+             echo PHANTOMDONE) - the two empty Enters must emit NONE; got {c_count}. \
+             captured: {out:?}"
+        );
+        assert_eq!(
+            out.matches("cmdline=echo%20ONE").count(),
+            1,
+            "{bash}: 'echo ONE' must appear once, not be re-reported by an empty-Enter \
+             phantom; captured: {out:?}"
+        );
+        assert!(
+            out.contains("cmdline=echo%20two%20%7C%20cat"),
+            "{bash}: the pipeline's FULL command line must be captured; captured: {out:?}"
+        );
+        // UTF-8 round-trip: the encoder emits bytes (caf%C3%A9) and osc.rs decodes
+        // them back to the original string.
+        assert!(
+            out.contains("cmdline=echo%20caf%C3%A9"),
+            "{bash}: a UTF-8 command line must be percent-encoded BYTE-wise; captured: {out:?}"
+        );
+        let mut scanner = OscScanner::with_nonce(nonce.0.clone());
+        let scan = scanner.scan(out.as_bytes());
+        let decoded: Vec<&String> = scan
+            .marks
+            .iter()
+            .filter_map(|(_, m)| match m {
+                Mark::CommandLine(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            decoded.iter().any(|c| c.as_str() == "echo café"),
+            "{bash}: the UTF-8 command line must percent-decode back to 'echo café'; \
+             decoded command lines: {decoded:?}"
+        );
+
+        drop(pty);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn bash_shim_emits_nonce_marks_through_real_bash() {
+        // Run against every bash present so both tiers are covered where available
+        // (macOS CI has /bin/bash 3.2; dev boxes usually also have Homebrew 5.3+).
+        let candidates = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash"];
+        let present: Vec<&str> = candidates
+            .into_iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .collect();
+        if present.is_empty() {
+            eprintln!("skip bash_shim_emits_nonce_marks: no bash on this host");
+            return;
+        }
+        for bash in present {
+            assert_bash_shim_emits_marks(bash);
+            assert_bash_lifecycle_behaviors(bash);
+        }
+    }
+
+    #[test]
+    fn fish_shim_emits_nonce_marks_through_real_fish() {
+        // fish >= 3.2 auto-sources our vendor_conf.d script once we prepend the shim
+        // dir to XDG_DATA_DIRS. Skip-if-absent (fish is not on macOS by default).
+        use crate::osc::OscScanner;
+        use crate::shell_integration::{IntegrationDir, ShimNonce};
+
+        let candidates = [
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/usr/bin/fish",
+        ];
+        let fish = match candidates
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        {
+            Some(f) => f,
+            None => {
+                eprintln!("skip fish_shim_emits_nonce_marks: no fish on this host");
+                return;
+            }
+        };
+
+        let nonce = ShimNonce("ATERMFISHNONCE0123456".into());
+        let shim = IntegrationDir::install_fish(&nonce, std::env::var("XDG_DATA_DIRS").ok())
+            .expect("materialize fish shim");
+        let env = shim.env_vars();
+        let arg_strings = shim.shell_args();
+        let args: Vec<&str> = arg_strings.iter().map(String::as_str).collect();
+
+        let pty = Pty::spawn(
+            fish,
+            &args,
+            small(),
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .expect("spawn fish");
+        let rx = reader_channel(pty.try_clone_reader().expect("clone reader"));
+        let mut writer = pty.take_writer().expect("take writer");
+
+        std::thread::sleep(Duration::from_millis(500));
+        writer
+            .write_all(b"echo aterm-fish-marker\n")
+            .expect("write command");
+        writer.flush().expect("flush");
+
+        let needle = format!("aterm_nonce={}", nonce.0);
+        let out = read_until(&rx, &needle, Duration::from_secs(15));
+        assert!(
+            out.contains(&needle),
+            "fish should emit nonce-stamped OSC-133 marks; captured: {out:?}"
+        );
+        let mut scanner = OscScanner::with_nonce(nonce.0.clone());
+        let scan = scanner.scan(out.as_bytes());
+        assert!(
+            !scan.marks.is_empty(),
+            "the with_nonce scanner should accept fish's marks; captured: {out:?}"
+        );
+
+        drop(pty);
+    }
+
     #[test]
     fn foreground_pgid_and_signal_interrupt_sleep() {
         use std::os::fd::BorrowedFd;

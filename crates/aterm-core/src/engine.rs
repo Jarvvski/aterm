@@ -44,6 +44,7 @@
 //! (child exits first) flows the same way: EOF → reader sends `Exited` → model
 //! breaks. Either way no thread is left detached and there is no hang.
 
+use std::io;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -129,11 +130,18 @@ pub struct Engine {
     /// backend exposed no master fd or the dup failed.
     #[cfg(unix)]
     fg_fd: Option<std::os::fd::OwnedFd>,
-    /// The materialized zsh `ZDOTDIR` shim dir (ticket T-2.2), held for the engine's
-    /// lifetime so it is removed only when the engine drops - AFTER `Drop` has joined
-    /// the threads and killed the child, so `exec zsh` mid-session still finds it.
-    /// `None` for non-zsh shells / test commands. Underscore: held for cleanup, not read.
+    /// The materialized shell-integration shim dir (tickets T-2.2 zsh, T-2.3
+    /// bash/fish), held for the engine's lifetime so it is removed only when the
+    /// engine drops - AFTER `Drop` has joined the threads and killed the child, so
+    /// `exec zsh` mid-session still finds it. `None` for unsupported shells / test
+    /// commands. Underscore: held for cleanup, not read.
     _integration: Option<IntegrationDir>,
+    /// The detected login [`ShellKind`] (`Other` for an unrecognised shell or a test
+    /// command). Feeds the T-2.6 integration indicator (Integrated / Heuristic /
+    /// Unknown) together with [`Engine::integration_active`].
+    shell_kind: ShellKind,
+    /// Whether a nonce-armed integration shim was actually installed this session.
+    integration_active: bool,
     reader: Option<JoinHandle<()>>,
     model: Option<JoinHandle<()>>,
 }
@@ -141,44 +149,74 @@ pub struct Engine {
 impl Engine {
     /// Spawn a login shell on a fresh PTY and start the engine.
     ///
-    /// When the login shell is zsh we install the shell-integration shim (ticket
-    /// T-2.2): a per-session `ZDOTDIR` shim is materialized, the child is spawned
-    /// with `$ZDOTDIR` pointed at it (zero dotfile edits), and the OSC scanner is
-    /// armed with the shim's nonce ([`OscScanner::with_nonce`]) so ONLY our marks
-    /// are trusted. For any other shell (or if the shim cannot be installed) we
-    /// spawn plainly and run the scanner untrusted (no nonce'd marks will appear).
+    /// For each supported shell we install a shell-integration shim (zsh: T-2.2;
+    /// bash/fish: T-2.3): a per-session shim dir is materialized, the child is
+    /// spawned with the env/args that load it (zero dotfile edits), and the OSC
+    /// scanner is armed with the shim's nonce ([`OscScanner::with_nonce`]) so ONLY
+    /// our marks are trusted. For an unsupported shell (or if the shim cannot be
+    /// installed) we spawn plainly with `-l` and run the scanner untrusted - no
+    /// nonce'd marks will appear, and the detected [`ShellKind`] (`Other`) drives the
+    /// "Unknown" integration state.
     pub fn spawn_login_shell(dims: PtyDimensions, scrollback: usize) -> Result<Self, PtyError> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let kind = ShellKind::from_path(&shell);
 
-        let mut osc = OscScanner::untrusted();
-        let mut env: Vec<(String, String)> = Vec::new();
-        let mut integration: Option<IntegrationDir> = None;
-
-        if ShellKind::from_path(&shell) == ShellKind::Zsh {
-            let orig_zdotdir = std::env::var("ZDOTDIR").ok();
-            if should_inject_zsh(orig_zdotdir.as_deref()) {
-                let nonce = ShimNonce::generate();
-                match IntegrationDir::install_zsh(&nonce, orig_zdotdir) {
-                    Ok(shim) => {
-                        env = shim.env_vars();
-                        osc = OscScanner::with_nonce(nonce.0);
-                        integration = Some(shim);
-                    }
-                    Err(e) => log::warn!(
-                        "zsh shell-integration shim install failed: {e}; \
-                         block segmentation disabled this session"
-                    ),
+        let nonce = ShimNonce::generate();
+        // Try to install the shim for the detected shell. `should_inject_zsh` guards
+        // the one footgun (a foreign custom `ZDOTDIR`); bash/fish have no equivalent
+        // hijack risk, so they always inject when detected.
+        let install: io::Result<Option<IntegrationDir>> = match kind {
+            ShellKind::Zsh => {
+                let orig_zdotdir = std::env::var("ZDOTDIR").ok();
+                if should_inject_zsh(orig_zdotdir.as_deref()) {
+                    IntegrationDir::install_zsh(&nonce, orig_zdotdir).map(Some)
+                } else {
+                    Ok(None)
                 }
             }
-        }
+            ShellKind::Bash => IntegrationDir::install_bash(&nonce).map(Some),
+            ShellKind::Fish => {
+                IntegrationDir::install_fish(&nonce, std::env::var("XDG_DATA_DIRS").ok()).map(Some)
+            }
+            ShellKind::Other => Ok(None),
+        };
+
+        let mut osc = OscScanner::untrusted();
+        let integration = match install {
+            Ok(Some(shim)) => {
+                osc = OscScanner::with_nonce(nonce.0);
+                Some(shim)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!(
+                    "{kind:?} shell-integration shim install failed: {e}; \
+                     block segmentation disabled this session"
+                );
+                None
+            }
+        };
+
+        // Spawn args: the shim's loader args when installed, else a plain login shell.
+        let env = integration
+            .as_ref()
+            .map(IntegrationDir::env_vars)
+            .unwrap_or_default();
+        let arg_strings = integration
+            .as_ref()
+            .map(IntegrationDir::shell_args)
+            .unwrap_or_else(|| vec!["-l".to_string()]);
+        let args: Vec<&str> = arg_strings.iter().map(String::as_str).collect();
 
         let pty = Pty::spawn(
             &shell,
-            &["-l"],
+            &args,
             dims,
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         )?;
-        Self::spawn_with_pty(pty, dims, scrollback, osc, integration)
+        let mut engine = Self::spawn_with_pty(pty, dims, scrollback, osc, integration)?;
+        engine.shell_kind = kind;
+        Ok(engine)
     }
 
     /// Spawn an arbitrary `program` with `args` on a fresh PTY and start the
@@ -269,7 +307,10 @@ impl Engine {
             metrics,
             #[cfg(unix)]
             fg_fd,
+            integration_active: integration.is_some(),
             _integration: integration,
+            // Set by `spawn_login_shell`; a raw `spawn_command` host is `Other`.
+            shell_kind: ShellKind::Other,
             reader: Some(reader_handle),
             model: Some(model_handle),
         })
@@ -318,6 +359,21 @@ impl Engine {
     /// Number of command blocks segmented so far.
     pub fn block_count(&self) -> usize {
         self.metrics.blocks.load(Ordering::Relaxed)
+    }
+
+    /// The detected login [`ShellKind`]. `Other` means an unrecognised shell with no
+    /// integration - the T-2.6 indicator reports it as "Unknown".
+    #[must_use]
+    pub fn shell_kind(&self) -> ShellKind {
+        self.shell_kind
+    }
+
+    /// Whether a nonce-armed integration shim was installed for this session. `false`
+    /// for an unsupported shell or when shim install failed (the T-2.6 indicator then
+    /// shows "Unknown" / "Heuristic" rather than "Integrated").
+    #[must_use]
+    pub fn integration_active(&self) -> bool {
+        self.integration_active
     }
 }
 

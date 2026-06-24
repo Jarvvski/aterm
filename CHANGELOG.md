@@ -22,13 +22,24 @@ the next version (or an `## Unreleased` heading until a version is cut).
   blocks from the app's own marks. Marks now fire in lockstep with the grid - the
   engine interleaves VT parsing and mark-application by stream offset, so the
   alt-screen decision is made against the true emulator state (ticket T-2.5).
+- **bash + fish shell integration.** Command-block marks now work in bash and fish
+  too, not just zsh - same zero-dotfile-edit, nonce-stamped OSC-133 + OSC 7 contract.
+  bash launches via a `--rcfile` bootstrap that reconstructs the normal startup
+  sequence (preserving `/etc/profile`) then installs hooks last, version-branched:
+  `PS0` + `PROMPT_COMMAND` on bash >= 5.3, a minimal `DEBUG`-trap preexec emulation on
+  bash 3.2 - 5.2 (so macOS's system bash works, if less reliably). fish injects via a
+  `vendor_conf.d` script on `XDG_DATA_DIRS` and hooks the `fish_prompt`/`fish_preexec`/
+  `fish_postexec` events. The engine reports the detected shell (and whether
+  integration is active) for the forthcoming status indicator; an unrecognised shell
+  runs raw and reports as unknown (ticket T-2.3). All three shims percent-encode the
+  command line byte-wise, so UTF-8 commands (accented paths, non-Latin text) round-trip
+  exactly - which also corrects the zsh shim's command-line encoding.
 - **zsh shell integration (command-block marks).** Launching aterm with zsh now
   installs a per-session `ZDOTDIR` shim - zero dotfile edits, restores the user's
   real config, removed on exit - that emits nonce-stamped OSC-133 A/B/C/D + OSC 7
   marks around the prompt and command. The engine arms its OSC filter with the
   shim's nonce, so command blocks segment reliably regardless of prompt theme and a
-  foreign program's (un-nonced) marks are ignored (tickets T-2.2 + T-2.1). bash and
-  fish are next (T-2.3).
+  foreign program's (un-nonced) marks are ignored (tickets T-2.2 + T-2.1).
 - **Terminal query replies.** Programs that probe the terminal - Primary Device
   Attributes (`\x1b[c`), cursor-position / status (`\x1b[6n`) - now receive their
   answers: the VT engine writes the reply straight back to the PTY on the model
