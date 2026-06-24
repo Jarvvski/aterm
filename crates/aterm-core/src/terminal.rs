@@ -26,10 +26,13 @@
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{point_to_viewport, Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use crossbeam_channel::{Receiver, Sender};
+
+use crate::block::RowSnapshot;
 
 /// Default scrollback (lines of history). Matches alacritty's own default and the
 /// dossier; surfaced as a config knob via [`Terminal::with_scrollback`].
@@ -51,6 +54,16 @@ pub(crate) const EVENT_CHANNEL_CAP: usize = 1_024;
 /// `\x1b[6n` DSR flood from a child that never drains its own input cannot grow
 /// this without bound, and the model's poll-guarded write never blocks on it.
 pub(crate) const REPLY_CHANNEL_CAP: usize = 1_024;
+
+/// Viewport height of the throwaway terminal used to replay a finished command's
+/// output for capture (ticket T-2.7). The captured height is however many rows the
+/// output actually produced (they scroll into the capture scrollback), not this.
+const CAPTURE_VIEWPORT_ROWS: usize = 24;
+
+/// Scrollback (retained output lines) for the capture replay - the per-block captured
+/// output ceiling in rows. A command whose output exceeds this loses its oldest lines
+/// in the replay (rare; the streaming / packed-storage capture is the follow-up).
+const CAPTURE_SCROLLBACK: usize = 50_000;
 
 /// Color of a cell as resolved by the VT engine, in a renderer-neutral form.
 ///
@@ -438,19 +451,7 @@ impl Terminal {
             if row >= rows || col >= cols {
                 continue;
             }
-            let cell = indexed.cell;
-            let flags = cell.flags;
-            out.cells[row * cols + col] = SnapshotCell {
-                c: cell.c,
-                fg: map_color(cell.fg),
-                bg: map_color(cell.bg),
-                bold: flags.contains(Flags::BOLD),
-                italic: flags.contains(Flags::ITALIC),
-                underline: flags.contains(Flags::UNDERLINE),
-                inverse: flags.contains(Flags::INVERSE),
-                wide: flags.contains(Flags::WIDE_CHAR),
-                wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
-            };
+            out.cells[row * cols + col] = map_cell(indexed.cell);
         }
 
         out.cursor = point_to_viewport(display_offset, cursor_point)
@@ -459,6 +460,74 @@ impl Terminal {
                 col: vp.column.0,
             })
             .unwrap_or_default();
+    }
+
+    /// Replay OSC-filtered command-output bytes through a throwaway off-screen
+    /// terminal `cols` wide and capture the result as owned immutable row snapshots -
+    /// the finished-command-block output capture (ticket T-2.7).
+    ///
+    /// Capturing from a byte *replay* rather than the live grid is what lets long
+    /// output survive: the live scrollback ring evicts a command's early lines as it
+    /// runs, and `alacritty_terminal` 0.26 exposes no stable line anchor to recover
+    /// them - but the byte stream the OSC pre-parser saw (between marks `C` and `D`)
+    /// is complete. Replaying it onto a fresh screen of the same width reproduces the
+    /// command's colors, attributes, soft-wrapping, and in-place `\r` redraws exactly
+    /// (a fresh screen + the output bytes == precisely what those bytes mean as
+    /// output). Trailing blank rows and each row's trailing blank cells are trimmed.
+    #[must_use]
+    pub fn capture_output_rows(cols: usize, clean_bytes: &[u8]) -> Vec<RowSnapshot> {
+        let mut t =
+            Terminal::with_scrollback(CAPTURE_VIEWPORT_ROWS, cols.max(1), CAPTURE_SCROLLBACK);
+        t.feed(clean_bytes);
+        t.captured_rows()
+    }
+
+    /// Capture every retained row (top of history down through the viewport) of this
+    /// terminal as owned [`RowSnapshot`]s, with each row trimmed to its last non-blank
+    /// cell and trailing fully-blank rows dropped. Used by [`Self::capture_output_rows`]
+    /// against the throwaway replay terminal.
+    fn captured_rows(&self) -> Vec<RowSnapshot> {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+        let mut rows: Vec<RowSnapshot> = Vec::with_capacity((bottom - top + 1).max(0) as usize);
+        for li in top..=bottom {
+            let row = &grid[Line(li)];
+            let mut cells: Vec<SnapshotCell> =
+                (0..cols).map(|c| map_cell(&row[Column(c)])).collect();
+            // Trim trailing default cells (a blank tail carries no glyph/bg of note).
+            let width = cells
+                .iter()
+                .rposition(|c| *c != SnapshotCell::default())
+                .map_or(0, |i| i + 1);
+            cells.truncate(width);
+            rows.push(RowSnapshot::new(cells));
+        }
+        // Drop the empty viewport tail below the output.
+        while rows.last().is_some_and(|r| r.cells.is_empty()) {
+            rows.pop();
+        }
+        rows
+    }
+}
+
+/// Map one alacritty [`Cell`] to our renderer-neutral [`SnapshotCell`]. Shared by the
+/// viewport snapshot ([`Terminal::snapshot_into`]) and the finished-block output
+/// capture ([`Terminal::capture_output_rows`], ticket T-2.7) so both resolve color +
+/// attribute flags identically.
+fn map_cell(cell: &Cell) -> SnapshotCell {
+    let flags = cell.flags;
+    SnapshotCell {
+        c: cell.c,
+        fg: map_color(cell.fg),
+        bg: map_color(cell.bg),
+        bold: flags.contains(Flags::BOLD),
+        italic: flags.contains(Flags::ITALIC),
+        underline: flags.contains(Flags::UNDERLINE),
+        inverse: flags.contains(Flags::INVERSE),
+        wide: flags.contains(Flags::WIDE_CHAR),
+        wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
     }
 }
 
@@ -706,5 +775,52 @@ mod tests {
         assert_eq!(owned.cursor, into.cursor);
         assert_eq!(owned.alt_screen, into.alt_screen);
         assert_eq!(owned.display_offset, into.display_offset);
+    }
+
+    #[test]
+    fn capture_output_rows_renders_command_output() {
+        // T-2.7 capture: replaying a command's clean output bytes yields its rows.
+        let rows = Terminal::capture_output_rows(40, b"alpha\r\nbravo\r\ncharlie\r\n");
+        let text: Vec<String> = rows
+            .iter()
+            .map(|r| r.cells.iter().map(|c| c.c).collect())
+            .collect();
+        assert_eq!(text, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn capture_output_rows_trims_trailing_blank_rows_and_cells() {
+        // Trailing newlines (blank rows) and trailing spaces (blank cells) are trimmed.
+        let rows = Terminal::capture_output_rows(40, b"hi   \r\n\r\n\r\n");
+        assert_eq!(rows.len(), 1, "trailing blank rows dropped");
+        assert_eq!(rows[0].cells.iter().map(|c| c.c).collect::<String>(), "hi");
+    }
+
+    #[test]
+    fn capture_output_rows_preserves_color_and_attrs() {
+        // SGR color/attrs survive the replay capture (red + bold on the first cell).
+        let rows = Terminal::capture_output_rows(20, b"\x1b[31;1mERR\x1b[0m\r\n");
+        assert_eq!(rows.len(), 1);
+        let c = rows[0].cells[0];
+        assert_eq!(c.c, 'E');
+        assert_eq!(c.fg, CellColor::Named(1)); // ANSI Red
+        assert!(c.bold);
+    }
+
+    #[test]
+    fn capture_output_rows_handles_in_place_carriage_return_redraw() {
+        // A `\r` progress redraw resolves to its FINAL state (the replay reproduces
+        // in-place redraws), not a pile of intermediate lines.
+        let rows = Terminal::capture_output_rows(40, b"10%\r50%\r100%\r\n");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].cells.iter().map(|c| c.c).collect::<String>(),
+            "100%"
+        );
+    }
+
+    #[test]
+    fn capture_output_rows_empty_input_is_empty() {
+        assert!(Terminal::capture_output_rows(40, b"").is_empty());
     }
 }

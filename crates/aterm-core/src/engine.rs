@@ -91,6 +91,13 @@ pub(crate) const COALESCE_INTERVAL: Duration = Duration::from_millis(5);
 /// protocol constant.
 pub(crate) const INTEGRATION_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 
+/// Per-command output-capture byte ceiling (ticket T-2.7). While a command runs, its
+/// clean output bytes are buffered so the finished block's rows can be captured by
+/// replay at `D`; a command whose output exceeds this keeps the head and drops the
+/// tail (rare - 8 MiB is tens of thousands of text lines; streaming / packed capture
+/// for unbounded output is the follow-up). The buffer is freed once captured.
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Lightweight, lock-free counters the model thread updates and the handle (and
 /// tests) read. Cheap observability into the pipeline; not on the render path.
 #[derive(Debug, Default)]
@@ -388,6 +395,8 @@ impl Engine {
             blocks: BlockList::new(),
             latest_blocks: Arc::clone(&latest_blocks),
             blocks_touched: false,
+            capture_buf: Vec::new(),
+            capturing: false,
             integration: monitor,
             integration_code: Arc::clone(&integration_code),
             confirm_window,
@@ -599,6 +608,15 @@ struct Model {
     /// [`Model::publish_blocks`] so an idle session that only streams output re-clones
     /// nothing.
     blocks_touched: bool,
+    /// Clean output bytes of the currently-running command, buffered from its `C` mark
+    /// so the finished block's rows can be captured by replay at `D` (ticket T-2.7).
+    /// Empty + dormant unless a command's output is being captured. Capped at
+    /// [`MAX_CAPTURE_BYTES`]; freed once captured.
+    capture_buf: Vec<u8>,
+    /// Whether a command's output is currently being captured (between its `C` and
+    /// `D`). Cleared - and the buffer discarded - if the command turns out to be a
+    /// full-screen (alt-screen) app, which has no captured output.
+    capturing: bool,
     /// Integration-indicator decision machine (ticket T-2.6). The model confirms it
     /// on a nonce-matched `A` and times it out via the confirmation-window timer in
     /// [`run_model`], publishing the result through `integration_code`.
@@ -663,7 +681,9 @@ impl Model {
         for (offset, mark) in &scan.marks {
             let rel = offset.saturating_sub(chunk_start).min(passthrough.len());
             if rel > fed {
-                self.terminal.feed(&passthrough[fed..rel]);
+                let seg = &passthrough[fed..rel];
+                self.terminal.feed(seg);
+                self.capture_feed(seg);
                 fed = rel;
             }
             self.segmenter
@@ -678,9 +698,31 @@ impl Model {
             {
                 self.integration.confirm();
             }
+            // Finished-block output capture (ticket T-2.7): buffer this command's clean
+            // output from its `C`, capture it by replay on `D`. Gated OFF the alt screen
+            // so a full-screen app's bytes are never captured (its block is Interactive,
+            // output-less). The byte stream - not the live grid - is the capture source,
+            // so output that scrolled out of the grid still survives.
+            if !self.terminal.is_alt_screen() {
+                match mark {
+                    Mark::Prompt(PromptKind::OutputStart) => {
+                        self.capturing = true;
+                        self.capture_buf.clear();
+                    }
+                    Mark::Prompt(PromptKind::CommandDone { .. }) => self.capture_finish(),
+                    // Missing-`D` recovery: the segmenter just closed the orphan; capture
+                    // whatever output it produced before it was interrupted.
+                    Mark::Prompt(PromptKind::PromptStart) if self.capturing => {
+                        self.capture_finish();
+                    }
+                    _ => {}
+                }
+            }
         }
         if fed < passthrough.len() {
-            self.terminal.feed(&passthrough[fed..]);
+            let seg = &passthrough[fed..];
+            self.terminal.feed(seg);
+            self.capture_feed(seg);
         }
         self.clean_offset += passthrough.len();
         // Feed the heuristic detector its newline signal (ticket T-2.6) - "a command
@@ -707,6 +749,44 @@ impl Model {
         // Publish any integration-state change (e.g. a just-confirmed `A`) so the UI
         // indicator sees it without waiting for the next publish tick (T-2.6).
         self.publish_integration();
+    }
+
+    /// Buffer a segment of clean command output for capture, while a command's output
+    /// is being captured (ticket T-2.7). Discards the in-flight capture if a
+    /// full-screen app has taken the screen (its block is Interactive, output-less).
+    /// Capped at [`MAX_CAPTURE_BYTES`]; excess is dropped (head kept).
+    fn capture_feed(&mut self, bytes: &[u8]) {
+        if !self.capturing {
+            return;
+        }
+        if self.terminal.is_alt_screen() {
+            self.capturing = false;
+            self.capture_buf.clear();
+            return;
+        }
+        let room = MAX_CAPTURE_BYTES.saturating_sub(self.capture_buf.len());
+        if room > 0 {
+            let take = room.min(bytes.len());
+            self.capture_buf.extend_from_slice(&bytes[..take]);
+        }
+    }
+
+    /// Capture the running command's buffered output into its block's immutable row
+    /// snapshot by replaying the bytes (ticket T-2.7), then free the buffer. No-op when
+    /// nothing is being captured (e.g. the command turned out to be a full-screen app).
+    fn capture_finish(&mut self) {
+        if !self.capturing {
+            return;
+        }
+        self.capturing = false;
+        if !self.blocks.is_empty() {
+            let idx = self.blocks.len() - 1;
+            let rows = Terminal::capture_output_rows(self.terminal.cols(), &self.capture_buf);
+            self.blocks.set_block_output(idx, rows);
+            self.blocks_touched = true;
+        }
+        // Free the buffer between commands so a large command does not pin memory.
+        self.capture_buf = Vec::new();
     }
 
     /// Publish the current [`Integration`] to the handle's lock-free slot (T-2.6).
@@ -1764,5 +1844,59 @@ mod tests {
             "a heuristic session's published blocks are labeled approximate"
         );
         drop(engine);
+    }
+
+    #[test]
+    fn finished_block_captures_its_output_rows() {
+        // T-2.7 end to end: a full A;C;output;D cycle through the nonce-armed scanner
+        // closes a block whose immutable output rows are captured (by byte replay).
+        let nonce = "ATERMCAP0000";
+        let script = format!(
+            "printf '\\033]133;A;aterm_nonce={n}\\007'; \
+             printf '\\033]133;C;aterm_nonce={n}\\007'; \
+             printf 'alpha\\nbravo\\ncharlie\\n'; \
+             printf '\\033]133;D;0;aterm_nonce={n}\\007'; \
+             sleep 2",
+            n = nonce
+        );
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", &script],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            Some(nonce),
+            Duration::from_secs(5),
+        )
+        .expect("spawn sh emitting a full command cycle");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let blocks = engine.latest_blocks();
+            if let Some(b) = blocks.get(0) {
+                if !b.is_running() && !b.output.is_empty() {
+                    let text: Vec<String> = b
+                        .output
+                        .iter()
+                        .map(|r| r.cells.iter().map(|c| c.c).collect())
+                        .collect();
+                    assert!(
+                        text.iter().any(|t| t.contains("alpha")),
+                        "captured output should contain the first line, got {text:?}"
+                    );
+                    assert!(
+                        text.iter().any(|t| t.contains("charlie")),
+                        "captured output should contain the last line, got {text:?}"
+                    );
+                    drop(engine);
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the finished block's output rows were not captured in time"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

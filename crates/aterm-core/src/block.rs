@@ -107,24 +107,19 @@ impl Block {
     }
 
     /// A finished, non-interactive command that produced NO output (e.g. `true`,
-    /// `cd`): the renderer collapses these to a thin marker line rather than an
-    /// empty output card (ticket T-2.5, AC4).
+    /// `cd`): the renderer collapses these to a thin marker line rather than an empty
+    /// output card (ticket T-2.5, AC4).
     ///
-    /// This is **conservative** until grid-row capture lands (see [`BlockList::
-    /// set_block_output`]): the `output_span.end == start` clause keys "no output"
-    /// off zero CLEAN bytes between `C` and `D`. That is exact for a truly silent
-    /// command, but a command that emits only a non-stripped zero-width control
-    /// sequence (an OSC 7 cwd report, OSC 1337) advances the clean offset, so its
-    /// span is non-empty and it is *not* flagged thin - it renders as an empty card
-    /// instead. This errs toward a card, never toward collapsing real output, so it
-    /// is safe; the precise signal is the captured `output` rows, and once those are
-    /// populated on `D` this should key thin off `output.is_empty()` alone.
+    /// Keyed off the captured `output` rows now that the engine snapshots them on `D`
+    /// (ticket T-2.7): a command is thin exactly when it finished with no captured
+    /// output rows. A command that emits only a zero-width control sequence (a bare
+    /// cursor move or SGR reset) produces no visible rows and is correctly thin; one
+    /// that prints anything visible is not. (Earlier this conservatively keyed off the
+    /// `C`..`D` byte span, erring toward an empty card; the captured rows are the exact
+    /// signal.)
     #[must_use]
     pub fn is_thin(&self) -> bool {
-        !self.interactive
-            && !self.is_running()
-            && self.output.is_empty()
-            && self.output_span.end == Some(self.output_span.start)
+        !self.interactive && !self.is_running() && self.output.is_empty()
     }
 
     /// This block's RAW height in grid rows: one row for the command/prompt line
