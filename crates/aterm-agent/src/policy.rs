@@ -5,6 +5,7 @@
 
 use crate::command::ShellCommand;
 use crate::risk::{DefaultRiskClassifier, Risk, RiskAssessment, RiskReason};
+use crate::secrets::Secrets;
 
 /// What the policy decided for a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,14 +33,15 @@ impl ApprovalPolicy {
         Self::default()
     }
 
-    /// Decide on a raw command line.
-    pub fn decide(&self, line: &str) -> Approval {
-        self.decide_command(&ShellCommand::parse(line))
+    /// Decide on a raw command line, classifying against the single [`Secrets`]
+    /// source so the gate shares the sanitizer's deny-set.
+    pub fn decide(&self, line: &str, secrets: &Secrets) -> Approval {
+        self.decide_command(&ShellCommand::parse(line), secrets)
     }
 
     /// Decide on a parsed command.
-    pub fn decide_command(&self, cmd: &ShellCommand) -> Approval {
-        let assessment = self.classifier.classify(cmd);
+    pub fn decide_command(&self, cmd: &ShellCommand, secrets: &Secrets) -> Approval {
+        let assessment = self.classifier.classify(cmd, secrets);
         // AUTO-SAFE: only Safe AND not shell-active.
         let shell_active = cmd.structure.is_shell_active()
             || assessment.reasons.contains(&RiskReason::ShellActive);
@@ -58,21 +60,24 @@ mod tests {
     #[test]
     fn safe_inert_command_auto_approves() {
         let p = ApprovalPolicy::new();
-        assert!(p.decide("ls -la").is_auto());
-        assert!(p.decide("git status").is_auto());
+        let s = Secrets::new();
+        assert!(p.decide("ls -la", &s).is_auto());
+        assert!(p.decide("git status", &s).is_auto());
     }
 
     #[test]
     fn caution_requires_confirm() {
         let p = ApprovalPolicy::new();
-        assert!(!p.decide("brew list").is_auto());
-        assert!(!p.decide("some-random-binary").is_auto());
+        let s = Secrets::new();
+        assert!(!p.decide("brew list", &s).is_auto());
+        assert!(!p.decide("some-random-binary", &s).is_auto());
     }
 
     #[test]
     fn dangerous_requires_confirm() {
         let p = ApprovalPolicy::new();
-        match p.decide("rm -rf ~") {
+        let s = Secrets::new();
+        match p.decide("rm -rf ~", &s) {
             Approval::RequireConfirm(a) => {
                 assert_eq!(a.level, Risk::Dangerous);
             }
@@ -84,6 +89,7 @@ mod tests {
     fn shell_active_safe_program_still_requires_confirm() {
         // `ls | grep` is built from safe programs but is shell-active.
         let p = ApprovalPolicy::new();
-        assert!(!p.decide("ls | grep foo").is_auto());
+        let s = Secrets::new();
+        assert!(!p.decide("ls | grep foo", &s).is_auto());
     }
 }

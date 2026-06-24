@@ -91,8 +91,10 @@ const INTERPRETERS: &[&str] = &[
 ];
 
 impl DefaultRiskClassifier {
-    /// Classify a parsed command. Pure; no IO beyond the static secret deny-set.
-    pub fn classify(&self, cmd: &ShellCommand) -> RiskAssessment {
+    /// Classify a parsed command against the single [`Secrets`] source. Pure; the
+    /// deny-set is borrowed from `secrets`, never a private copy, so the gate and
+    /// the [`crate::sanitizer::OutputSanitizer`] cannot drift.
+    pub fn classify(&self, cmd: &ShellCommand, secrets: &Secrets) -> RiskAssessment {
         let mut reasons: Vec<RiskReason> = Vec::new();
         let mut level = Risk::Safe;
 
@@ -156,7 +158,7 @@ impl DefaultRiskClassifier {
         }
 
         // 6. Secret-path access → Dangerous.
-        if Secrets::argv_touches_secret(&cmd.argv) {
+        if secrets.argv_touches_secret(&cmd.argv) {
             escalate(
                 Risk::Dangerous,
                 RiskReason::SecretPathAccess,
@@ -328,7 +330,7 @@ mod tests {
     use super::*;
 
     fn classify(line: &str) -> RiskAssessment {
-        DefaultRiskClassifier.classify(&ShellCommand::parse(line))
+        DefaultRiskClassifier.classify(&ShellCommand::parse(line), &Secrets::new())
     }
 
     #[test]
@@ -386,6 +388,26 @@ mod tests {
     #[test]
     fn secret_path_read_dangerous() {
         let a = classify("cat ~/.ssh/id_rsa");
+        assert_eq!(a.level, Risk::Dangerous);
+        assert!(a.reasons.contains(&RiskReason::SecretPathAccess));
+    }
+
+    #[test]
+    fn bare_credential_files_are_secret_path_access() {
+        // A standalone `secrets.yaml` / `credentials` is a deploy/CI secret file;
+        // reading it must escalate (not auto-run via `cat` being a SAFE_PROGRAM).
+        let a = classify("cat secrets.yaml");
+        assert_eq!(a.level, Risk::Dangerous);
+        assert!(a.reasons.contains(&RiskReason::SecretPathAccess));
+        assert_eq!(classify("cat credentials").level, Risk::Dangerous);
+    }
+
+    #[test]
+    fn imds_metadata_read_is_secret_path_access() {
+        // The cloud-metadata endpoint serves instance credentials. A realistic
+        // exfil command embeds the IP in a URL with a path, so the deny-set
+        // substring match (not a bare-literal match) must escalate it.
+        let a = classify("curl http://169.254.169.254/latest/meta-data/iam/security-credentials/");
         assert_eq!(a.level, Risk::Dangerous);
         assert!(a.reasons.contains(&RiskReason::SecretPathAccess));
     }

@@ -32,7 +32,7 @@ Body sections, always in this order:
 
 ### Status
 
-`status` is one of the six canonical triage labels in [`../agents/triage-labels.md`](../agents/triage-labels.md) - `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `done`, `wontfix` - describing *who acts next*. Most open tickets are `ready-for-agent`; T-8.4 is `needs-info`; the landed EPIC-1/EPIC-2 foundation (T-1.5, T-1.6, T-1.7, T-1.8, T-2.2-T-2.7), plus the EPIC-3 pure-core units T-3.1 (the unified-input reducer) and T-3.7 (the shared history ring + per-mode lenses), is `done` (acceptance criteria met; any on-hardware/visual residual is consolidated into its proper future ticket - EPIC-4/T-4.6, EPIC-7, T-8.1 - never parked on a human). With T-1.8 the renderer draws via the wgpu instanced glyph-atlas pipeline (the typing-lag cure), not the interim glyphon path. **Ordering/blocking is expressed by `depends_on`, not a status** - a ticket whose upstream tickets have not landed still reads `ready-for-agent`; an agent simply works the dependency-satisfied tickets first.
+`status` is one of the six canonical triage labels in [`../agents/triage-labels.md`](../agents/triage-labels.md) - `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `done`, `wontfix` - describing *who acts next*. Most open tickets are `ready-for-agent`; T-8.4 is `needs-info`; the landed EPIC-1/EPIC-2 foundation (T-1.5, T-1.6, T-1.7, T-1.8, T-2.2-T-2.7), plus the EPIC-3 pure-core units T-3.1 (the unified-input reducer) and T-3.7 (the shared history ring + per-mode lenses), and the EPIC-5 safety unit T-5.6 (the single Secrets source + OutputSanitizer), is `done` (acceptance criteria met; any on-hardware/visual residual is consolidated into its proper future ticket - EPIC-4/T-4.6, EPIC-7, T-8.1 - never parked on a human). With T-1.8 the renderer draws via the wgpu instanced glyph-atlas pipeline (the typing-lag cure), not the interim glyphon path. **Ordering/blocking is expressed by `depends_on`, not a status** - a ticket whose upstream tickets have not landed still reads `ready-for-agent`; an agent simply works the dependency-satisfied tickets first.
 
 ## Conventions all tickets share
 
@@ -112,7 +112,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-5.3 | OpenAiProvider (Responses API) | ready-for-agent | T-5.1 |
 | T-5.4 | Typed tool definitions (run_command/read_file/edit_file/...) | ready-for-agent | T-5.1 |
 | T-5.5 | Deterministic risk gate (zsh-aware argv parse) | ready-for-agent | - |
-| T-5.6 | Single Secrets source + OutputSanitizer | ready-for-agent | - |
+| T-5.6 | Single Secrets source + OutputSanitizer | done | - |
 | T-5.7 | Seatbelt sandbox (sandbox-exec) + setrlimit + timeout-kill | ready-for-agent | T-5.4 |
 | T-5.8 | Agentic turn loop (shared, provider-neutral) | ready-for-agent | T-5.2, T-5.4, T-5.5 |
 | T-5.9 | Command-execution sinks (no-shell runner + gated PTY inject) | ready-for-agent | T-5.5, T-5.7, T-1.1 |

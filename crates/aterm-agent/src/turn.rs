@@ -55,7 +55,9 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
     /// Classify a proposed tool call's command deterministically. The model's
     /// own risk claim is intentionally ignored.
     pub fn disposition_for_command(&self, command_line: &str) -> ToolDisposition {
-        match self.policy.decide(command_line) {
+        // The gate classifies against the SAME `Secrets` the sanitizer redacts
+        // from (`self.secrets`) - one source, so the two defenses cannot drift.
+        match self.policy.decide(command_line, self.secrets) {
             Approval::AutoApprove => ToolDisposition::AutoRun,
             Approval::RequireConfirm(a) => ToolDisposition::NeedsConfirm(a.reasons),
         }
@@ -164,6 +166,38 @@ mod tests {
             turn.disposition_for_command("ls -la"),
             ToolDisposition::AutoRun
         );
+    }
+
+    #[test]
+    fn gate_and_sanitizer_cannot_drift_single_secrets_source() {
+        // AC1: ONE `Secrets` instance feeds BOTH the risk gate and the output
+        // sanitizer. Mutating that single source - registering a sensitive path
+        // and a secret value - must be reflected by BOTH defenses at once.
+        let mut secrets = Secrets::new();
+        secrets.add_sensitive_path("vault-keys");
+        secrets.add_value("sk-live-DRIFT-CANARY-0987654321");
+        let provider = AnthropicProvider::new("sk-test");
+        let turn = AgentTurn::new(&provider, &secrets);
+
+        // Gate side: `cat vault-keys` would be Safe (cat is inert, no shell-active
+        // chars) UNLESS the gate consults the mutated instance deny-set. It must
+        // refuse, citing the secret-path reason - proving the gate read THIS
+        // instance, not a private/static copy.
+        match turn.disposition_for_command("cat vault-keys") {
+            ToolDisposition::NeedsConfirm(reasons) => {
+                assert!(
+                    reasons.contains(&crate::risk::RiskReason::SecretPathAccess),
+                    "the registered sensitive path must drive a secret-path escalation"
+                );
+            }
+            ToolDisposition::AutoRun => {
+                panic!("a path added to the single Secrets source must never auto-run")
+            }
+        }
+
+        // Sanitizer side: the value added to the SAME instance is redacted.
+        let clean = turn.sanitize_observation("leak=sk-live-DRIFT-CANARY-0987654321 end", None);
+        assert!(!clean.contains("DRIFT-CANARY"));
     }
 
     #[test]

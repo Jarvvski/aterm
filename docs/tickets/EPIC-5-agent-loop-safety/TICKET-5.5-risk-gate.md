@@ -38,3 +38,28 @@ Port the prototype's deterministic, code-side risk gate to Rust nearly verbatim:
 # Out of scope
 
 - Secrets source + sanitizer (T-5.6), sandbox (T-5.7), execution (T-5.9), approval UI (T-5.11).
+
+# Pre-work findings (must fix when this ticket is worked)
+
+**Env-dump fail-open in the scaffold classifier (found during T-5.6 review,
+2026-06-24).** The scaffold `risk.rs` lists `env` and `printenv` in
+`SAFE_PROGRAMS` and has NO env-dump head rule, so a bare `env` / `printenv`
+classifies `Safe` with no reasons and AUTO-RUNS - dumping the whole environment,
+including the agent's own `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` when the env-var
+key fallback is in use (see `Secrets::from_env`). `printenv AWS_SECRET_ACCESS_KEY`
+(any credential var) is the same fail-open: the T-5.6 deny-set carries the two
+provider key *names*, but per-token substring matching only catches the
+explicit-arg read of *those two literal names*, never the bare verb form nor
+other credential vars. This is the canonical credential-exfil shape and it is a
+fail-open MISS (the unsafe direction).
+
+The prototype gates this in the classifier, not the Secrets source:
+`Risk.kt` has `ENV_DUMP = setOf("env", "printenv")` and
+`if (parsed.head in ENV_DUMP) reasons.add(RiskReason.SecretAccess)` (Dangerous),
+asserted by `RiskClassifierTest.kt::envDumpIsDangerous`. **Fix when porting:**
+remove `env`/`printenv` from `SAFE_PROGRAMS`, add an `ENV_DUMP` head rule
+escalating to `Dangerous`/`SecretPathAccess`, and add red-capable tests
+(`env`, `printenv`, `printenv AWS_SECRET_ACCESS_KEY` → Dangerous + RequireConfirm;
+a benign carrier like `echo env` stays Safe). Latent today (no execution path is
+wired - T-5.9 not landed - and T-5.9 depends on this ticket), but it MUST be
+closed before any command-execution sink goes live.
