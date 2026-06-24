@@ -15,6 +15,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Stream the renderer's frame zones to the Tracy profiler (T-1.8 AC4): build with
+# `--features tracy` and run a Tracy server. Off by default - no C client compiled.
+tracy = ["aterm-ui/tracy"]
+
 [dependencies]
 aterm-core.workspace = true
 aterm-ui.workspace = true

@@ -136,6 +136,8 @@ impl GpuRenderer {
     /// Render the snapshot grid (and always clear). Split out so `render` reads
     /// cleanly.
     fn render_inner(&mut self, frame: Frame<'_>) -> Result<(), RenderError> {
+        // Tracy frame zone (ticket T-1.8 AC4); zero-cost with no subscriber.
+        let _frame_zone = tracing::trace_span!("frame").entered();
         let clear = linear_to_wgpu(frame.theme.colors.bg_canvas);
 
         // Resolve the shell-integration indicator (ticket T-2.6) so the state reaches
@@ -164,19 +166,22 @@ impl GpuRenderer {
         // Build the grid instances BEFORE acquiring the surface texture - rebuilds
         // only when the snapshot version / size / theme changed (the damage gate),
         // and reuses the buffers with zero work + zero allocation otherwise.
-        let has_text = match frame.snapshot {
-            Some(snap) => self.grid.prepare(
-                &self.device,
-                &self.queue,
-                snap,
-                frame.theme,
-                crate::grid_render::FrameSize {
-                    width: self.config.width,
-                    height: self.config.height,
-                    scale: self.scale_factor,
-                },
-            ),
-            None => false,
+        let has_text = {
+            let _build = tracing::trace_span!("build").entered();
+            match frame.snapshot {
+                Some(snap) => self.grid.prepare(
+                    &self.device,
+                    &self.queue,
+                    snap,
+                    frame.theme,
+                    crate::grid_render::FrameSize {
+                        width: self.config.width,
+                        height: self.config.height,
+                        scale: self.scale_factor,
+                    },
+                ),
+                None => false,
+            }
         };
 
         // wgpu 29: `get_current_texture` returns a `CurrentSurfaceTexture` enum.
@@ -198,36 +203,42 @@ impl GpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-frame"),
-            });
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-clear+grid"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+            let _encode = tracing::trace_span!("encode").entered();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("aterm-frame"),
+                });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("aterm-clear+grid"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(clear),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
 
-            if has_text {
-                self.grid.draw(&mut pass);
+                if has_text {
+                    self.grid.draw(&mut pass);
+                }
             }
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
-        surface_tex.present();
+        {
+            let _present = tracing::trace_span!("present").entered();
+            surface_tex.present();
+        }
         Ok(())
     }
 }

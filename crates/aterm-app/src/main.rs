@@ -15,6 +15,8 @@ use session::Session;
 fn main() {
     // Logging: `RUST_LOG=info cargo run -p aterm-app`.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Frame profiling: a no-op unless built with `--features tracy` (T-1.8 AC4).
+    aterm_ui::profiling::init();
 
     let cfg = Config::load();
     log::info!(

@@ -20,6 +20,7 @@ pub mod gpu;
 pub mod grid_render;
 pub mod indicator;
 pub mod present;
+pub mod profiling;
 pub mod renderer;
 pub mod text;
 pub mod timeline;

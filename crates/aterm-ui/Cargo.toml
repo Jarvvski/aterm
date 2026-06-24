@@ -21,6 +21,16 @@ pollster.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 thiserror.workspace = true
+# Frame-zone instrumentation (T-1.8 AC4). `tracing` spans are always compiled and
+# cost nothing without a subscriber; the Tracy layer is opt-in (the `tracy` feature).
+tracing.workspace = true
+tracing-tracy = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+# Install a Tracy subscriber so the frame zones stream to the Tracy profiler.
+# Build with `--features aterm-ui/tracy` (or `aterm-app/tracy`) + run a Tracy server.
+tracy = ["dep:tracing-tracy", "dep:tracing-subscriber"]
 
 # macOS-only: the self-bridged CADisplayLink vsync clock (T-1.5). Target-gated so
 # the crate still builds on Linux/Windows (the display link falls back to the

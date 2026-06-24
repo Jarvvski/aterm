@@ -67,6 +67,12 @@ bytemuck = { version = "1", features = ["derive"] }
 # --- logging ---
 log = "0.4"
 env_logger = "0.11"
+# --- profiling: Tracy frame zones (T-1.8 AC4). `tracing` is always on (zero-cost
+# with no subscriber); the Tracy layer + subscriber are pulled only behind the
+# aterm-ui `tracy` feature (so the default build never compiles the C tracy client).
+tracing = "0.1"
+tracing-tracy = "0.11"
+tracing-subscriber = "0.3"
 # --- benches: Tier-1 instruction-count micro-benches (T-1.7). iai-callgrind runs
 # under valgrind/callgrind (Linux CI), so it gates PRs noise-immune on shared
 # runners; locally (macOS, no valgrind) the harness compiles but does not execute.
