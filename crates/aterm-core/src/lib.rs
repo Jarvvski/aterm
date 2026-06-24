@@ -15,7 +15,7 @@ pub mod shell_integration;
 pub mod terminal;
 
 // Re-export the load-bearing public types at the crate root for ergonomics.
-pub use block::{Block, BlockList, BlockSegmenter, OutputSpan};
+pub use block::{Block, BlockList, BlockSegmenter, HeightIndex, OutputSpan, RowSnapshot};
 pub use engine::{Engine, EngineMetrics, ToModel};
 pub use input::{InputEvent, InputMode, InputModel, InputOutcome};
 pub use osc::{Mark, OscScanner, PromptKind, ScanResult};
