@@ -32,7 +32,7 @@ use aterm_core::Snapshot;
 use aterm_tokens::{Theme, ThemeKind};
 
 use crate::gpu::GpuRenderer;
-use crate::present::PresentScheduler;
+use crate::present::{DisplayLink, PresentScheduler};
 use crate::renderer::{Frame, Renderer};
 use crate::window::{grid_dims, window_attributes};
 
@@ -82,6 +82,17 @@ pub trait UiCallbacks {
 pub struct HeadlessCallbacks;
 impl UiCallbacks for HeadlessCallbacks {}
 
+/// Render-loop configuration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderConfig {
+    /// Opt into the self-bridged `CADisplayLink` vsync clock (macOS only). Default
+    /// `false`: the portable winit-driven present loop drives presentation. The
+    /// link path is compile-verified but pending on-hardware validation (T-1.5
+    /// AC3 / T-7.2); flip this on to validate it. On non-macOS it is ignored (the
+    /// link never constructs and the winit loop is used regardless).
+    pub display_link: bool,
+}
+
 /// The application: owns the window, renderer, theme, host callbacks, and the
 /// keep-warm present scheduler.
 pub struct AtermApp<C: UiCallbacks> {
@@ -91,6 +102,10 @@ pub struct AtermApp<C: UiCallbacks> {
     callbacks: C,
     title: String,
     scheduler: PresentScheduler,
+    config: RenderConfig,
+    /// The macOS vsync clock, if installed (opt-in + creation succeeded). `None`
+    /// means the winit-driven present loop is driving presentation.
+    display_link: Option<DisplayLink>,
 }
 
 impl<C: UiCallbacks> AtermApp<C> {
@@ -102,7 +117,17 @@ impl<C: UiCallbacks> AtermApp<C> {
             callbacks,
             title: "aterm".to_string(),
             scheduler: PresentScheduler::default(),
+            config: RenderConfig::default(),
+            display_link: None,
         }
+    }
+
+    /// Override the render-loop configuration (e.g. to opt into the CADisplayLink
+    /// vsync clock). Builder-style so `run`/`run_with` can stay thin.
+    #[must_use]
+    pub fn with_render_config(mut self, config: RenderConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Draw exactly one frame: clear to the canvas color and, if the host has a
@@ -120,16 +145,34 @@ impl<C: UiCallbacks> AtermApp<C> {
         }
     }
 
-    /// Set the control flow for the next wait based on the scheduler state: a tight
-    /// guard while warm (cadence is really the `Fifo` vsync), a coarse poll while
-    /// idle (draws nothing, just notices new output). Called from `about_to_wait`.
+    /// Set the control flow for the next wait based on the scheduler state and the
+    /// active clock source. Called from `about_to_wait`; never renders.
+    ///
+    /// - **CADisplayLink installed:** while warm, the link wakes us every vsync, so
+    ///   the loop just `Wait`s between ticks; the link is paused when idle so we
+    ///   truly drop to zero wakeups, with a coarse poll to still notice output that
+    ///   arrives while idle.
+    /// - **winit fallback:** a tight guard while warm (the real cadence is the
+    ///   `Fifo` present blocking on vsync) and the same coarse idle poll.
     fn schedule_next_wake(&self, event_loop: &ActiveEventLoop, now: Instant) {
-        let interval = if self.scheduler.is_warm(now) {
-            WARM_WAKE
-        } else {
-            IDLE_WAKE
-        };
-        event_loop.set_control_flow(ControlFlow::WaitUntil(now + interval));
+        let warm = self.scheduler.is_warm(now);
+        match self.display_link.as_ref() {
+            Some(link) => {
+                // Pause when idle => zero idle wakeups; resume when warm.
+                link.set_paused(!warm);
+                if warm {
+                    // The link drives the cadence; sleep until it (or input) wakes.
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                } else {
+                    // Link paused: still poll coarsely so output-while-idle shows.
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(now + IDLE_WAKE));
+                }
+            }
+            None => {
+                let interval = if warm { WARM_WAKE } else { IDLE_WAKE };
+                event_loop.set_control_flow(ControlFlow::WaitUntil(now + interval));
+            }
+        }
     }
 }
 
@@ -155,6 +198,24 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
             }
         }
         self.callbacks.on_ready(window.clone());
+
+        // Opt-in: install the self-bridged CADisplayLink vsync clock. Each tick
+        // turns into a redraw request (the scheduler decides whether it draws). If
+        // creation fails (non-macOS, headless, OS decline) we silently keep the
+        // winit-driven loop. The link calls request_redraw on the main thread.
+        if self.config.display_link {
+            let win = window.clone();
+            match DisplayLink::new(&window, move || win.request_redraw()) {
+                Some(link) => {
+                    log::info!("CADisplayLink vsync clock installed");
+                    self.display_link = Some(link);
+                }
+                None => {
+                    log::info!("CADisplayLink unavailable; using the winit-driven present loop")
+                }
+            }
+        }
+
         // Window creation is activity: arm keep-warm so the first ~1s presents
         // (the window paints immediately and holds the refresh rate on open).
         self.scheduler.note_activity(Instant::now());
@@ -247,16 +308,27 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
     }
 }
 
-/// Convenience entry point: build the event loop, run `AtermApp` to completion.
-/// Blocks until the window closes. Returns once the loop exits.
+/// Convenience entry point with the default render config (winit-driven present
+/// loop). Blocks until the window closes.
 pub fn run<C: UiCallbacks>(
     theme_kind: ThemeKind,
     callbacks: C,
+) -> Result<(), winit::error::EventLoopError> {
+    run_with(theme_kind, callbacks, RenderConfig::default())
+}
+
+/// Entry point with an explicit [`RenderConfig`] (e.g. to opt into the
+/// CADisplayLink vsync clock). Builds the event loop, runs `AtermApp` to
+/// completion, and returns once the window closes.
+pub fn run_with<C: UiCallbacks>(
+    theme_kind: ThemeKind,
+    callbacks: C,
+    config: RenderConfig,
 ) -> Result<(), winit::error::EventLoopError> {
     let event_loop = EventLoop::new()?;
     // Start in `Wait`; the scheduler arms a `WaitUntil` cadence from `resumed`
     // onward. (Idle floor: when nothing is happening the loop truly sleeps.)
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = AtermApp::new(theme_kind, callbacks);
+    let mut app = AtermApp::new(theme_kind, callbacks).with_render_config(config);
     event_loop.run_app(&mut app)
 }

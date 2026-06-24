@@ -38,7 +38,10 @@ fn main() {
 
     // Open the window + GPU surface and run the event loop until the window
     // closes. This blocks the main thread (winit requirement).
-    if let Err(e) = aterm_ui::run(cfg.theme, session) {
+    let render_config = aterm_ui::RenderConfig {
+        display_link: cfg.display_link,
+    };
+    if let Err(e) = aterm_ui::run_with(cfg.theme, session, render_config) {
         log::error!("event loop error: {e}");
         std::process::exit(1);
     }

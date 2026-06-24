@@ -55,6 +55,15 @@ bytemuck = { version = "1", features = ["derive"] }
 # --- logging ---
 log = "0.4"
 env_logger = "0.11"
+# --- macOS interop (aterm-ui only, target-gated): the self-bridged CADisplayLink
+# vsync clock (T-1.5). These pin winit 0.30's objc2 *0.5* generation EXACTLY
+# (objc2 0.5.2 / objc2-foundation 0.2.2 / objc2-quartz-core 0.2.2) so the NSView
+# we pull from a winit window and the run-loop types share winit's runtime. Do
+# NOT bump to the 0.3.x/objc2-0.6 line here - that is a different, non-interop
+# generation (it is what wgpu-hal uses internally). ---
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSRunLoop", "NSString", "NSObjCRuntime"] }
+objc2-quartz-core = { version = "0.2", features = ["CADisplayLink"] }
 # --- internal crates ---
 aterm-core = { path = "crates/aterm-core" }
 aterm-tokens = { path = "crates/aterm-tokens" }

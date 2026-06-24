@@ -21,3 +21,12 @@ pollster.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 thiserror.workspace = true
+
+# macOS-only: the self-bridged CADisplayLink vsync clock (T-1.5). Target-gated so
+# the crate still builds on Linux/Windows (the display link falls back to the
+# winit-driven present loop there). These MUST stay on winit 0.30's objc2 0.5
+# generation - see the workspace manifest note.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-quartz-core.workspace = true
