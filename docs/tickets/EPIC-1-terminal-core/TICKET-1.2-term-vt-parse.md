@@ -2,7 +2,7 @@
 id: T-1.2
 epic: EPIC-1-terminal-core
 title: alacritty_terminal Term wiring + VT parse loop
-status: ready-for-agent
+status: done
 labels: [core, vt]
 depends_on: [T-1.1]
 ---

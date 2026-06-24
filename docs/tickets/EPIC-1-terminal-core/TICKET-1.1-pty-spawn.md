@@ -2,7 +2,7 @@
 id: T-1.1
 epic: EPIC-1-terminal-core
 title: PTY spawn/resize/signals over portable-pty
-status: ready-for-agent
+status: done
 labels: [core, pty]
 depends_on: []
 ---

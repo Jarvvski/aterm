@@ -2,7 +2,7 @@
 id: T-1.9
 epic: EPIC-1-terminal-core
 title: Event::PtyWrite reply channel + foreground pgid tracking
-status: ready-for-agent
+status: done
 labels: [core, pty]
 depends_on: [T-1.1, T-1.2]
 ---

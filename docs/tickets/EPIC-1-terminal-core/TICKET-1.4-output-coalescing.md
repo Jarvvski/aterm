@@ -2,7 +2,7 @@
 id: T-1.4
 epic: EPIC-1-terminal-core
 title: Output coalescing + grid snapshot publication
-status: ready-for-agent
+status: done
 labels: [core, perf]
 depends_on: [T-1.3]
 ---

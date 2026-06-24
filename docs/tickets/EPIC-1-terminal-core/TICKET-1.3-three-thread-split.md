@@ -2,7 +2,7 @@
 id: T-1.3
 epic: EPIC-1-terminal-core
 title: Three-thread reader/model/render split + bounded backpressure
-status: ready-for-agent
+status: done
 labels: [core, perf, threading]
 depends_on: [T-1.1, T-1.2]
 ---
