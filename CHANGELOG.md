@@ -13,6 +13,13 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **zsh shell integration (command-block marks).** Launching aterm with zsh now
+  installs a per-session `ZDOTDIR` shim - zero dotfile edits, restores the user's
+  real config, removed on exit - that emits nonce-stamped OSC-133 A/B/C/D + OSC 7
+  marks around the prompt and command. The engine arms its OSC filter with the
+  shim's nonce, so command blocks segment reliably regardless of prompt theme and a
+  foreign program's (un-nonced) marks are ignored (tickets T-2.2 + T-2.1). bash and
+  fish are next (T-2.3).
 - **Terminal query replies.** Programs that probe the terminal - Primary Device
   Attributes (`\x1b[c`), cursor-position / status (`\x1b[6n`) - now receive their
   answers: the VT engine writes the reply straight back to the PTY on the model

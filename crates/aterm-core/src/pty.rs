@@ -467,6 +467,178 @@ mod tests {
     }
 
     #[test]
+    fn zsh_shim_emits_nonce_marks_through_a_real_zsh() {
+        // AC1 (T-2.2): spawning zsh with the materialized ZDOTDIR shim produces
+        // nonce-stamped OSC-133 marks for a command cycle, and the T-2.1 filter
+        // (with_nonce) accepts them. End-to-end proof the shim activates the gate.
+        use crate::osc::OscScanner;
+        use crate::shell_integration::{IntegrationDir, ShimNonce};
+
+        let zsh = "/bin/zsh";
+        if !std::path::Path::new(zsh).exists() {
+            eprintln!("skip zsh_shim_emits_nonce_marks: no {zsh} on this host");
+            return;
+        }
+        let nonce = ShimNonce("ATERMTESTNONCE0123456789".into());
+        // Isolate from the test runner's own zsh config: restore ZDOTDIR to an empty
+        // dir so no user .zshrc/.zshenv loads and the test is deterministic.
+        let user_cfg = std::env::temp_dir().join(format!("aterm-itest-cfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&user_cfg);
+        let shim =
+            IntegrationDir::install_zsh(&nonce, Some(user_cfg.to_string_lossy().into_owned()))
+                .expect("materialize zsh shim");
+        let env = shim.env_vars();
+
+        // Interactive zsh over the PTY so precmd/preexec fire; the shim loads via the
+        // ZDOTDIR .zshenv bootstrap.
+        let pty = Pty::spawn(
+            zsh,
+            &["-i"],
+            small(),
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .expect("spawn zsh");
+        let rx = reader_channel(pty.try_clone_reader().expect("clone reader"));
+        let mut writer = pty.take_writer().expect("take writer");
+
+        // Let zsh start + load the integration, then run a command cycle. (zsh
+        // buffers PTY input, so an early write is processed once ZLE is ready.)
+        std::thread::sleep(Duration::from_millis(400));
+        writer
+            .write_all(b"echo aterm-block-marker\n")
+            .expect("write command");
+        writer.flush().expect("flush");
+
+        let needle = format!("aterm_nonce={}", nonce.0);
+        let out = read_until(&rx, &needle, Duration::from_secs(15));
+        assert!(
+            out.contains(&needle),
+            "zsh should emit nonce-stamped OSC-133 marks; captured: {out:?}"
+        );
+
+        // The T-2.1 filter accepts the shim's marks (and would drop un-nonced ones).
+        let mut scanner = OscScanner::with_nonce(nonce.0.clone());
+        let scan = scanner.scan(out.as_bytes());
+        assert!(
+            !scan.marks.is_empty(),
+            "with_nonce scanner should accept the shim's marks; captured: {out:?}"
+        );
+
+        drop(pty);
+        let _ = std::fs::remove_dir_all(&user_cfg);
+    }
+
+    #[test]
+    fn zsh_shim_survives_exec_zsh() {
+        // AC3 (T-2.2): integration must survive `exec zsh` mid-session. Because the
+        // bootstrap keeps ZDOTDIR PINNED at the shim, a re-exec'd zsh re-enters the
+        // bootstrap and reinstalls. We run a command, `exec zsh -i`, then run a
+        // SECOND command and assert it still gets a nonce-stamped C mark carrying
+        // its (encoded) command line - i.e. marks did not silently vanish.
+        use crate::shell_integration::{IntegrationDir, ShimNonce};
+
+        let zsh = "/bin/zsh";
+        if !std::path::Path::new(zsh).exists() {
+            eprintln!("skip zsh_shim_survives_exec_zsh: no {zsh} on this host");
+            return;
+        }
+        let nonce = ShimNonce("ATERMEXECNONCE0123".into());
+        let user_cfg = std::env::temp_dir().join(format!("aterm-exec-cfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&user_cfg);
+        let shim =
+            IntegrationDir::install_zsh(&nonce, Some(user_cfg.to_string_lossy().into_owned()))
+                .expect("materialize shim");
+        let env = shim.env_vars();
+        let pty = Pty::spawn(
+            zsh,
+            &["-i"],
+            small(),
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .expect("spawn zsh");
+        let rx = reader_channel(pty.try_clone_reader().expect("clone reader"));
+        let mut writer = pty.take_writer().expect("take writer");
+
+        std::thread::sleep(Duration::from_millis(400));
+        // Re-exec the shell, then run a uniquely-identifiable command AFTER the exec.
+        writer.write_all(b"exec zsh -i\n").expect("write exec");
+        writer.flush().expect("flush");
+        std::thread::sleep(Duration::from_millis(500));
+        writer
+            .write_all(b"echo aterm-post-exec-cmd\n")
+            .expect("write post-exec command");
+        writer.flush().expect("flush");
+
+        // The post-exec command's C mark carries cmdline= with the percent-encoded
+        // command line ("echo aterm-post-exec-cmd" -> "echo%20aterm-post-exec-cmd",
+        // the space encoded). Matching the full encoded form confirms a POST-exec
+        // nonce'd mark, i.e. integration survived the exec.
+        let needle = "cmdline=echo%20aterm-post-exec-cmd";
+        let out = read_until(&rx, needle, Duration::from_secs(15));
+        assert!(
+            out.contains(needle),
+            "integration must survive `exec zsh`: the post-exec command should still \
+             emit a nonce'd C mark; captured: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("aterm_nonce={}", nonce.0)),
+            "post-exec marks must still carry the session nonce; captured: {out:?}"
+        );
+
+        drop(pty);
+        let _ = std::fs::remove_dir_all(&user_cfg);
+    }
+
+    #[test]
+    fn zsh_shim_preserves_user_config_and_restores_zdotdir() {
+        // AC2 + AC4 (T-2.2): the bootstrap restores a pre-existing ZDOTDIR and the
+        // user's real .zshrc still loads - a sentinel it prints appears in the
+        // output, proving both the restore (zsh read .zshrc from the user's dir) and
+        // config preservation.
+        use crate::shell_integration::{IntegrationDir, ShimNonce};
+
+        let zsh = "/bin/zsh";
+        if !std::path::Path::new(zsh).exists() {
+            eprintln!("skip zsh_shim_preserves_user_config: no {zsh} on this host");
+            return;
+        }
+        let nonce = ShimNonce("ATERMCFGNONCE0123456".into());
+        // A fake user ZDOTDIR carrying a .zshrc with a unique sentinel.
+        let user_zdotdir =
+            std::env::temp_dir().join(format!("aterm-user-cfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&user_zdotdir);
+        std::fs::write(
+            user_zdotdir.join(".zshrc"),
+            "print -r -- ATERM_USER_RC_SENTINEL_42\n",
+        )
+        .expect("write user .zshrc");
+
+        let shim =
+            IntegrationDir::install_zsh(&nonce, Some(user_zdotdir.to_string_lossy().into_owned()))
+                .expect("materialize shim");
+        let env = shim.env_vars();
+        let pty = Pty::spawn(
+            zsh,
+            &["-i"],
+            small(),
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .expect("spawn zsh");
+        let rx = reader_channel(pty.try_clone_reader().expect("clone reader"));
+
+        // The sentinel prints during .zshrc load at startup (no command needed).
+        let out = read_until(&rx, "ATERM_USER_RC_SENTINEL_42", Duration::from_secs(15));
+        assert!(
+            out.contains("ATERM_USER_RC_SENTINEL_42"),
+            "the user's real .zshrc must still load from the restored ZDOTDIR \
+             (AC2/AC4); captured: {out:?}"
+        );
+
+        drop(pty);
+        let _ = std::fs::remove_dir_all(&user_zdotdir);
+    }
+
+    #[test]
     fn foreground_pgid_and_signal_interrupt_sleep() {
         use std::os::fd::BorrowedFd;
         // `sleep 10` becomes the pty's foreground (session-leader) process group.

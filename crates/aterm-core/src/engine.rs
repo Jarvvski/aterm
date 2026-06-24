@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{after, bounded, never, select, unbounded, Receiver, Sender, TryRecvError};
 
+use crate::shell_integration::{should_inject_zsh, IntegrationDir, ShellKind, ShimNonce};
 use crate::{
     BlockList, BlockSegmenter, OscScanner, Pty, PtyDimensions, PtyError, PtyEvent, Signal,
     Snapshot, Terminal, TerminalEvent,
@@ -128,19 +129,61 @@ pub struct Engine {
     /// backend exposed no master fd or the dup failed.
     #[cfg(unix)]
     fg_fd: Option<std::os::fd::OwnedFd>,
+    /// The materialized zsh `ZDOTDIR` shim dir (ticket T-2.2), held for the engine's
+    /// lifetime so it is removed only when the engine drops - AFTER `Drop` has joined
+    /// the threads and killed the child, so `exec zsh` mid-session still finds it.
+    /// `None` for non-zsh shells / test commands. Underscore: held for cleanup, not read.
+    _integration: Option<IntegrationDir>,
     reader: Option<JoinHandle<()>>,
     model: Option<JoinHandle<()>>,
 }
 
 impl Engine {
     /// Spawn a login shell on a fresh PTY and start the engine.
+    ///
+    /// When the login shell is zsh we install the shell-integration shim (ticket
+    /// T-2.2): a per-session `ZDOTDIR` shim is materialized, the child is spawned
+    /// with `$ZDOTDIR` pointed at it (zero dotfile edits), and the OSC scanner is
+    /// armed with the shim's nonce ([`OscScanner::with_nonce`]) so ONLY our marks
+    /// are trusted. For any other shell (or if the shim cannot be installed) we
+    /// spawn plainly and run the scanner untrusted (no nonce'd marks will appear).
     pub fn spawn_login_shell(dims: PtyDimensions, scrollback: usize) -> Result<Self, PtyError> {
-        Self::spawn_with_pty(Pty::spawn_login_shell(dims)?, dims, scrollback)
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+
+        let mut osc = OscScanner::untrusted();
+        let mut env: Vec<(String, String)> = Vec::new();
+        let mut integration: Option<IntegrationDir> = None;
+
+        if ShellKind::from_path(&shell) == ShellKind::Zsh {
+            let orig_zdotdir = std::env::var("ZDOTDIR").ok();
+            if should_inject_zsh(orig_zdotdir.as_deref()) {
+                let nonce = ShimNonce::generate();
+                match IntegrationDir::install_zsh(&nonce, orig_zdotdir) {
+                    Ok(shim) => {
+                        env = shim.env_vars();
+                        osc = OscScanner::with_nonce(nonce.0);
+                        integration = Some(shim);
+                    }
+                    Err(e) => log::warn!(
+                        "zsh shell-integration shim install failed: {e}; \
+                         block segmentation disabled this session"
+                    ),
+                }
+            }
+        }
+
+        let pty = Pty::spawn(
+            &shell,
+            &["-l"],
+            dims,
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )?;
+        Self::spawn_with_pty(pty, dims, scrollback, osc, integration)
     }
 
     /// Spawn an arbitrary `program` with `args` on a fresh PTY and start the
     /// engine. Used for the integration tests (`yes`, `cat`, `echo`) and any
-    /// future non-login-shell host.
+    /// future non-login-shell host. Runs the scanner untrusted (no shim).
     pub fn spawn_command(
         program: &str,
         args: &[&str],
@@ -148,11 +191,20 @@ impl Engine {
         scrollback: usize,
     ) -> Result<Self, PtyError> {
         let pty = Pty::spawn(program, args, dims, std::iter::empty::<(&str, &str)>())?;
-        Self::spawn_with_pty(pty, dims, scrollback)
+        Self::spawn_with_pty(pty, dims, scrollback, OscScanner::untrusted(), None)
     }
 
-    /// Wire the reader + model threads around an already-spawned [`Pty`].
-    fn spawn_with_pty(pty: Pty, dims: PtyDimensions, scrollback: usize) -> Result<Self, PtyError> {
+    /// Wire the reader + model threads around an already-spawned [`Pty`]. `osc` is
+    /// the (nonce-armed or untrusted) OSC scanner the model thread uses; `integration`
+    /// is the materialized shim dir, held for the engine's lifetime and removed when
+    /// it drops.
+    fn spawn_with_pty(
+        pty: Pty,
+        dims: PtyDimensions,
+        scrollback: usize,
+        osc: OscScanner,
+        integration: Option<IntegrationDir>,
+    ) -> Result<Self, PtyError> {
         // Clone the reader and take the writer *before* the Pty moves into the
         // model thread (both take `&self`).
         let reader = pty.try_clone_reader()?;
@@ -194,7 +246,7 @@ impl Engine {
             pty,
             writer,
             terminal,
-            osc: OscScanner::untrusted(),
+            osc,
             segmenter: BlockSegmenter::new(),
             blocks: BlockList::new(),
             replies,
@@ -216,6 +268,7 @@ impl Engine {
             metrics,
             #[cfg(unix)]
             fg_fd,
+            _integration: integration,
             reader: Some(reader_handle),
             model: Some(model_handle),
         })

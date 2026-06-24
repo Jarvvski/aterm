@@ -2,7 +2,7 @@
 id: T-2.2
 epic: EPIC-2-shell-integration-blocks
 title: Shell-integration shim extraction + ZDOTDIR injection (zsh)
-status: ready-for-agent
+status: ready-for-human
 labels: [core, shell-integration]
 depends_on: [T-1.1]
 ---
@@ -38,3 +38,53 @@ Bundle the integration scripts as embedded resources, write them to a per-sessio
 - bash + fish hooks (T-2.3).
 - The filter that consumes the marks (T-2.1).
 - The visible indicator (T-2.6).
+
+# Notes
+
+2026-06-24 (agent): Landed. zsh shell integration is wired end-to-end and ACTIVATES
+the T-2.1 nonce gate (the engine flips `OscScanner::untrusted()` ->
+`with_nonce(shim-nonce)` whenever the zsh shim installs). Status -> `ready-for-human`
+for the one remaining AC that needs a real prompt framework to verify (AC5).
+
+**Mechanism.** `aterm-core::shell_integration`: a per-session `ZDOTDIR` shim is
+materialized to a temp dir (`IntegrationDir`, RAII - removed on `Engine` drop, after
+the child is killed). The embedded `resources/zshenv` bootstrap KEEPS `$ZDOTDIR`
+pinned at the shim for the whole session and drives the user's real startup files
+(`.zshenv`/`.zprofile`/`.zshrc`/`.zlogin`) by explicit path from `ATERM_REAL_ZDOTDIR`
+in zsh's normal order, then sources `resources/integration.zsh` last. The
+integration emits nonce-stamped OSC-133 A/B/C/D + OSC 7, percent-encoded `cmdline=`
+on C, an `ATERM_INTEGRATION_LOADED` idempotency guard, an `__aterm_ran` first-precmd
+guard, and an idempotent precmd PS1 re-wrap (re-captures the base when PS1 loses our
+nonce). Every mark is one `printf` so the nonce is never detached from its `ESC ]`
+introducer (the T-2.1 contract).
+
+**Verified (real zsh, headless, macOS CI):** AC1 (a command cycle emits nonce'd
+OSC-133/7 marks the `with_nonce` filter accepts), AC2 (the user's real `.zshrc`
+loads - sentinel test), AC3 (**exec zsh** preserves integration - a post-exec
+command still emits a nonce'd C mark; this is the pinned-ZDOTDIR design), AC4
+(a pre-existing `ZDOTDIR` is restored/driven), AC6 (temp dir removed on drop). Plus
+unit tests for materialization, shell detection, the mark-atomicity contract, and
+the nonce/injection-guard logic.
+
+**Adversarial review (3 lenses x skeptic, 17 findings) caught a real HIGH bug, now
+fixed:** the original bootstrap RESTORED `$ZDOTDIR` away from the shim, so `exec zsh`
+silently lost integration (failing AC3). Fixed by keeping `$ZDOTDIR` pinned at the
+shim + driving user files by explicit path; verified by the new exec-survival test.
+Also hardened the shim-dir creation (`create_dir`, not `create_dir_all`, so a
+pre-existing/attacker dir is never trusted - we point a shell at it).
+
+**Pending (the `ready-for-human` item):**
+
+- **AC5 - coexistence with starship/powerlevel10k/zsh-defer.** The precmd PS1 re-wrap
+  that defends against a late prompt framework clobbering our A/B marks is
+  implemented + reasoned (idempotent re-capture), but is NOT tested against a real
+  framework (none installed in CI). Wants an owner smoke-test with starship/p10k.
+- Minor robustness follow-ups (dismissed by review as non-exploitable, noted for a
+  later pass): the OSC 7 cwd path is emitted unencoded (a dir name with an embedded
+  ESC/BEL - exotic - could truncate the cwd mark; a real exploit is blocked by the
+  nonce gate + the filter's abort/re-anchor), and `cmdline=` percent-encoding is
+  char- not byte-based (non-ASCII command text is mangled in the advisory label).
+
+`fmt`/`clippy`/full-workspace `build`/`test` green (aterm-core 77 tests, incl. 3
+real-zsh integration tests, all stable across reruns). No new Rust deps (the scripts
+are `include_str!`'d resources).

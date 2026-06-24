@@ -1,0 +1,43 @@
+# aterm ZDOTDIR bootstrap (.zshenv).
+#
+# aterm points $ZDOTDIR at its shim dir and KEEPS it there for the whole session, so
+# the integration re-installs automatically across `exec zsh` (a restored ZDOTDIR
+# would silently lose integration after exec). zsh reads THIS .zshenv first; because
+# ZDOTDIR stays on the shim (which has no .zprofile/.zshrc/.zlogin), this script
+# drives the user's real startup files by explicit path, in zsh's normal order, then
+# installs aterm's integration last. __ATERM_INTEGRATION_PATH__ is substituted with
+# the absolute path of the integration script in this same dir.
+
+# The shim dir (where this file lives) and the user's real config dir. The spawner
+# passes the user's original ZDOTDIR in ATERM_REAL_ZDOTDIR (absent -> default $HOME).
+__aterm_shim="$ZDOTDIR"
+__aterm_real="${ATERM_REAL_ZDOTDIR:-$HOME}"
+unset ATERM_REAL_ZDOTDIR
+
+# Run the user's startup files with ZDOTDIR pointed at THEIR dir (so configs that
+# reference $ZDOTDIR resolve correctly), in zsh's normal order: .zshenv always,
+# .zprofile (login) before .zshrc (interactive), .zlogin (login) after.
+export ZDOTDIR="$__aterm_real"
+[ -f "$ZDOTDIR/.zshenv" ] && source "$ZDOTDIR/.zshenv"
+if [[ -o login ]]; then
+  [ -f "$ZDOTDIR/.zprofile" ] && source "$ZDOTDIR/.zprofile"
+fi
+if [[ -o interactive ]]; then
+  [ -f "$ZDOTDIR/.zshrc" ] && source "$ZDOTDIR/.zshrc"
+fi
+if [[ -o login ]]; then
+  [ -f "$ZDOTDIR/.zlogin" ] && source "$ZDOTDIR/.zlogin"
+fi
+
+# Re-pin ZDOTDIR at the shim so a later `exec zsh` re-enters this bootstrap and
+# reinstalls integration. A child that inherits ZDOTDIR sees the shim; the
+# integration is idempotent and re-chains the user's files, so a nested zsh just
+# works (and a non-zsh child ignores ZDOTDIR).
+export ZDOTDIR="$__aterm_shim"
+unset __aterm_shim __aterm_real
+
+# Install aterm's integration LAST (after the user's .zshrc), interactive only -
+# non-interactive zsh scripts get no hooks and no overhead.
+if [[ -o interactive ]]; then
+  source '__ATERM_INTEGRATION_PATH__'
+fi

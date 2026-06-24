@@ -76,7 +76,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | id | title | status | depends_on |
 |---|---|---|---|
 | T-2.1 | OSC-133/OSC-7 pre-parser filter with nonce gating | ready-for-agent | T-1.2 |
-| T-2.2 | Shell-integration shim extraction + ZDOTDIR/ENV/XDG injection | ready-for-agent | T-1.1 |
+| T-2.2 | Shell-integration shim extraction + ZDOTDIR/ENV/XDG injection | ready-for-human | T-1.1 |
 | T-2.3 | bash + fish hooks (version-branched) | ready-for-agent | T-2.2 |
 | T-2.4 | BlockList + SumTree height index + immutable snapshots | ready-for-agent | T-2.1 |
 | T-2.5 | Block lifecycle state machine + alt-screen suppression | ready-for-agent | T-2.1, T-2.4 |
