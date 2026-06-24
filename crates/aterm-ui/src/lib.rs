@@ -8,6 +8,11 @@
 //!
 //! Depends on `aterm-core` (the grid snapshot) and `aterm-tokens` (colors/fonts).
 
+// Test-only heap-allocation counter for the steady-state no-alloc assertions
+// (ticket T-1.8 AC2 / T-1.5 AC5). Compiled out of every non-test build.
+#[cfg(test)]
+mod alloc_probe;
+
 pub mod app;
 pub mod fonts;
 pub mod glyph;

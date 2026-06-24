@@ -981,6 +981,41 @@ mod gpu_tests {
     }
 
     #[test]
+    fn steady_state_prepare_is_allocation_free() {
+        let Some((device, queue, format)) = device() else {
+            return;
+        };
+        let mut grid = GridRenderer::new(&device, format);
+        let (w, h) = target_size(4, 1);
+        let snap = one_cell(
+            4,
+            'S',
+            CellColor::Rgb(255, 255, 255),
+            CellColor::Rgb(0, 0, 0),
+            false,
+        );
+        let size = FrameSize {
+            width: w,
+            height: h,
+            scale: SCALE,
+        };
+        // First prepare builds + caches (allocates).
+        grid.prepare(&device, &queue, &snap, &theme(), size);
+
+        // An unchanged frame (same version/viewport/theme) must early-out with NO
+        // allocation - the steady-state present path (ticket T-1.8 AC1/AC2). This is
+        // the renderer-level "skip the rebuild when nothing is dirty".
+        let allocs = crate::alloc_probe::count_allocs(|| {
+            let drew = grid.prepare(&device, &queue, &snap, &theme(), size);
+            std::hint::black_box(drew);
+        });
+        assert_eq!(
+            allocs, 0,
+            "an unchanged frame's prepare early-out allocates nothing (got {allocs})"
+        );
+    }
+
+    #[test]
     fn wide_cell_background_spans_two_columns() {
         let Some((device, queue, format)) = device() else {
             return;

@@ -581,6 +581,31 @@ mod tests {
     }
 
     #[test]
+    fn warm_frame_build_does_not_allocate() {
+        // The CPU frame build (snapshot -> per-cell instances) is the hot-path work
+        // that must be allocation-free in steady state (ticket T-1.8 AC2 /
+        // 09-performance-60fps §4). Warm the output buffer once, then assert a
+        // re-build at the same dimensions allocates nothing.
+        let t = theme();
+        let mut snap = Snapshot::empty(24, 80);
+        snap.cells[0].c = 'h';
+        snap.cells[1].c = 'i';
+        snap.cells[2].fg = CellColor::Rgb(200, 30, 30);
+        snap.cells[2].bg = CellColor::Rgb(10, 10, 40);
+        let mut out = Vec::new();
+        build_grid_cells(&snap, &t, &mut out); // warms capacity (allocates)
+
+        let allocs = crate::alloc_probe::count_allocs(|| {
+            build_grid_cells(&snap, &t, &mut out);
+            std::hint::black_box(&out);
+        });
+        assert_eq!(
+            allocs, 0,
+            "a warmed frame build allocates nothing (got {allocs})"
+        );
+    }
+
+    #[test]
     fn build_grid_cells_reuses_buffer() {
         let t = theme();
         let snap = Snapshot::empty(4, 10);
