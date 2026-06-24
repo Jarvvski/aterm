@@ -32,7 +32,7 @@ Body sections, always in this order:
 
 ### Status
 
-`status` is one of the six canonical triage labels in [`../agents/triage-labels.md`](../agents/triage-labels.md) - `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `done`, `wontfix` - describing *who acts next*. Most open tickets are `ready-for-agent`; T-8.4 is `needs-info`; the landed EPIC-1/EPIC-2 foundation (T-1.5, T-1.6, T-1.7, T-2.2-T-2.7) is `done` (acceptance criteria met; any GPU/hardware/visual residual is consolidated into its proper future ticket - T-1.8, EPIC-4/T-4.6, EPIC-7 - never parked on a human). **Ordering/blocking is expressed by `depends_on`, not a status** - a ticket whose upstream tickets have not landed still reads `ready-for-agent`; an agent simply works the dependency-satisfied tickets first.
+`status` is one of the six canonical triage labels in [`../agents/triage-labels.md`](../agents/triage-labels.md) - `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `done`, `wontfix` - describing *who acts next*. Most open tickets are `ready-for-agent`; T-8.4 is `needs-info`; the landed EPIC-1/EPIC-2 foundation (T-1.5, T-1.6, T-1.7, T-1.8, T-2.2-T-2.7) is `done` (acceptance criteria met; any on-hardware/visual residual is consolidated into its proper future ticket - EPIC-4/T-4.6, EPIC-7, T-8.1 - never parked on a human). With T-1.8 the renderer draws via the wgpu instanced glyph-atlas pipeline (the typing-lag cure), not the interim glyphon path. **Ordering/blocking is expressed by `depends_on`, not a status** - a ticket whose upstream tickets have not landed still reads `ready-for-agent`; an agent simply works the dependency-satisfied tickets first.
 
 ## Conventions all tickets share
 
@@ -69,7 +69,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-1.5 | wgpu device/surface + CADisplayLink present loop + keep-warm | done | T-1.3 |
 | T-1.6 | Glyph atlas + monospace grid fast-path (cosmic-text/swash) | done | T-1.5 |
 | T-1.7 | Tier-1 iai-callgrind micro-benches (parse/grid/frame-build) | done | T-1.4 |
-| T-1.8 | Render-path perf validation (folded-in spike) + damage tracking | ready-for-agent | T-1.5, T-1.6 |
+| T-1.8 | Render-path perf validation (folded-in spike) + damage tracking | done | T-1.5, T-1.6 |
 | T-1.9 | Event::PtyWrite reply channel + foreground pgid tracking | ready-for-agent | T-1.1, T-1.2 |
 
 ### EPIC-2 - Shell integration + block model
