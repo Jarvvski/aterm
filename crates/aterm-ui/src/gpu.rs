@@ -166,10 +166,10 @@ impl GpuRenderer {
         // Build the grid instances BEFORE acquiring the surface texture - rebuilds
         // only when the snapshot version / size / theme changed (the damage gate),
         // and reuses the buffers with zero work + zero allocation otherwise.
-        let has_text = {
+        {
             let _build = tracing::trace_span!("build").entered();
-            match frame.snapshot {
-                Some(snap) => self.grid.prepare(
+            if let Some(snap) = frame.snapshot {
+                self.grid.prepare(
                     &self.device,
                     &self.queue,
                     snap,
@@ -179,10 +179,9 @@ impl GpuRenderer {
                         height: self.config.height,
                         scale: self.scale_factor,
                     },
-                ),
-                None => false,
+                );
             }
-        };
+        }
 
         // wgpu 29: `get_current_texture` returns a `CurrentSurfaceTexture` enum.
         let surface_tex = match self.surface.get_current_texture() {
@@ -228,9 +227,10 @@ impl GpuRenderer {
                     multiview_mask: None,
                 });
 
-                if has_text {
-                    self.grid.draw(&mut pass);
-                }
+                // Always call draw: it internally no-ops (and resets the
+                // glyph-draw-call counter to 0) when there are no instances, so the
+                // counter stays honest after a text frame is followed by a blank one.
+                self.grid.draw(&mut pass);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }

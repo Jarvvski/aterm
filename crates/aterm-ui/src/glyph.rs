@@ -7,9 +7,10 @@
 //! into the shared atlas (keyed + deduplicated by [`crate::text::GlyphCache`]) and
 //! composites with the cell's foreground color by multiplication. Grayscale AA only
 //! (macOS dropped LCD subpixel AA in 2018 and the iA aesthetic wants grayscale; see
-//! `08-text-glyph-rendering.md` Rec 3). No subpixel-offset variants: a constant-
-//! advance grid lands every glyph on an integer cell origin, so there is exactly one
-//! variant per `(glyph, face, px)` (the [`crate::text::GlyphKey`] note).
+//! `08-text-glyph-rendering.md` Rec 3). No subpixel-offset variants: the grid
+//! renderer SNAPS each glyph quad to an integer pixel origin (the cell advance is
+//! fractional, so it rounds), and samples Nearest, so one rasterization per
+//! `(glyph, face, px)` is exact (the [`crate::text::GlyphKey`] note).
 //!
 //! Why swash and not glyphon's whole-buffer reshape: the interim glyphon path
 //! re-shaped the ENTIRE grid through cosmic-text on every keystroke (`Shaping::

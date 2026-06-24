@@ -12,8 +12,8 @@ gate sitting between the model and your shell.
 **Status: Phase-2 scaffold.** The workspace compiles, runs, and is green; the
 engine (PTY/VT/blocks/OSC marks), the agent safety spine (risk gate, secrets,
 sanitizer, approval policy, sandbox seam), the design tokens, and a
-window+wgpu+glyphon renderer are real. The LLM provider clients and the agentic
-turn loop are compiling stubs behind traits (EPIC-5); see the TODOs.
+window+wgpu instanced glyph-atlas renderer are real. The LLM provider clients and
+the agentic turn loop are compiling stubs behind traits (EPIC-5); see the TODOs.
 
 ## Build & run
 
@@ -43,7 +43,7 @@ app -> {ui, agent};  ui -> {core, tokens};  agent -> core;  bench -> {core}
 | `aterm-core`    | Engine: PTY (`portable-pty`), VT/grid (`alacritty_terminal`), block model, OSC-133/OSC-7 marks, shell-integration shim, and the pure unified-input `InputModel` reducer. No UI, no LLM. |
 | `aterm-tokens`  | Design tokens as typed Rust consts (paper-light + dark themes, ANSI-16 palettes, type/spacing scales, font families). Leaf crate. |
 | `aterm-agent`   | The safety spine: `ShellCommand` parse, `DefaultRiskClassifier`, `Secrets`, `OutputSanitizer`, `ApprovalPolicy`, `Sandbox` trait. Plus the `LlmProvider` trait, provider stubs, and the `AgentTurn` skeleton. |
-| `aterm-ui`      | Renderer seam: `winit` window + `wgpu` device/surface, a `Renderer` trait, a `glyphon` grid text fast-path, widget stubs. |
+| `aterm-ui`      | Renderer seam: `winit` window + `wgpu` device/surface, a `Renderer` trait, a `swash` instanced glyph-atlas grid fast-path, widget stubs. |
 | `aterm-app`     | The `aterm` binary. Wires ui+agent+core, owns the window + 3-thread model and the unified-input routing (the `InputModel` reducer itself lives in `aterm-core`). |
 | `aterm-bench`   | `criterion` benches (VT parse / OSC scan / block segmentation throughput). |
 

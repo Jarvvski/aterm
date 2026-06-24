@@ -140,11 +140,17 @@ pub struct GridRenderer {
     cache: GlyphCache,
     rasterizer: GlyphRasterizer,
     /// Glyph placement `(left, top)` per key, paralleling `cache` (the cache stores
-    /// only the atlas rect; placement positions the quad). Cleared with the cache.
+    /// only the atlas rect; placement positions the quad). NOTE: this, the
+    /// `GlyphCache`, and the atlas texture are never cleared today - they grow with
+    /// the set of distinct `(glyph, face, px)` seen, so a DPI/font-size change leaves
+    /// the prior size's glyphs resident. Bounded by the atlas (a full atlas then
+    /// drops new glyphs); eviction + atlas growth is a follow-up (see the `ATLAS_DIM`
+    /// note).
     placements: std::collections::HashMap<GlyphKey, (i32, i32)>,
-    /// Keys whose glyph is inkless (space / `.notdef` with no outline) - skipped so
-    /// they are not re-rasterized on every rebuild and emit no glyph instance.
-    empty_glyphs: HashSet<GlyphKey>,
+    /// Keys that emit no glyph instance and must not be re-rasterized on every
+    /// rebuild: inkless glyphs (space / `.notdef` with no outline) AND glyphs that
+    /// could not be placed because the atlas is full (the give-up memo).
+    skip_glyphs: HashSet<GlyphKey>,
 
     // Pipelines + bindings.
     bg_pipeline: wgpu::RenderPipeline,
@@ -161,7 +167,9 @@ pub struct GridRenderer {
     glyph_buf: InstanceBuffer,
 
     /// Rebuild gate: `(version, vw, vh, px, theme_sig)` currently built, or `None`.
-    built: Option<(u64, u32, u32, u32, u32)>,
+    /// `theme_sig` is a hash over every theme color the build reads (see
+    /// [`theme_signature`]), so a theme change always invalidates the build.
+    built: Option<(u64, u32, u32, u32, u64)>,
     /// Glyph-layer draw calls issued by the last [`Self::draw`] (the T-1.6 AC c
     /// counter: exactly 1 when the grid has any inked cell, else 0).
     last_glyph_draw_calls: u32,
@@ -186,10 +194,16 @@ impl GridRenderer {
             view_formats: &[],
         });
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+        // Nearest, NOT Linear: glyph quads are snapped to integer pixel origins (see
+        // `prepare`) and packed edge-to-edge in the atlas with no gutter, so a 1:1
+        // texel mapping is exact. Linear would interpolate the boundary texels of one
+        // glyph against its atlas NEIGHBOR (a different glyph) and soften the hinted
+        // bitmap; Nearest at integer positions is the conventional crisp choice for a
+        // constant-advance grid (08-text-glyph-rendering.md).
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("aterm-atlas-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -344,7 +358,7 @@ impl GridRenderer {
             cache: GlyphCache::new(ATLAS_DIM, ATLAS_DIM),
             rasterizer: GlyphRasterizer::new(),
             placements: std::collections::HashMap::new(),
-            empty_glyphs: HashSet::new(),
+            skip_glyphs: HashSet::new(),
             bg_pipeline,
             glyph_pipeline,
             viewport_buf,
@@ -382,9 +396,13 @@ impl GridRenderer {
 
     /// Build the frame's instances from `snap`, reusing the prior build when the
     /// `(version, viewport, px, theme)` signature is unchanged (the damage gate).
-    /// Returns `true` if there is anything to draw. Allocates nothing on the
-    /// unchanged path, and nothing on the changed path either once buffers + glyph
-    /// caches are warm at a stable size.
+    /// Returns `true` if there is anything to draw.
+    ///
+    /// The unchanged path allocates nothing (the steady-state present; asserted by
+    /// `steady_state_prepare_is_allocation_free`). On the CHANGED path the CPU
+    /// instance build reuses its warm `Vec`s and the glyph cache, so it does not
+    /// allocate either once warm at a stable size and glyph set; the GPU upload
+    /// (`queue.write_buffer`) is wgpu-managed staging and is not part of that claim.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -400,8 +418,13 @@ impl GridRenderer {
         } = size;
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
-        let theme_sig = theme.colors.bg_canvas.to_u32() ^ theme.colors.fg_primary.to_u32();
-        let key = (snap.version, viewport_w, viewport_h, px_key, theme_sig);
+        let key = (
+            snap.version,
+            viewport_w,
+            viewport_h,
+            px_key,
+            theme_signature(theme),
+        );
         if self.built == Some(key) {
             // Nothing changed: reuse the instance buffers verbatim (no rebuild, no
             // allocation). This is the steady-state present path (T-1.5 AC5 / AC1).
@@ -451,7 +474,7 @@ impl GridRenderer {
                 face,
                 px: px_key,
             };
-            if self.empty_glyphs.contains(&gkey) {
+            if self.skip_glyphs.contains(&gkey) {
                 continue;
             }
             let slot = match self.cache.get(&gkey) {
@@ -461,8 +484,12 @@ impl GridRenderer {
             let Some((rect, (left, top))) = slot else {
                 continue;
             };
-            let gx = cell_x + left as f32;
-            let gy = cell_y + baseline_off - top as f32;
+            // Snap the glyph quad to integer pixels so the hinted bitmap maps 1:1 to
+            // texels under the Nearest sampler (crisp, no inter-glyph bleed). The cell
+            // origin is fractional (cw is ~7.8px), so without this the quad would
+            // straddle pixel boundaries.
+            let gx = (cell_x + left as f32).round();
+            let gy = (cell_y + baseline_off - top as f32).round();
             let inv = 1.0 / ATLAS_DIM as f32;
             self.glyph_instances.push(GlyphInstance {
                 rect: [gx, gy, rect.w as f32, rect.h as f32],
@@ -518,9 +545,9 @@ impl GridRenderer {
     }
 
     /// Rasterize a glyph on a cache miss, upload it into the atlas, and record its
-    /// placement. Empty (inkless) glyphs are remembered so they are neither
-    /// re-rasterized nor drawn. Returns the atlas rect + placement, or `None` for an
-    /// empty/failed glyph.
+    /// placement. Inkless glyphs AND glyphs the (full) atlas cannot place are added to
+    /// `skip_glyphs` so they are never re-rasterized on a later rebuild. Returns the
+    /// atlas rect + placement, or `None` if it emits no glyph instance.
     fn rasterize_into_atlas(
         &mut self,
         queue: &wgpu::Queue,
@@ -531,7 +558,7 @@ impl GridRenderer {
     ) -> Option<(crate::text::AtlasRect, (i32, i32))> {
         let g = self.rasterizer.rasterize(face, gid, px)?;
         if g.is_empty() {
-            self.empty_glyphs.insert(gkey);
+            self.skip_glyphs.insert(gkey);
             return None;
         }
         let atlas = &self.atlas;
@@ -542,6 +569,9 @@ impl GridRenderer {
             g.height,
         );
         let Some(rect) = rect else {
+            // Atlas full: memoize the give-up so this glyph is not re-rasterized every
+            // rebuild (it cannot be placed until eviction/growth lands).
+            self.skip_glyphs.insert(gkey);
             if !self.atlas_full_logged {
                 log::warn!("glyph atlas full; new glyphs will not render (growth is a follow-up)");
                 self.atlas_full_logged = true;
@@ -606,6 +636,25 @@ fn upload_glyph(
             depth_or_array_layers: 1,
         },
     );
+}
+
+/// A stable hash over every theme color the build reads (canvas, primary + muted
+/// text, and the 16-color ANSI palette), so the rebuild gate invalidates on ANY
+/// theme change. An XOR of two colors (the previous gate) can collide and ignores the
+/// ANSI palette / muted text entirely. Computed once per rebuild, never on the
+/// steady-state present path.
+fn theme_signature(theme: &Theme) -> u64 {
+    fn fold(h: u64, c: aterm_tokens::Rgba) -> u64 {
+        (h ^ u64::from(c.to_u32())).wrapping_mul(0x0000_0100_0000_01b3)
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    h = fold(h, theme.colors.bg_canvas);
+    h = fold(h, theme.colors.fg_primary);
+    h = fold(h, theme.colors.fg_muted);
+    for i in 0..16u8 {
+        h = fold(h, theme.ansi.by_index(i));
+    }
+    h
 }
 
 const SHADER: &str = r#"
@@ -1041,6 +1090,80 @@ mod gpu_tests {
         assert!(
             rb.any_chan(col1_x, y0, col1_x + 1, y1, 0, 200),
             "the wide cell's red bg extends across the second column"
+        );
+    }
+
+    #[test]
+    fn two_distinct_glyphs_share_the_atlas_without_bleeding() {
+        // Every other GPU test renders ONE glyph into a fresh atlas, so neighbor-glyph
+        // bleed (Linear sampling across adjacent atlas rects) is invisible to them.
+        // This renders two DISTINCT glyphs into one atlas with a blank cell between
+        // them and asserts both ink while the blank cell stays clear - the Nearest
+        // sampler + integer-snapped quads must not spill one glyph into the other.
+        let Some((device, queue, format)) = device() else {
+            return;
+        };
+        let mut grid = GridRenderer::new(&device, format);
+        let (w, h) = target_size(4, 1);
+        let mut snap = Snapshot::empty(1, 4);
+        snap.version = 1;
+        let white = CellColor::Rgb(255, 255, 255);
+        let black = CellColor::Rgb(0, 0, 0);
+        // 'A' at col 0, 'B' at col 1, blank at col 2.
+        for (i, ch) in [(0usize, 'A'), (1, 'B')] {
+            snap.cells[i].c = ch;
+            snap.cells[i].fg = white;
+            snap.cells[i].bg = black;
+        }
+        let rb = render(&device, &queue, &mut grid, &snap, w, h);
+        assert!(
+            grid.rasterizations() >= 2,
+            "two distinct glyphs are rasterized"
+        );
+
+        let (a0, ay0, a1, ay1) = cell_box(0, 0, false);
+        let (b0, by0, b1, by1) = cell_box(1, 0, false);
+        assert!(
+            rb.any_chan(a0, ay0, a1, ay1, 0, 60),
+            "'A' inked (white on black)"
+        );
+        assert!(
+            rb.any_chan(b0, by0, b1, by1, 0, 60),
+            "'B' inked (white on black)"
+        );
+        // Sample the CENTER of the blank cell (col 2), clear of any neighbor glyph's
+        // own ink extent at the cell boundary - any coverage here would be true
+        // atlas-neighbor bleed. With Nearest sampling + integer-snapped quads there is
+        // none.
+        let (cw, _) = cell_px(SCALE);
+        let inset = INSET_LOGICAL * SCALE;
+        let cx = (inset + cw * 2.5) as u32; // center of column 2
+        let (_, cy0, _, cy1) = cell_box(2, 0, false);
+        assert!(
+            !rb.any_chan(cx - 1, cy0, cx + 2, cy1, 0, 20),
+            "the blank cell's center stays clear (no atlas-neighbor bleed)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sig_tests {
+    use super::theme_signature;
+    use aterm_tokens::{Theme, ThemeKind};
+
+    #[test]
+    fn theme_signature_distinguishes_themes_and_is_stable() {
+        let dark = *Theme::for_kind(ThemeKind::Dark);
+        let light = *Theme::for_kind(ThemeKind::Light);
+        assert_eq!(
+            theme_signature(&dark),
+            theme_signature(&dark),
+            "the signature is deterministic for a theme"
+        );
+        assert_ne!(
+            theme_signature(&dark),
+            theme_signature(&light),
+            "a theme change must change the rebuild-gate signature (else the renderer keeps stale colors)"
         );
     }
 }
