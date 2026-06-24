@@ -63,6 +63,16 @@ pub struct Block {
     /// until the lifecycle driver (ticket T-2.5) copies the grid region in on `D`;
     /// once populated these are owned rows, never aliased to the live grid.
     pub output: Vec<RowSnapshot>,
+    /// This block ran a full-screen (alt-screen) application - vim, htop, less - so
+    /// it lives "outside" the normal scrollback: it is rendered as a compact
+    /// "ran <cmd>" marker rather than a captured-output card, and no output rows are
+    /// snapshotted (the alt screen is ephemeral). Set by the lifecycle driver when
+    /// the alt screen activates while this block is running (ticket T-2.5).
+    ///
+    /// (This is the lightweight, non-breaking stand-in for the ticket's `Interactive`
+    /// block VARIANT; the full `Block` enum redesign is the owner-confirm item from
+    /// T-2.4, to be designed once alongside Epic-5's agent variants.)
+    pub interactive: bool,
 }
 
 impl Block {
@@ -74,6 +84,27 @@ impl Block {
     /// Did the command succeed (exit 0)? `None` until it finishes.
     pub fn succeeded(&self) -> Option<bool> {
         self.exit_code.map(|c| c == 0)
+    }
+
+    /// A finished, non-interactive command that produced NO output (e.g. `true`,
+    /// `cd`): the renderer collapses these to a thin marker line rather than an
+    /// empty output card (ticket T-2.5, AC4).
+    ///
+    /// This is **conservative** until grid-row capture lands (see [`BlockList::
+    /// set_block_output`]): the `output_span.end == start` clause keys "no output"
+    /// off zero CLEAN bytes between `C` and `D`. That is exact for a truly silent
+    /// command, but a command that emits only a non-stripped zero-width control
+    /// sequence (an OSC 7 cwd report, OSC 1337) advances the clean offset, so its
+    /// span is non-empty and it is *not* flagged thin - it renders as an empty card
+    /// instead. This errs toward a card, never toward collapsing real output, so it
+    /// is safe; the precise signal is the captured `output` rows, and once those are
+    /// populated on `D` this should key thin off `output.is_empty()` alone.
+    #[must_use]
+    pub fn is_thin(&self) -> bool {
+        !self.interactive
+            && !self.is_running()
+            && self.output.is_empty()
+            && self.output_span.end == Some(self.output_span.start)
     }
 
     /// This block's height in grid rows for the height index: one row for the
@@ -353,6 +384,16 @@ pub struct BlockSegmenter {
     command_start_offset: Option<usize>,
     /// CWD reported most recently via OSC-7, applied to the next opened block.
     pending_cwd: Option<String>,
+    /// Authoritative command text decoded from a nonce-matched `C;cmdline=` (or OSC
+    /// 633 `E`), staged by the [`Mark::CommandLine`] that precedes `OutputStart` and
+    /// consumed when the block opens (ticket T-2.5).
+    pending_command: Option<String>,
+    /// Whether the alt screen is currently active. The caller (engine) sets this at
+    /// FIRE TIME via [`Self::set_alt_screen`] - after draining the grid to the
+    /// mark's offset - because the alt-screen-toggling CSI may still be unprocessed
+    /// passthrough when a mark is first seen. While set, marks are suppressed (a
+    /// full-screen TUI's own OSC-133 marks must not fabricate phantom blocks).
+    alt_screen: bool,
 }
 
 impl Default for BlockSegmenter {
@@ -367,16 +408,52 @@ impl BlockSegmenter {
             phase: Phase::Idle,
             command_start_offset: None,
             pending_cwd: None,
+            pending_command: None,
+            alt_screen: false,
         }
+    }
+
+    /// Update the alt-screen state from the drained emulator (ticket T-2.5). On the
+    /// transition into the alt screen, the currently-running command is the one that
+    /// launched the full-screen app, so it becomes a compact `Interactive` block (no
+    /// captured output) rather than a normal output card. Call this at fire time -
+    /// after feeding the grid up to the mark's offset - so the flag is accurate.
+    pub fn set_alt_screen(&mut self, alt_screen: bool, list: &mut BlockList) {
+        if alt_screen && !self.alt_screen {
+            // Entering the alt screen. The block that ran the TUI is the one whose
+            // output is currently open (phase Output) - the `Phase::Output` guard
+            // ensures we never flag a stale block left running by an earlier
+            // missing-`D` (whose phase would not be Output) as interactive.
+            if self.phase == Phase::Output {
+                if let Some(b) = list.last_mut() {
+                    if b.is_running() {
+                        b.interactive = true;
+                    }
+                }
+            }
+            // The launching command is now the TUI; drop any command line staged
+            // for a not-yet-opened block so it cannot leak into a later one.
+            self.pending_command = None;
+        }
+        self.alt_screen = alt_screen;
     }
 
     /// Apply one mark at byte `offset` in the logical stream, mutating `list`.
     pub fn apply(&mut self, mark: &Mark, offset: usize, list: &mut BlockList) {
+        // Alt-screen suppression (ticket T-2.5): while a full-screen app owns the
+        // screen, drop ALL marks so its own OSC-133 chatter cannot fabricate phantom
+        // blocks. The launching command is already flagged Interactive (see
+        // set_alt_screen); the real prompt cycle resumes once the app exits and the
+        // alt screen is off (the closing `D` then fires with alt_screen == false).
+        if self.alt_screen {
+            return;
+        }
         match mark {
-            Mark::CommandLine(_cmd) => {
-                // The decoded command line (OSC 133 `C;cmdline=` / OSC 633 `E`).
-                // Capturing it into `Block.command` is the lifecycle state
-                // machine's job (ticket T-2.5); T-2.1 only detects + decodes it.
+            Mark::CommandLine(cmd) => {
+                // Decoded, nonce-matched command line (OSC 133 `C;cmdline=` / 633
+                // `E`); the scanner emits it just before `OutputStart`. Stage it for
+                // the block that opens next.
+                self.pending_command = Some(cmd.clone());
             }
             Mark::Cwd(path) => {
                 self.pending_cwd = Some(path.clone());
@@ -388,8 +465,20 @@ impl BlockSegmenter {
                 }
             }
             Mark::Prompt(PromptKind::PromptStart) => {
+                // Missing-`D` recovery (AC3): a fresh prompt while a block is still
+                // open means the command never reported `D` (Ctrl-C, a kill, a crash
+                // mid-output). Auto-close the orphan with an UNKNOWN exit (None) so
+                // it is finalized rather than dangling forever.
+                if let Some(b) = list.last_mut() {
+                    if b.is_running() {
+                        b.output_span.end = Some(offset);
+                        b.finished_at = Some(Instant::now());
+                        // exit_code stays None == unknown.
+                    }
+                }
                 self.phase = Phase::Prompt;
                 self.command_start_offset = None;
+                self.pending_command = None;
             }
             Mark::Prompt(PromptKind::CommandStart) => {
                 // `B`: command input begins.
@@ -397,18 +486,22 @@ impl BlockSegmenter {
                 self.command_start_offset = Some(offset);
             }
             Mark::Prompt(PromptKind::OutputStart) => {
-                // `C`: a new block opens; its output span starts here.
+                // `C`: a new block opens; its output span starts here. An empty Enter
+                // (A->B->A with no C) never reaches here, so no phantom empty block
+                // is created (AC4); a command that runs but emits nothing yields a
+                // block whose output span stays empty -> `Block::is_thin`.
                 self.phase = Phase::Output;
                 list.push(Block {
-                    command: String::new(),
+                    command: self.pending_command.take().unwrap_or_default(),
                     output_span: OutputSpan::open(offset),
                     exit_code: None,
                     started_at: Instant::now(),
                     finished_at: None,
                     cwd: self.pending_cwd.clone(),
                     // The immutable output snapshot lands on `D` via
-                    // BlockList::set_block_output (the lifecycle driver, T-2.5).
+                    // BlockList::set_block_output (grid-row capture is a follow-up).
                     output: Vec::new(),
+                    interactive: false,
                 });
             }
             Mark::Prompt(PromptKind::CommandDone { exit_code }) => {
@@ -422,6 +515,7 @@ impl BlockSegmenter {
                 }
                 self.phase = Phase::Idle;
                 self.command_start_offset = None;
+                self.pending_command = None;
             }
         }
     }
@@ -791,5 +885,187 @@ mod tests {
         assert!(!b0.is_running());
         assert_eq!(b0.output.len(), 2, "immutable output snapshot captured");
         assert_eq!(b0.height_rows(), 3);
+    }
+
+    // --- T-2.5 lifecycle state machine + alt-screen suppression ----------------
+
+    #[test]
+    fn ac1_normal_cycle_finalizes_one_block_and_resumes() {
+        // AC1: a normal A/B/C/D cycle yields one finalized block; a second cycle
+        // then yields a second (the state machine returned to Idle).
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        for base in [0usize, 100] {
+            seg.apply(&a(), base, &mut list);
+            seg.apply(&b(), base + 2, &mut list);
+            seg.apply(&c(), base + 4, &mut list);
+            seg.apply(&d(0), base + 40, &mut list);
+        }
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|b| !b.is_running()));
+        assert_eq!(list.get(0).unwrap().exit_code, Some(0));
+    }
+
+    #[test]
+    fn ac1_cmdline_mark_sets_block_command() {
+        // The scanner emits CommandLine(X) just before OutputStart for a nonce'd
+        // `C;cmdline=X`; the segmenter stages it onto the opening block.
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&b(), 2, &mut list);
+        seg.apply(&Mark::CommandLine("git status".into()), 4, &mut list);
+        seg.apply(&c(), 4, &mut list);
+        seg.apply(&d(0), 20, &mut list);
+        assert_eq!(list.get(0).unwrap().command, "git status");
+    }
+
+    #[test]
+    fn ac2_alt_screen_yields_one_interactive_block_no_phantoms() {
+        // AC2: running a TUI (vim) -> one Interactive block, and the TUI's own
+        // OSC-133 marks while in the alt screen create NO phantom blocks.
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        // vim launches: a normal block opens.
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&b(), 2, &mut list);
+        seg.apply(&Mark::CommandLine("vim".into()), 4, &mut list);
+        seg.apply(&c(), 4, &mut list);
+        assert_eq!(list.len(), 1);
+        // vim enters the alt screen -> the launching block becomes Interactive.
+        seg.set_alt_screen(true, &mut list);
+        assert!(list.get(0).unwrap().interactive);
+        // Phantom marks the TUI emits while in the alt screen are suppressed.
+        seg.apply(&a(), 50, &mut list);
+        seg.apply(&b(), 52, &mut list);
+        seg.apply(&c(), 54, &mut list);
+        seg.apply(&d(0), 56, &mut list);
+        assert_eq!(list.len(), 1, "no phantom blocks from alt-screen chatter");
+        // vim exits -> alt screen off -> the shell's D closes the interactive block.
+        seg.set_alt_screen(false, &mut list);
+        seg.apply(&d(0), 100, &mut list);
+        let b0 = list.get(0).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(b0.interactive);
+        assert!(
+            !b0.is_running(),
+            "the interactive block is finalized on exit"
+        );
+        assert_eq!(b0.command, "vim");
+    }
+
+    #[test]
+    fn altscreen_entry_clears_staged_command_line() {
+        // Hardening (review): a command line staged via `CommandLine` whose block
+        // never opened before the alt screen activates must not leak into a later
+        // block. Entering the alt screen drops the staged command.
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&Mark::CommandLine("staged".into()), 0, &mut list);
+        assert_eq!(seg.pending_command.as_deref(), Some("staged"));
+        seg.set_alt_screen(true, &mut list);
+        assert!(
+            seg.pending_command.is_none(),
+            "alt-screen entry drops the staged command line"
+        );
+    }
+
+    #[test]
+    fn altscreen_entry_only_flags_the_open_output_block() {
+        // Hardening (review): entering the alt screen flags ONLY the block whose
+        // output is currently open (phase Output, still running) as interactive -
+        // never a finished block (the `is_running` guard) and never a stale block
+        // left dangling by an earlier missing `D` (whose phase is not Output, so the
+        // `Phase::Output` guard rejects it).
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&b(), 2, &mut list);
+        seg.apply(&c(), 4, &mut list);
+        seg.apply(&d(0), 20, &mut list); // finished; phase -> Idle
+        seg.set_alt_screen(true, &mut list);
+        assert!(
+            !list.get(0).unwrap().interactive,
+            "a finished (non-Output) block is not retroactively made interactive"
+        );
+    }
+
+    #[test]
+    fn ac3_missing_d_recovery_auto_closes_with_unknown_exit() {
+        // AC3: a Ctrl-C'd command (no D before the next prompt) is auto-closed with
+        // an UNKNOWN exit when the next A arrives.
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&b(), 2, &mut list);
+        seg.apply(&c(), 4, &mut list); // command running...
+        assert!(list.get(0).unwrap().is_running());
+        // No D - the next prompt arrives (user hit Ctrl-C).
+        seg.apply(&a(), 30, &mut list);
+        let b0 = list.get(0).unwrap();
+        assert!(!b0.is_running(), "orphaned block auto-closed");
+        assert_eq!(b0.exit_code, None, "auto-closed exit is unknown");
+        // The recovery did not spawn a phantom block.
+        assert_eq!(list.len(), 1);
+        // A real next command still segments normally.
+        seg.apply(&b(), 32, &mut list);
+        seg.apply(&c(), 34, &mut list);
+        seg.apply(&d(0), 60, &mut list);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.get(1).unwrap().exit_code, Some(0));
+    }
+
+    #[test]
+    fn ac4_empty_enter_makes_no_block_and_no_output_is_thin() {
+        // AC4: an empty Enter (A->B->A, never reaching C) creates no block.
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&b(), 2, &mut list);
+        seg.apply(&a(), 4, &mut list); // empty Enter -> new prompt, no command ran
+        assert_eq!(list.len(), 0, "an empty Enter must not create a block");
+
+        // A command that runs but emits nothing (C and D adjacent) -> a thin block.
+        seg.apply(&b(), 6, &mut list);
+        seg.apply(&c(), 8, &mut list);
+        seg.apply(&d(0), 8, &mut list); // no output bytes between C and D
+        assert_eq!(list.len(), 1);
+        assert!(
+            list.get(0).unwrap().is_thin(),
+            "no-output command collapses to a thin marker"
+        );
+    }
+
+    #[test]
+    fn ac5_nonce_mismatch_marks_never_reach_the_segmenter() {
+        // AC5: a nested un-integrated shell (or an attacker) emitting OSC-133 with
+        // the WRONG nonce produces NO marks from the nonce-armed scanner, so the
+        // outer block list is never mutated. (The gate is T-2.1's; this confirms the
+        // integration that protects the lifecycle.)
+        use crate::osc::OscScanner;
+        let mut scanner = OscScanner::with_nonce("realsession");
+        let forged = b"\x1b]133;A;aterm_nonce=attacker\x07\
+\x1b]133;C;aterm_nonce=attacker\x07\x1b]133;D;0;aterm_nonce=attacker\x07";
+        let scan = scanner.scan(forged);
+        assert!(
+            scan.marks.is_empty(),
+            "wrong-nonce marks must be dropped by the scanner"
+        );
+
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        for (offset, mark) in &scan.marks {
+            seg.apply(mark, *offset, &mut list);
+        }
+        assert_eq!(list.len(), 0, "no block from forged marks");
+
+        // The same sequence with the CORRECT nonce DOES produce marks (sanity).
+        let good = b"\x1b]133;A;aterm_nonce=realsession\x07\
+\x1b]133;C;aterm_nonce=realsession\x07\x1b]133;D;0;aterm_nonce=realsession\x07";
+        let scan = scanner.scan(good);
+        assert!(
+            !scan.marks.is_empty(),
+            "correctly-nonced marks pass the gate"
+        );
     }
 }

@@ -251,6 +251,7 @@ impl Engine {
             blocks: BlockList::new(),
             replies,
             pending_reply: Vec::new(),
+            clean_offset: 0,
             version: 0,
             latest: Arc::clone(&latest),
             back,
@@ -398,6 +399,11 @@ struct Model {
     /// Holds at most one reply at a time so a short (non-blocking) write resumes
     /// next cycle without truncating the escape sequence (see [`Model::write_replies`]).
     pending_reply: Vec<u8>,
+    /// Cumulative count of clean (passthrough) bytes fed to the terminal so far -
+    /// the session-absolute base the OSC scanner stamps mark offsets against. Used
+    /// to convert a mark's absolute offset into a chunk-relative index so feed and
+    /// mark-application can be interleaved in stream order (ticket T-2.5).
+    clean_offset: usize,
     /// Monotonic publish counter; stamped into each published snapshot.
     version: u64,
     latest: Arc<Mutex<Arc<Snapshot>>>,
@@ -428,10 +434,28 @@ impl Model {
     /// position, so marks already carry absolute offsets.
     fn process_output(&mut self, bytes: &[u8]) {
         let scan = self.osc.scan(bytes);
+        // Interleave feed + mark-application in stream order (ticket T-2.5): feed the
+        // clean bytes up to each mark's offset BEFORE applying it, so the grid (hence
+        // the alt-screen flag the segmenter reads at fire time) reflects exactly the
+        // state at that mark. With no marks this collapses to a single feed of the
+        // whole passthrough - identical to before.
+        let chunk_start = self.clean_offset;
+        let passthrough = &scan.passthrough;
+        let mut fed = 0usize;
         for (offset, mark) in &scan.marks {
+            let rel = offset.saturating_sub(chunk_start).min(passthrough.len());
+            if rel > fed {
+                self.terminal.feed(&passthrough[fed..rel]);
+                fed = rel;
+            }
+            self.segmenter
+                .set_alt_screen(self.terminal.is_alt_screen(), &mut self.blocks);
             self.segmenter.apply(mark, *offset, &mut self.blocks);
         }
-        self.terminal.feed(&scan.passthrough);
+        if fed < passthrough.len() {
+            self.terminal.feed(&passthrough[fed..]);
+        }
+        self.clean_offset += passthrough.len();
         // The feed above may have raised DA/DSR/cursor-position replies into the
         // terminal's reply channel; write them back to the PTY (ticket T-1.9).
         self.write_replies();

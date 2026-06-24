@@ -13,6 +13,15 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Command-block lifecycle.** The block segmenter now drives the full lifecycle from
+  the shell's OSC-133 marks: a normal command cycle yields one finalized block (its
+  command line taken from `cmdline=`), a Ctrl-C'd command auto-closes with an unknown
+  exit when the next prompt arrives, an empty Enter creates no block, a no-output
+  command collapses to a thin marker, and running a full-screen app (vim/htop)
+  becomes a single compact "interactive" block instead of fragmenting into phantom
+  blocks from the app's own marks. Marks now fire in lockstep with the grid - the
+  engine interleaves VT parsing and mark-application by stream offset, so the
+  alt-screen decision is made against the true emulator state (ticket T-2.5).
 - **zsh shell integration (command-block marks).** Launching aterm with zsh now
   installs a per-session `ZDOTDIR` shim - zero dotfile edits, restores the user's
   real config, removed on exit - that emits nonce-stamped OSC-133 A/B/C/D + OSC 7
