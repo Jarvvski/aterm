@@ -4,7 +4,7 @@
 //! drop in without touching the app's frame loop, and keeps the 60fps fast-path
 //! behind a stable surface.
 
-use aterm_core::{Integration, Snapshot};
+use aterm_core::{BlockList, Integration, Snapshot};
 use aterm_tokens::Theme;
 
 /// Errors a renderer can surface during a frame.
@@ -27,6 +27,12 @@ pub enum RenderError {
 pub struct Frame<'a> {
     pub theme: &'a Theme,
     pub snapshot: Option<&'a Snapshot>,
+    /// The published block list for the virtualized timeline (ticket T-2.7), borrowed
+    /// from the host's `Arc<BlockList>` for the duration of the frame. `None` for a
+    /// host with no engine (e.g. the headless UI). The renderer virtualizes it via the
+    /// SumTree ([`crate::timeline`]); the host supplies it through
+    /// [`crate::app::UiCallbacks::blocks`].
+    pub blocks: Option<&'a BlockList>,
     /// The shell-integration indicator state for this frame (ticket T-2.6). The
     /// renderer maps it to a glyph + tooltip via [`crate::indicator::
     /// IntegrationIndicator`]; the host supplies it through

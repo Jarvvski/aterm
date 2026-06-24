@@ -15,6 +15,7 @@ pub mod indicator;
 pub mod present;
 pub mod renderer;
 pub mod text;
+pub mod timeline;
 pub mod widgets;
 pub mod window;
 
@@ -26,6 +27,10 @@ pub use renderer::{Frame, RenderError, Renderer};
 pub use text::{
     build_grid_cells, classify_run, is_ascii_fast, resolve_color, AtlasRect, FaceStyle, GlyphCache,
     GlyphKey, GridCell, RunLayout, ShelfAllocator,
+};
+pub use timeline::{
+    layout as timeline_layout, visible_block_count, GutterMarker, Scroll, TimelineLayout,
+    TimelineMode, TimelineRow, VisibleBlock,
 };
 
 // Re-export the winit key types the host app needs for input routing.

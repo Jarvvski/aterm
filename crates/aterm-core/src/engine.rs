@@ -130,6 +130,12 @@ pub struct Engine {
     to_model: Option<Sender<ToModel>>,
     /// The model thread publishes here; consumers read the latest snapshot.
     latest: Arc<Mutex<Arc<Snapshot>>>,
+    /// The model thread publishes the block list here; the render thread reads it to
+    /// virtualize the timeline (ticket T-2.7). Mirrors `latest` (a `Mutex<Arc<_>>`
+    /// swapped on change): a cheap `Arc` clone for the consumer, an immutable
+    /// `BlockList` snapshot re-published only when the list actually changes (block
+    /// mutations are human-paced, not per-frame).
+    latest_blocks: Arc<Mutex<Arc<BlockList>>>,
     /// VT window events (title/bell/clipboard/PtyWrite/...) the app drains.
     events: Receiver<TerminalEvent>,
     metrics: Arc<EngineMetrics>,
@@ -352,6 +358,9 @@ impl Engine {
         let latest = Arc::new(Mutex::new(Arc::new(Snapshot::empty(rows, cols))));
         // The second half of the publish double-buffer (T-1.4).
         let back = Arc::new(Snapshot::empty(rows, cols));
+        // The block-list publish slot (T-2.7): seeded empty so a consumer that reads
+        // before the first block opens sees a coherent (empty) list, not a sentinel.
+        let latest_blocks = Arc::new(Mutex::new(Arc::new(BlockList::new())));
 
         // Integration indicator state (T-2.6). The monitor's decision logic is pure;
         // the model thread drives it (confirm on a nonce-matched A, time out the
@@ -377,6 +386,8 @@ impl Engine {
             segmenter: BlockSegmenter::new(),
             heuristic: HeuristicSegmenter::new(),
             blocks: BlockList::new(),
+            latest_blocks: Arc::clone(&latest_blocks),
+            blocks_touched: false,
             integration: monitor,
             integration_code: Arc::clone(&integration_code),
             confirm_window,
@@ -396,6 +407,7 @@ impl Engine {
         Ok(Self {
             to_model: Some(to_model_tx),
             latest,
+            latest_blocks,
             events,
             metrics,
             #[cfg(unix)]
@@ -437,6 +449,15 @@ impl Engine {
     /// held only for the refcount bump.
     pub fn latest_snapshot(&self) -> Arc<Snapshot> {
         Arc::clone(&self.latest.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// The most recently published block list (ticket T-2.7), for the virtualized
+    /// timeline renderer. Cheap: clones an `Arc` under a lock held only for the
+    /// refcount bump - the same zero-copy publish discipline as [`Self::
+    /// latest_snapshot`]. The returned `BlockList` is an immutable point-in-time view;
+    /// the model thread keeps publishing fresh ones as blocks open/close.
+    pub fn latest_blocks(&self) -> Arc<BlockList> {
+        Arc::clone(&self.latest_blocks.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Borrow the channel of VT window events (title/bell/clipboard/...).
@@ -569,6 +590,15 @@ struct Model {
     /// otherwise.
     heuristic: HeuristicSegmenter,
     blocks: BlockList,
+    /// The render thread's view of [`Self::blocks`], an immutable `Arc<BlockList>`
+    /// re-published only when the list changed (ticket T-2.7). See [`Model::
+    /// publish_blocks`].
+    latest_blocks: Arc<Mutex<Arc<BlockList>>>,
+    /// Set whenever [`Self::blocks`] was mutated since the last block publish (a mark
+    /// opened/closed a block, or the heuristic appended one). Gates the clone in
+    /// [`Model::publish_blocks`] so an idle session that only streams output re-clones
+    /// nothing.
+    blocks_touched: bool,
     /// Integration-indicator decision machine (ticket T-2.6). The model confirms it
     /// on a nonce-matched `A` and times it out via the confirmation-window timer in
     /// [`run_model`], publishing the result through `integration_code`.
@@ -660,6 +690,11 @@ impl Model {
         if self.integration.heuristic_active() && !self.terminal.is_alt_screen() {
             self.heuristic.observe_output(passthrough);
         }
+        // A mark in this chunk mutated the block list (opened/closed/flagged a block
+        // via the segmenter), so the next publish must re-publish the blocks snapshot
+        // for the render thread (ticket T-2.7). The heuristic's own appends happen in
+        // `publish` and set the flag there.
+        self.blocks_touched |= !scan.marks.is_empty();
         // The feed above may have raised DA/DSR/cursor-position replies into the
         // terminal's reply channel; write them back to the PTY (ticket T-1.9).
         self.write_replies();
@@ -799,8 +834,13 @@ impl Model {
                 (snap.cursor.col, snap.alt_screen)
             };
             if !alt_screen {
+                let before = self.blocks.len();
                 self.heuristic
                     .note_prompt_if_idle(cursor_col, self.clean_offset, &mut self.blocks);
+                if self.blocks.len() != before {
+                    // The heuristic appended an approximate block - re-publish below.
+                    self.blocks_touched = true;
+                }
                 self.metrics
                     .blocks
                     .store(self.blocks.len(), Ordering::Relaxed);
@@ -820,6 +860,34 @@ impl Model {
         self.metrics
             .snapshots_published
             .fetch_add(1, Ordering::Relaxed);
+
+        // Publish the block list too, if it changed since the last publish (ticket
+        // T-2.7). It rides the same publish() call as the snapshot but under its OWN
+        // lock, so the (snapshot, blocks) pair is *eventually consistent*, not atomic:
+        // each side is internally coherent, but a consumer can briefly observe a new
+        // snapshot paired with the previous block list (it self-heals next frame).
+        // Today's only consumer reads a SumTree count that is unused while alt-screen,
+        // so the skew is invisible; a future consumer that draws block geometry keyed
+        // off the snapshot's alt_screen flag should reconcile (e.g. stamp the publish
+        // version onto both). Cheap (a flag check) when nothing changed.
+        self.publish_blocks();
+    }
+
+    /// Re-publish the block list to the render thread when it changed since the last
+    /// publish (ticket T-2.7). Clones the current [`BlockList`] into a fresh immutable
+    /// `Arc` and swaps it into `latest_blocks` (the lock held only for the pointer
+    /// swap). Skipped entirely - no clone, no lock - when `blocks_touched` is clear,
+    /// so an output-only flood (no new/closed blocks) pays nothing here.
+    fn publish_blocks(&mut self) {
+        if !self.blocks_touched {
+            return;
+        }
+        let snapshot = Arc::new(self.blocks.clone());
+        {
+            let mut guard = self.latest_blocks.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = snapshot;
+        }
+        self.blocks_touched = false;
     }
 
     /// Apply a control message. Returns `true` if it warrants a republish (a
@@ -1651,6 +1719,49 @@ mod tests {
             2,
             "the heuristic must segment exactly two command cycles, no more (no \
              mid-output over-segmentation)"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn latest_blocks_publishes_the_segmented_list_to_consumers() {
+        // T-2.7 seam: the model thread publishes the BlockList to the render thread.
+        // A no-shim supported shell is heuristic-active; the same two-cycle script as
+        // `heuristic_session_produces_approximate_blocks` must surface TWO approximate
+        // blocks through `latest_blocks()` (the render-thread view), not just the
+        // `block_count` metric.
+        let script = "printf 'P> '; sleep 0.4; printf 'a\\nb\\nP> '; sleep 0.4; \
+                      printf 'c\\nP> '; sleep 0.8";
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", script],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            None,
+            Duration::from_millis(100),
+        )
+        .expect("spawn sh simulating a no-hooks shell");
+        // Before any prompt the published list is the seeded-empty one.
+        assert_eq!(
+            engine.latest_blocks().len(),
+            0,
+            "seeded empty before any block"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while engine.latest_blocks().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let blocks = engine.latest_blocks();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "the published block list must carry the two segmented cycles"
+        );
+        assert!(
+            blocks.iter().all(|b| b.approximate),
+            "a heuristic session's published blocks are labeled approximate"
         );
         drop(engine);
     }

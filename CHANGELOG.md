@@ -13,6 +13,21 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Virtualized block-timeline layout.** The block list is now published to the
+  renderer and laid out as a single vertically-scrolling timeline, virtualized over the
+  SumTree height index so a 10k-block history costs O(visible rows) per frame, not
+  O(history): the index picks the blocks intersecting the viewport (O(log n)), then only
+  the rows on screen within each become geometry. Each block carries a gutter status
+  marker (running / exit-0 / failed-with-code / unknown / interactive / approximate),
+  and long output collapses to a capped height with a "... +N lines" affordance - the
+  collapse folded into the block's display height so scroll-to-block and the drawn
+  layout share one coordinate space. A full-screen app (vim) switches the layout to a
+  full-window alt-screen surface and leaves the scroll untouched, so exiting resumes the
+  timeline in place. The engine publishes the live block list each time it changes; the
+  renderer consumes it and reports a live visible-block count. Drawing the timeline
+  cards on screen (replacing the raw grid) awaits finished-block output-row capture and
+  EPIC-4 component styling; this lands the geometry, the virtualization, and the publish
+  seam (ticket T-2.7).
 - **Shell-integration status indicator.** aterm now surfaces a visible three-state
   integration status - Integrated / Heuristic / None - so it degrades loudly instead
   of silently (the prototype's worst sin). "Integrated" is shown only after a

@@ -28,7 +28,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use aterm_core::Snapshot;
+use aterm_core::{BlockList, Snapshot};
 use aterm_tokens::{Theme, ThemeKind};
 
 use crate::gpu::GpuRenderer;
@@ -71,6 +71,15 @@ pub trait UiCallbacks {
     /// only going to idle. Defaults to 0 (a host with no engine never advances).
     fn snapshot_version(&mut self) -> u64 {
         0
+    }
+
+    /// Provide the published block list for the virtualized timeline this frame
+    /// (ticket T-2.7), or `None` for a host with no engine (e.g.
+    /// [`HeadlessCallbacks`]). Returns an `Arc` so the renderer borrows it without a
+    /// per-frame deep copy - the consumer side of the model thread's block publish,
+    /// mirroring [`Self::snapshot`].
+    fn blocks(&mut self) -> Option<Arc<BlockList>> {
+        None
     }
 
     /// The shell-integration indicator state to show this frame (ticket T-2.6).
@@ -146,11 +155,13 @@ impl<C: UiCallbacks> AtermApp<C> {
     /// snapshot, the grid text. Called only when the scheduler says to present.
     fn redraw(&mut self) {
         let snapshot = self.callbacks.snapshot();
+        let blocks = self.callbacks.blocks();
         let integration = self.callbacks.integration_status();
         if let Some(renderer) = self.renderer.as_mut() {
             let frame = Frame {
                 theme: &self.theme,
                 snapshot: snapshot.as_deref(),
+                blocks: blocks.as_deref(),
                 integration,
             };
             if let Err(e) = renderer.render(frame) {

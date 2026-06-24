@@ -42,6 +42,18 @@ impl OutputSpan {
     }
 }
 
+/// Default display policy: a finished block whose captured output exceeds this many
+/// rows is collapsed in the timeline to its first `COLLAPSED_OUTPUT_ROWS` rows plus a
+/// single "... +N lines" affordance row (ticket T-2.7, AC4). This caps a single
+/// block's contribution to the scroll height, so one `cargo build` or `git log` cannot
+/// dominate the timeline; the hidden rows stay in the immutable snapshot and are
+/// revealed by the (future) expand affordance. A tuning default, NOT a protocol
+/// constant - revisit against the T-7.x perf/UX matrix; the per-block expand toggle is
+/// a follow-up (EPIC-3/4 input). Mirrors the precedent of [`Block::is_thin`] living in
+/// core: the height that feeds the [`HeightIndex`] IS the renderer's geometry contract,
+/// so the collapse decision belongs with it (one coordinate space).
+pub const COLLAPSED_OUTPUT_ROWS: u64 = 16;
+
 /// One command block.
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -115,25 +127,66 @@ impl Block {
             && self.output_span.end == Some(self.output_span.start)
     }
 
-    /// This block's height in grid rows for the height index: one row for the
-    /// command/prompt line plus its captured output rows. (A still-running block
-    /// reports 1 until its output is snapshotted on finish; the live tail block's
-    /// on-screen height is the renderer's concern, ticket T-2.7.)
+    /// This block's RAW height in grid rows: one row for the command/prompt line
+    /// plus every captured output row, uncollapsed. (A still-running block reports 1
+    /// until its output is snapshotted on finish; the live tail block's on-screen
+    /// height is the renderer's concern, ticket T-2.7.) The height the timeline
+    /// actually reserves - and the [`HeightIndex`] tracks - is
+    /// [`Self::display_height_rows`], which collapses long output.
     #[must_use]
     pub fn height_rows(&self) -> u64 {
         1 + self.output.len() as u64
+    }
+
+    /// The number of output rows actually shown when this block is rendered: capped
+    /// at [`COLLAPSED_OUTPUT_ROWS`] for a long block, else all of them (ticket T-2.7).
+    #[must_use]
+    pub fn shown_output_rows(&self) -> u64 {
+        (self.output.len() as u64).min(COLLAPSED_OUTPUT_ROWS)
+    }
+
+    /// `Some(hidden_row_count)` when this block's output is collapsed (more than
+    /// [`COLLAPSED_OUTPUT_ROWS`] rows captured), else `None`. Drives the
+    /// "... +N lines" affordance the timeline draws (ticket T-2.7, AC4).
+    #[must_use]
+    pub fn collapsed_hidden_rows(&self) -> Option<u64> {
+        let n = self.output.len() as u64;
+        (n > COLLAPSED_OUTPUT_ROWS).then(|| n - COLLAPSED_OUTPUT_ROWS)
+    }
+
+    /// This block's height in *display* rows - what the timeline reserves and what
+    /// the [`HeightIndex`] tracks, so the virtualized renderer's scroll geometry
+    /// matches what is drawn (ticket T-2.7). Equal to [`Self::height_rows`] until the
+    /// output exceeds [`COLLAPSED_OUTPUT_ROWS`], after which the block collapses to:
+    /// the command line + `COLLAPSED_OUTPUT_ROWS` shown rows + one "... +N lines"
+    /// affordance row. Collapsing HERE (not only in the renderer) keeps a single
+    /// coordinate space: `block_at` / `blocks_in_viewport` / scroll-to-block all agree
+    /// with the drawn layout.
+    #[must_use]
+    pub fn display_height_rows(&self) -> u64 {
+        match self.collapsed_hidden_rows() {
+            // command line + the shown (capped) rows + the "... +N lines" row.
+            Some(_) => 1 + COLLAPSED_OUTPUT_ROWS + 1,
+            None => self.height_rows(),
+        }
     }
 }
 
 /// The ordered list of blocks for a session, with a [`HeightIndex`] giving
 /// O(log n) viewport queries for the virtualized timeline renderer (ticket T-2.4).
 ///
-/// The index mirrors each block's [`Block::height_rows`]; it is kept in step by
-/// [`Self::push`] (a new block) and [`Self::set_block_output`] (a block's output
-/// snapshot lands, growing its height). Mutating a block's cwd/exit/finished flags
-/// via [`Self::last_mut`] does not change its height, so the index stays consistent
+/// The index mirrors each block's [`Block::display_height_rows`] (the collapsed
+/// display height, ticket T-2.7); it is kept in step by [`Self::push`] (a new block)
+/// and [`Self::set_block_output`] (a block's output snapshot lands, growing - and
+/// possibly collapsing - its height). Mutating a block's cwd/exit/finished flags via
+/// [`Self::last_mut`] does not change its height, so the index stays consistent
 /// without an explicit update there.
-#[derive(Debug, Default)]
+///
+/// `Clone` so the model thread can publish an immutable `Arc<BlockList>` snapshot to
+/// the render thread (ticket T-2.7) - mirroring the grid `Snapshot` publish. Blocks
+/// are small (the output capture that would make them heavy is a follow-up), and the
+/// clone happens only when the list actually changes, not per frame.
+#[derive(Debug, Default, Clone)]
 pub struct BlockList {
     blocks: Vec<Block>,
     index: HeightIndex,
@@ -167,10 +220,19 @@ impl BlockList {
         self.blocks.last()
     }
 
-    /// Total height of all blocks in rows (the timeline's scroll extent).
+    /// Total height of all blocks in display rows (the timeline's scroll extent).
     #[must_use]
     pub fn total_height_rows(&self) -> u64 {
         self.index.total()
+    }
+
+    /// The display-row offset of block `i`'s top edge from the top of the timeline
+    /// (the cumulative display height of all blocks before it) - O(log n) via the
+    /// height index. The virtualized renderer uses this to place a block on screen
+    /// relative to the scroll position (ticket T-2.7).
+    #[must_use]
+    pub fn block_top_row(&self, i: usize) -> u64 {
+        self.index.prefix(i)
     }
 
     /// The half-open range of block indices intersecting a viewport of `viewport_h`
@@ -183,11 +245,12 @@ impl BlockList {
     }
 
     /// Replace block `i`'s output snapshot (the lifecycle driver, T-2.5, calls this
-    /// on `D` with the captured grid rows) and update the height index to match.
+    /// on `D` with the captured grid rows) and update the height index to match its
+    /// new *display* height (collapsing long output, ticket T-2.7).
     pub fn set_block_output(&mut self, i: usize, rows: Vec<RowSnapshot>) {
         if let Some(b) = self.blocks.get_mut(i) {
             b.output = rows;
-            self.index.set(i, b.height_rows());
+            self.index.set(i, b.display_height_rows());
         }
     }
 
@@ -196,7 +259,7 @@ impl BlockList {
     }
 
     fn push(&mut self, block: Block) {
-        self.index.push(block.height_rows());
+        self.index.push(block.display_height_rows());
         self.blocks.push(block);
     }
 }
@@ -977,6 +1040,70 @@ mod tests {
             list.blocks_in_viewport(4, 1),
             1..2,
             "row 4 is block 1's only row"
+        );
+    }
+
+    #[test]
+    fn display_height_collapses_long_output() {
+        // AC4 (T-2.7): a block whose captured output exceeds COLLAPSED_OUTPUT_ROWS
+        // collapses to command + CAP shown rows + one "... +N lines" affordance row;
+        // a short block shows every row uncollapsed (display == raw height).
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+
+        // A short block (3 output rows) is never collapsed.
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&c(), 4, &mut list);
+        seg.apply(&d(0), 40, &mut list);
+        list.set_block_output(0, vec![row(80); 3]);
+        let short = list.get(0).unwrap();
+        assert_eq!(short.collapsed_hidden_rows(), None);
+        assert_eq!(short.shown_output_rows(), 3);
+        assert_eq!(short.display_height_rows(), short.height_rows());
+        assert_eq!(short.display_height_rows(), 1 + 3);
+
+        // A long block: CAP + 25 rows of output collapses.
+        let long_rows = (COLLAPSED_OUTPUT_ROWS + 25) as usize;
+        seg.apply(&a(), 100, &mut list);
+        seg.apply(&c(), 104, &mut list);
+        seg.apply(&d(0), 200, &mut list);
+        list.set_block_output(1, vec![row(80); long_rows]);
+        let long = list.get(1).unwrap();
+        assert_eq!(long.shown_output_rows(), COLLAPSED_OUTPUT_ROWS);
+        assert_eq!(long.collapsed_hidden_rows(), Some(25));
+        // command + CAP shown + 1 affordance row, NOT 1 + long_rows.
+        assert_eq!(long.display_height_rows(), 1 + COLLAPSED_OUTPUT_ROWS + 1);
+        assert!(long.display_height_rows() < long.height_rows());
+    }
+
+    #[test]
+    fn height_index_tracks_collapsed_display_height() {
+        // The SumTree must virtualize over DISPLAY heights so scroll geometry matches
+        // the drawn (collapsed) layout - one coordinate space (ticket T-2.7).
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&c(), 4, &mut list);
+        seg.apply(&d(0), 40, &mut list);
+
+        let long_rows = (COLLAPSED_OUTPUT_ROWS + 100) as usize;
+        list.set_block_output(0, vec![row(80); long_rows]);
+
+        let collapsed_h = 1 + COLLAPSED_OUTPUT_ROWS + 1;
+        assert_eq!(list.get(0).unwrap().display_height_rows(), collapsed_h);
+        assert_eq!(
+            list.total_height_rows(),
+            collapsed_h,
+            "the index tracks the collapsed display height, not the raw output count"
+        );
+        assert_eq!(list.block_top_row(0), 0);
+        // A viewport far taller than the collapsed block still sees exactly one block,
+        // and the index never reports a row past the collapsed extent.
+        assert_eq!(list.blocks_in_viewport(0, 1000), 0..1);
+        assert_eq!(
+            list.block_top_row(1),
+            collapsed_h,
+            "the next block's top edge is after the collapsed block's display height"
         );
     }
 

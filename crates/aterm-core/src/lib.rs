@@ -18,6 +18,7 @@ pub mod terminal;
 // Re-export the load-bearing public types at the crate root for ergonomics.
 pub use block::{
     Block, BlockList, BlockSegmenter, HeightIndex, HeuristicSegmenter, OutputSpan, RowSnapshot,
+    COLLAPSED_OUTPUT_ROWS,
 };
 pub use engine::{Engine, EngineMetrics, ToModel};
 pub use input::{InputEvent, InputMode, InputModel, InputOutcome};

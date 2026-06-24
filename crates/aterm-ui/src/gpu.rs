@@ -39,6 +39,14 @@ pub struct GpuRenderer {
     /// `(version, width, height)` currently shaped into `text_buffer`, or `None`
     /// when nothing is shaped (cleared / no snapshot).
     text_state: Option<(u64, u32, u32)>,
+    /// Virtualized-timeline scroll position (ticket T-2.7). Auto-follows the bottom
+    /// (the live-terminal default) until scroll input lands (EPIC-3).
+    scroll: crate::timeline::Scroll,
+    /// Blocks that built timeline geometry on the last drawn frame - the AC1
+    /// virtualization counter (ticket T-2.7), exposed via
+    /// [`GpuRenderer::visible_block_count`] for tests / a future status line. `0`
+    /// until a block list is published.
+    last_visible_blocks: usize,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -127,9 +135,27 @@ impl GpuRenderer {
             text_buffer,
             text_scratch: String::new(),
             text_state: None,
+            scroll: crate::timeline::Scroll::default(),
+            last_visible_blocks: 0,
             _window: window,
             scale_factor,
         })
+    }
+
+    /// The number of grid rows that fit in the current surface - the timeline
+    /// viewport height in display rows (ticket T-2.7). Uses the same GRID cell-height
+    /// metric as the PTY grid sizing ([`crate::window::cell_px`]), so the timeline
+    /// viewport matches the terminal's row count.
+    fn viewport_rows(&self) -> u64 {
+        let (_, ch) = crate::window::cell_px(self.scale_factor);
+        (self.config.height as f32 / ch).floor().max(0.0) as u64
+    }
+
+    /// The number of blocks that built timeline geometry on the last drawn frame -
+    /// the AC1 virtualization counter (ticket T-2.7).
+    #[must_use]
+    pub fn visible_block_count(&self) -> usize {
+        self.last_visible_blocks
     }
 
     /// Render the snapshot text (and always clear). Split out so `render` reads
@@ -144,6 +170,30 @@ impl GpuRenderer {
         // this ticket wires the state through.
         let _indicator =
             crate::indicator::IntegrationIndicator::resolve(frame.integration, frame.theme);
+
+        // Virtualized-timeline bookkeeping (ticket T-2.7). When a block list is
+        // published, count the blocks intersecting the viewport - the AC1
+        // virtualization counter - via the SumTree (O(log n), no allocation). The
+        // on-screen view stays the grid for now: drawing the timeline cards needs the
+        // finished-block OUTPUT-row capture that T-2.4/T-2.5 deferred (see the ticket
+        // notes), and the card styling is T-4.6. This wires + exercises the publish
+        // seam end to end and proves the virtualization against the live list.
+        let alt_screen = frame.snapshot.is_some_and(|s| s.alt_screen);
+        let viewport_rows = self.viewport_rows();
+        self.last_visible_blocks = match frame.blocks {
+            Some(blocks) => {
+                // Auto-follow the latest output (pin to the bottom) until scroll input
+                // (EPIC-3) drives `self.scroll`. Skip while a full-screen app owns the
+                // screen so the timeline scroll is PRESERVED across the alt-screen
+                // round-trip (ticket T-2.7 AC3): exiting vim resumes where we were.
+                if !alt_screen {
+                    self.scroll
+                        .to_bottom(blocks.total_height_rows(), viewport_rows);
+                }
+                crate::timeline::visible_block_count(blocks, alt_screen, self.scroll, viewport_rows)
+            }
+            None => 0,
+        };
 
         // wgpu 29: `get_current_texture` returns a `CurrentSurfaceTexture` enum.
         let surface_tex = match self.surface.get_current_texture() {

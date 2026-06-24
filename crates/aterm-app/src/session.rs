@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use aterm_core::{Engine, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK};
+use aterm_core::{BlockList, Engine, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK};
 use aterm_ui::{NamedKey, UiCallbacks, Window};
 
 use aterm_core::{InputEvent, InputModel, InputOutcome};
@@ -95,6 +95,14 @@ impl UiCallbacks for Session {
         // bump under a short lock) - NO per-frame deep copy of the grid. This is
         // the consumer side of the engine's zero-alloc publish (ticket T-1.5 AC5).
         Some(self.engine.latest_snapshot())
+    }
+
+    fn blocks(&mut self) -> Option<Arc<BlockList>> {
+        // The live, virtualized timeline's data (ticket T-2.7): the model thread
+        // publishes the block list, here handed to the renderer as a cheap `Arc`
+        // clone (a refcount bump under a short lock - NO per-frame deep copy), the
+        // consumer side of the model thread's block publish.
+        Some(self.engine.latest_blocks())
     }
 
     fn integration_status(&mut self) -> aterm_core::Integration {
