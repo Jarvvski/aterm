@@ -30,6 +30,15 @@ pub struct GpuRenderer {
     atlas: TextAtlas,
     viewport: Viewport,
     text_renderer: TextRenderer,
+    // Persistent grid-text state, reused across frames so a steady-state present
+    // does not allocate (ticket T-1.5 AC5). The buffer + scratch String are built
+    // once and only re-shaped when the snapshot version or the surface size
+    // changes; an unchanged warm frame reuses them with zero allocation.
+    text_buffer: Buffer,
+    text_scratch: String,
+    /// `(version, width, height)` currently shaped into `text_buffer`, or `None`
+    /// when nothing is shaped (cleared / no snapshot).
+    text_state: Option<(u64, u32, u32)>,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -96,8 +105,14 @@ impl GpuRenderer {
         let viewport = Viewport::new(&device, &cache);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let font_system = font_system_with_bundled();
+        let mut font_system = font_system_with_bundled();
         let swash_cache = SwashCache::new();
+
+        // The persistent grid-text buffer (reused every frame; see AC5). Metrics
+        // are the fixed GRID type style; its size is set on first render / resize.
+        let grid = aterm_tokens::type_scale::GRID;
+        let metrics = Metrics::new(grid.size_pt, grid.size_pt * grid.line_height);
+        let text_buffer = Buffer::new(&mut font_system, metrics);
 
         Ok(Self {
             surface,
@@ -109,6 +124,9 @@ impl GpuRenderer {
             atlas,
             viewport,
             text_renderer,
+            text_buffer,
+            text_scratch: String::new(),
+            text_state: None,
             _window: window,
             scale_factor,
         })
@@ -139,9 +157,10 @@ impl GpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Build the text buffer from the snapshot (if any) ahead of the pass so
-        // glyphon's prepare can borrow it.
-        let mut buffer = self.build_text_buffer(frame.snapshot, fg);
+        // Update the PERSISTENT text buffer from the snapshot (if any), reshaping
+        // only when the content or size changed; an unchanged warm frame reuses it
+        // with no allocation (ticket T-1.5 AC5).
+        let has_text = self.update_text_buffer(frame.snapshot);
 
         self.viewport.update(
             &self.queue,
@@ -151,9 +170,9 @@ impl GpuRenderer {
             },
         );
 
-        if let Some(buf) = buffer.as_mut() {
+        if has_text {
             let text_areas = [TextArea {
-                buffer: buf,
+                buffer: &self.text_buffer,
                 left: 8.0,
                 top: 8.0,
                 scale: self.scale_factor,
@@ -202,7 +221,7 @@ impl GpuRenderer {
                 multiview_mask: None,
             });
 
-            if buffer.is_some() {
+            if has_text {
                 self.text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .map_err(|e| RenderError::Backend(format!("text render: {e}")))?;
@@ -215,44 +234,60 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Build a glyphon text buffer from the grid snapshot. Returns `None` when
-    /// there is nothing to draw (window still clears).
-    fn build_text_buffer(
-        &mut self,
-        snapshot: Option<&aterm_core::Snapshot>,
-        _fg: Rgba,
-    ) -> Option<Buffer> {
-        let snap = snapshot?;
-        // Render the visible grid as monospaced lines. This is the stretch text
-        // fast-path; it is intentionally simple (no per-cell color/attr yet).
-        // TODO(ticket EPIC-1.6): per-cell fg/bg + bold/italic runs + a real grid
-        // fast-path that batches one quad per cell instead of shaping each row.
-        let grid = aterm_tokens::type_scale::GRID;
-        let metrics = Metrics::new(grid.size_pt, grid.size_pt * grid.line_height);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(
+    /// Update the persistent grid-text buffer from the snapshot, reshaping ONLY
+    /// when the content (snapshot version) or the surface size changed. Returns
+    /// whether there is text to draw.
+    ///
+    /// Reusing `text_buffer` + `text_scratch` keeps a steady-state present
+    /// allocation-free (ticket T-1.5 AC5): an unchanged warm frame hits the
+    /// `text_state` cache and returns immediately, doing no work. When the content
+    /// *does* change (active output), it reuses the scratch String's heap and the
+    /// buffer's storage; the residual per-change shaping cost is what the per-cell
+    /// glyph/quad fast-path (ticket T-1.6) replaces - this stays the simple
+    /// monospaced-rows stretch path, with no per-cell color/attr yet.
+    fn update_text_buffer(&mut self, snapshot: Option<&aterm_core::Snapshot>) -> bool {
+        let Some(snap) = snapshot else {
+            self.text_state = None;
+            return false;
+        };
+        let key = (snap.version, self.config.width, self.config.height);
+        if self.text_state == Some(key) {
+            return true; // unchanged: reuse the already-shaped buffer (no alloc)
+        }
+
+        self.text_buffer.set_size(
             &mut self.font_system,
             Some(self.config.width as f32),
             Some(self.config.height as f32),
         );
-
-        let mut text = String::with_capacity(snap.rows * (snap.cols + 1));
-        for row in 0..snap.rows {
-            for cell in snap.row(row) {
-                text.push(cell.c);
-            }
-            text.push('\n');
-        }
+        fill_grid_text(&mut self.text_scratch, snap);
         let attrs = Attrs::new().family(Family::Name(tfont::GRID));
-        buffer.set_text(
+        self.text_buffer.set_text(
             &mut self.font_system,
-            &text,
+            &self.text_scratch,
             &attrs,
             Shaping::Advanced,
             None,
         );
-        buffer.shape_until_scroll(&mut self.font_system, false);
-        Some(buffer)
+        self.text_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.text_state = Some(key);
+        true
+    }
+}
+
+/// Fill `scratch` with the snapshot's visible grid as monospaced rows (one `\n`
+/// per row). Clears then refills so the String's heap is reused across frames
+/// (no realloc once warmed at a stable size). Pulled out as a free function so
+/// the reuse behavior is unit-testable without a GPU device (ticket T-1.5 AC5).
+fn fill_grid_text(scratch: &mut String, snap: &aterm_core::Snapshot) {
+    scratch.clear();
+    scratch.reserve(snap.rows * (snap.cols + 1));
+    for row in 0..snap.rows {
+        for cell in snap.row(row) {
+            scratch.push(cell.c);
+        }
+        scratch.push('\n');
     }
 }
 
@@ -292,4 +327,31 @@ fn linear_to_wgpu(c: Rgba) -> wgpu::Color {
 /// Convert to glyphon's packed RGBA color.
 fn rgba_to_gcolor(c: Rgba) -> GColor {
     GColor::rgba(c.r, c.g, c.b, c.a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fill_grid_text;
+    use aterm_core::Snapshot;
+
+    #[test]
+    fn fill_grid_text_has_one_newline_per_row_and_reuses_capacity() {
+        // A blank 3x4 grid: 3 rows * (4 cells + 1 newline) = 15 chars, 3 newlines.
+        let snap = Snapshot::empty(3, 4);
+        let mut s = String::new();
+        fill_grid_text(&mut s, &snap);
+        assert_eq!(s.chars().count(), 3 * (4 + 1));
+        assert_eq!(s.matches('\n').count(), 3);
+
+        // Re-filling at the same dims reuses the heap: capacity must not shrink
+        // (it is the same buffer cleared + refilled, so no reallocation) - this is
+        // the steady-state no-alloc property the persistent buffer depends on.
+        let cap = s.capacity();
+        fill_grid_text(&mut s, &snap);
+        assert_eq!(s.chars().count(), 3 * (4 + 1));
+        assert!(
+            s.capacity() >= cap,
+            "reuse must not shrink/realloc the scratch String"
+        );
+    }
 }

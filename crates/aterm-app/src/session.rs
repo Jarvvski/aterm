@@ -90,13 +90,13 @@ impl UiCallbacks for Session {
         self.engine.latest_snapshot().version
     }
 
-    fn snapshot(&mut self) -> Option<Snapshot> {
+    fn snapshot(&mut self) -> Option<Arc<Snapshot>> {
         self.drain_terminal_events();
-        // The engine's model thread owns the parse loop; here we just read the
-        // latest published snapshot. Cloning out of the `Arc` satisfies the
-        // current owned-`Option<Snapshot>` callback contract; a later change can
-        // hand the renderer the `Arc` directly to drop this per-frame clone.
-        Some((*self.engine.latest_snapshot()).clone())
+        // The engine's model thread owns the parse loop; here we just hand the
+        // renderer the latest published snapshot as a cheap `Arc` clone (a refcount
+        // bump under a short lock) - NO per-frame deep copy of the grid. This is
+        // the consumer side of the engine's zero-alloc publish (ticket T-1.5 AC5).
+        Some(self.engine.latest_snapshot())
     }
 
     fn on_key(&mut self, text: Option<&str>, named: Option<NamedKey>) -> Option<Vec<u8>> {

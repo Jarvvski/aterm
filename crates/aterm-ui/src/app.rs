@@ -56,7 +56,12 @@ pub trait UiCallbacks {
     fn on_ready(&mut self, _window: Arc<Window>) {}
 
     /// Provide the terminal snapshot to draw this frame (or `None` to just clear).
-    fn snapshot(&mut self) -> Option<Snapshot> {
+    ///
+    /// Returns an `Arc` so the renderer borrows the published grid without a
+    /// per-frame deep clone - the consumer side of the engine's zero-alloc publish
+    /// (ticket T-1.5 AC5). The host hands back a cheap `Arc` clone, not a copy of
+    /// the cells.
+    fn snapshot(&mut self) -> Option<Arc<Snapshot>> {
         None
     }
 
@@ -137,7 +142,7 @@ impl<C: UiCallbacks> AtermApp<C> {
         if let Some(renderer) = self.renderer.as_mut() {
             let frame = Frame {
                 theme: &self.theme,
-                snapshot: snapshot.as_ref(),
+                snapshot: snapshot.as_deref(),
             };
             if let Err(e) = renderer.render(frame) {
                 log::warn!("frame render error: {e}");

@@ -21,6 +21,21 @@ the next version (or an `## Unreleased` heading until a version is cut).
   scheduler (ticket T-1.5). The precise self-bridged `CADisplayLink` vsync source the
   60fps floor targets is layered on behind a seam (opt-in, validated on ProMotion
   hardware).
+- **Allocation-free steady-state present.** The renderer no longer deep-clones the
+  grid every frame (it borrows the engine's published `Arc<Snapshot>`) and the grid
+  text buffer is reshaped only when the content or window size changes - an unchanged
+  warm frame now allocates nothing on the present path (ticket T-1.5 AC5). Per-cell
+  color/attr drawing and the formal debug allocation assertion remain T-1.6 / T-1.8.
+
+### Known limitations
+
+- **Resize is not yet tear-synchronized.** T-1.5 AC4 (toggle `presentsWithTransaction`
+  on the Metal layer for the duration of a live resize) is **deferred**: it requires
+  reaching wgpu's `CAMetalLayer` via `Surface::as_hal` and a synchronous main-thread
+  transactional present during resize, and tear-free resize cannot be verified without
+  a display. The present-with-transaction protocol already lives in wgpu-hal, so this
+  is a contained follow-up; it is flagged for the owner to validate alongside the
+  on-hardware CADisplayLink pass (see ticket T-1.5 notes).
 
 ## 0.1.0 - 2026-06-23
 
