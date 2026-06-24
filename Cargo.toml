@@ -54,6 +54,12 @@ nix = { version = "0.28", default-features = false, features = ["term", "signal"
 winit = "0.30"
 wgpu = "29"
 glyphon = "0.11"
+# swash: CoreType-free glyph rasterization to an 8-bit alpha mask for the grid
+# fast-path (T-1.8 GPU half). The grid renderer owns its own atlas + instanced
+# wgpu pipeline rather than going through glyphon's whole-buffer reshape; swash
+# rasterizes each unique (glyph, face, px) once into the atlas (the typing-lag
+# cure - see the render diagnosis). Stays the published 0.2 line.
+swash = "0.2"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 # --- logging ---

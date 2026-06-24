@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod fonts;
+pub mod glyph;
 pub mod gpu;
 pub mod indicator;
 pub mod present;
@@ -20,6 +21,7 @@ pub mod widgets;
 pub mod window;
 
 pub use app::{run, run_with, AtermApp, HeadlessCallbacks, RenderConfig, UiCallbacks};
+pub use glyph::{CellMetrics, GlyphRasterizer, RasterGlyph};
 pub use gpu::GpuRenderer;
 pub use indicator::IntegrationIndicator;
 pub use present::{DisplayLink, FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
