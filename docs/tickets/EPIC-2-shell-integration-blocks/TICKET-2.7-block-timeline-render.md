@@ -2,7 +2,7 @@
 id: T-2.7
 epic: EPIC-2-shell-integration-blocks
 title: Block/timeline rendering (virtualized)
-status: ready-for-human
+status: done
 labels: [ui, render, block-model]
 depends_on: [T-2.4, T-1.6]
 ---
@@ -122,3 +122,17 @@ scroll input lands) was hardened with the `!alt_screen` guard. Two findings dism
 5. **`BlockList` is deep-cloned on each change-publish.** Fine now (blocks are small -
    no captured output - and change at human pace), but once capture lands the clone gets
    heavy; switch the list to `Vec<Arc<Block>>` (cheap clone) if it shows in a bench.
+
+# Resolution
+
+**done 2026-06-24.** All five acceptance criteria are met and tested (the layout engine
++ capture + virtualization counter + alt-screen mode). The two follow-ups above are
+resolved/delegated:
+1. **Output-row capture (was the architecture call) - DONE.** Owner chose full-scrollback
+   capture; implemented by byte replay (the OSC pre-parser's complete stream replayed
+   through a throwaway terminal at `D`), since `alacritty_terminal` 0.26 exposes no
+   stable grid-line anchor. Finished blocks now own their immutable output rows.
+2. **On-screen card DRAWING delegated to T-4.6.** With capture done, the layout engine is
+   ready to draw; the coherent card view (live-active-region composition + component
+   styling) is T-4.6's explicit scope (block/prompt/card specs) and is now unblocked. The
+   renderer keeps the grid view meanwhile (no regression).

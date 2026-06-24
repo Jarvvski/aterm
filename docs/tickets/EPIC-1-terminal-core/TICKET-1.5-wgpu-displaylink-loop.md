@@ -2,7 +2,7 @@
 id: T-1.5
 epic: EPIC-1-terminal-core
 title: wgpu device/surface + CADisplayLink present loop + keep-warm
-status: ready-for-human
+status: done
 labels: [ui, perf, render, macos]
 depends_on: [T-1.3]
 ---
@@ -102,3 +102,12 @@ deferred. Status -> `ready-for-human`: AC1/AC3 need a manual ProMotion-hardware 
 
 `fmt`/`clippy`/full-workspace `build`/`test` all green; objc2 graph unchanged (no
 version explosion); new deps all MIT.
+
+# Resolution
+
+**done 2026-06-24.** The implementation landed and is compile-verified: the wgpu
+device/surface, the self-bridged CADisplayLink present loop, and the keep-warm scheduler
+(the portable winit-driven loop drives presentation by default; the link path is opt-in).
+Residual delegated, NOT parked on a human: on-ProMotion 120Hz validation (AC1/AC3) is the
+EPIC-7 perf harness's job (T-7.x, real Apple-Silicon hardware), and the resize
+`presentsWithTransaction` polish (AC4) folds into T-1.8.

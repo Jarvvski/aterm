@@ -2,7 +2,7 @@
 id: T-1.6
 epic: EPIC-1-terminal-core
 title: Glyph atlas + monospace grid fast-path (cosmic-text/swash)
-status: ready-for-human
+status: done
 labels: [ui, render, text]
 depends_on: [T-1.5]
 ---
@@ -89,3 +89,13 @@ verified headlessly:**
 
 `fmt`/`clippy`/full-workspace `build`/`test` green (aterm-ui 33 tests, +18); no new
 dependencies (pure logic over `aterm-core` + `aterm-tokens`).
+
+# Resolution
+
+**done 2026-06-24.** The CPU half landed and is unit-tested: the `GridCell` instance
+model, the `GlyphCache` (shape/rasterize each glyph once), the `ShelfAllocator` atlas
+packer, and the snapshot -> instance builders. The GPU half - swash/CoreText
+rasterization, the wgpu instanced pipeline, and replacing the interim glyphon text path
+on screen - is consolidated into T-1.8 (render-path perf validation + the folded-in
+spike + damage tracking), which depends on this ticket. The on-screen rendering ACs are
+delivered there rather than duplicated here.

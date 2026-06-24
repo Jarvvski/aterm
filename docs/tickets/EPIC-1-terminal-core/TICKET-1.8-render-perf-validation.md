@@ -34,3 +34,14 @@ Validate the wgpu + CADisplayLink + atlas path against the frame-time budget end
 
 - The full Tier-2 recorder + 7 scenarios + CI gate (Epic 7); this is early manual validation.
 - Resize/reflow perf (T-7.4).
+
+# Notes
+
+**Inherited 2026-06-24 (from T-1.6, T-1.5).** Beyond its own damage-tracking + perf
+scope, this ticket now also carries: (a) the GPU half of T-1.6 - swash/CoreText
+rasterization + the wgpu instanced pipeline that replaces the interim glyphon text path
+on screen, consuming the `GridCell`/`GlyphCache`/`ShelfAllocator` CPU half already
+landed; and (b) the resize `presentsWithTransaction` polish from T-1.5 (AC4). The
+instanced fast-path is also the real cure for the typing-lag stand-in (per the render
+diagnosis: glyphon `Shaping::Advanced` per-keystroke full-grid reshape). On-hardware
+120Hz/ProMotion validation itself is EPIC-7 (T-7.x).

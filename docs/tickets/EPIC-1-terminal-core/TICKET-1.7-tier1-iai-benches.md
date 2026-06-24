@@ -2,7 +2,7 @@
 id: T-1.7
 epic: EPIC-1-terminal-core
 title: Tier-1 iai-callgrind micro-benches (parse/grid/frame-build)
-status: ready-for-human
+status: done
 labels: [bench, perf, ci]
 depends_on: [T-1.4]
 ---
@@ -86,3 +86,11 @@ added the partial-Lines case above.
 
 `fmt`/`clippy`/full-workspace `build`/`test` green; `iai-callgrind` is a pinned
 (non-wildcard) dev-dependency; all ~20 new transitive deps are MIT/Apache.
+
+# Resolution
+
+**done 2026-06-24.** The Tier-1 iai-callgrind micro-benches (parse / grid / frame-build)
+are written and verified locally on macOS. Residual delegated to CI under EPIC-7: running
+them on a Linux + valgrind runner to emit instruction counts, persisting a main-branch
+baseline, and promoting the job from `continue-on-error` to a required gate (or wiring
+Bencher) is a CI/infra action, not parked on a human in this loop.

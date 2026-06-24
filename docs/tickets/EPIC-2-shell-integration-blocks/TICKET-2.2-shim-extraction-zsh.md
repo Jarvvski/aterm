@@ -2,7 +2,7 @@
 id: T-2.2
 epic: EPIC-2-shell-integration-blocks
 title: Shell-integration shim extraction + ZDOTDIR injection (zsh)
-status: ready-for-human
+status: done
 labels: [core, shell-integration]
 depends_on: [T-1.1]
 ---
@@ -88,3 +88,12 @@ pre-existing/attacker dir is never trusted - we point a shell at it).
 `fmt`/`clippy`/full-workspace `build`/`test` green (aterm-core 77 tests, incl. 3
 real-zsh integration tests, all stable across reruns). No new Rust deps (the scripts
 are `include_str!`'d resources).
+
+# Resolution
+
+**done 2026-06-24.** All acceptance criteria met. Residual (non-blocking, not tracked as
+a follow-up): the OSC-7 `cwd` path is sent unencoded - the adversarial review confirmed
+this non-exploitable for v1 (only an exotic directory literally named with a control
+char or `%` is affected). The `cmdline=` field is already byte-safe in all three shims
+(`LC_ALL=C` byte-masking; fish `string escape --style=url`). A path-safe (keep-`/`)
+cwd encoder is minor future hardening if exotic paths ever matter.

@@ -2,7 +2,7 @@
 id: T-2.3
 epic: EPIC-2-shell-integration-blocks
 title: bash + fish hooks (version-branched)
-status: ready-for-human
+status: done
 labels: [core, shell-integration]
 depends_on: [T-2.2]
 ---
@@ -102,3 +102,12 @@ tests; content-only string tests cannot catch these):
 4. **DEBUG-trap tier caveats** (documented in `integration.bash`): it is the
    least-reliable tier (drives T-2.6's "Heuristic" label); a user rc that later installs
    its own `DEBUG` trap would override ours. The broader on-host shell matrix is T-7.4.
+
+# Resolution
+
+**done 2026-06-24.** AC2 "version detected AND reported" resolved: each shim now emits
+`aterm_ver=<version>` on the first prompt's `A` mark (bash `$BASH_VERSION`, zsh
+`$ZSH_VERSION`, fish `$version`), the nonce-gated OSC scanner parses it into
+`Mark::ShellVersion`, and `Engine::shell_version()` surfaces it for the T-2.6 indicator.
+The fish live end-to-end test stays skip-if-absent (validated where fish >= 3.2 is
+present); the shim is exercised by the real-shell tests on hosts that have it.

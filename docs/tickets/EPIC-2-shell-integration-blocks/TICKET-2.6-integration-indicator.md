@@ -2,7 +2,7 @@
 id: T-2.6
 epic: EPIC-2-shell-integration-blocks
 title: Three-state integration indicator + heuristic fallback
-status: ready-for-human
+status: done
 labels: [ui, shell-integration]
 depends_on: [T-2.3, T-2.5]
 ---
@@ -109,3 +109,13 @@ exact-count engine test.
    indicator cannot yet say "bash 3.2 - upgrade for reliable blocks". `IntegrationReason::
    why()` is generic; the UI can prepend the `ShellKind`. Surfacing the version (a mark
    attribute or a `bash --version` probe) is the remaining piece.
+
+# Resolution
+
+**done 2026-06-24.** Owner product decision (open-question #2, resolved): KEEP the
+labeled-heuristic fallback rather than an honest "no-blocks" mode - approximate blocks,
+always labeled. Follow-up #4 (bash-version surfacing) resolved: `Engine::shell_version()`
+now carries the shell's reported version (T-2.3), so the indicator can say "bash 3.2 -
+upgrade for reliable blocks". The indicator's on-screen glyph/tooltip drawing remains
+EPIC-4 (T-4.6), consistent with the rest of the indicator UI. `INTEGRATION_CONFIRM_WINDOW`
+(5s) stays an untuned default - revisit against the EPIC-7 perf/shell matrix.

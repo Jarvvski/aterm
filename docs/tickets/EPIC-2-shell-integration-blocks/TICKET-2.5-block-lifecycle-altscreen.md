@@ -2,7 +2,7 @@
 id: T-2.5
 epic: EPIC-2-shell-integration-blocks
 title: Block lifecycle state machine + alt-screen suppression
-status: ready-for-human
+status: done
 labels: [core, block-model, shell-integration]
 depends_on: [T-2.1, T-2.4]
 ---
@@ -81,3 +81,11 @@ findings; 2 cheap, real hardenings were fixed and pinned with tests
    ticket's `Interactive` *variant* is folded into the deferred `Block`-enum redesign
    that is the T-2.4 owner-confirm item; the flag delivers the behavior (one compact
    block, no captured output, no phantoms) non-breakingly until that decision is made.
+
+# Resolution
+
+**done 2026-06-24.** `Block::is_thin` is now keyed off the captured `output.is_empty()`
+(grid-row capture landed in T-2.7), the precise signal the original conservative
+byte-span check stood in for. Owner decision: `Interactive` stays a `bool` flag, not a
+block variant, until the Epic-5 `Block`-enum design (see T-2.4) - the flag delivers the
+behavior (compact block, no output, no phantom marks) non-breakingly.

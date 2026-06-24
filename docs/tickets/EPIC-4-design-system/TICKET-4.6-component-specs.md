@@ -37,3 +37,15 @@ Apply the iA component specs to the live UI: the command block, the unified prom
 
 - The agent-card *data* model (T-5.10) - this styles whatever the model provides.
 - Focus-Mode dimming (T-8.5).
+
+# Notes
+
+**Inherited 2026-06-24 (from T-2.7, T-2.6).** This ticket now owns the on-screen DRAWING
+of the block timeline. Its data + geometry are ready: T-2.7 landed the pure `timeline`
+layout engine (`aterm-ui/src/timeline.rs`: virtualized blocks, gutter markers, output
+rows, collapse affordance, scroll model) and finished-block output capture, and T-2.6
+landed the integration-indicator presentation (`IntegrationIndicator`). Remaining for
+this ticket: the component styling AND the live-active-region composition (drawing
+finished blocks from captured output while the running command shows its live output,
+without duplicating scrollback) - the renderer currently draws the raw grid as a
+non-regressing stand-in. Scroll input is EPIC-3 (T-3.x).

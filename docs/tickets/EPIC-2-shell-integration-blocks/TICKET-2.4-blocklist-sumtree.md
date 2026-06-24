@@ -2,7 +2,7 @@
 id: T-2.4
 epic: EPIC-2-shell-integration-blocks
 title: BlockList + SumTree height index + immutable snapshots
-status: ready-for-human
+status: done
 labels: [core, block-model]
 depends_on: [T-2.1]
 ---
@@ -83,3 +83,13 @@ models a command block: command/exit/cwd/finished + the new immutable snapshot).
 enum reshaping wants an owner call on the variant set + field names, then an agent
 can implement it - ideally coordinated with T-2.5 and Epic-5 so the variant set is
 designed once. No CHANGELOG entry: internal data structure, no user-visible change.
+
+# Resolution
+
+**done 2026-06-24.** Owner decision (recorded so it is not re-litigated): KEEP the
+flag-based `Block` struct. The typed `Block` enum (`RunningBlock` / `CommandBlock` /
+`Interactive` / agent-transcript variants) is designed ONCE at Epic-5, when the agent
+variants (T-5.10) are actually known - avoiding a double redesign. The `SumTree`
+`HeightIndex` now also virtualizes the timeline (T-2.7) and tracks each block's
+*collapsed display height*, so scroll geometry and the drawn layout share one coordinate
+space.
