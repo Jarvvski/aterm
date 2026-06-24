@@ -56,7 +56,47 @@ jobs:
       - name: Build benches
         run: cargo build -p aterm-bench --benches
 
-      # Placeholder: a full `cargo bench` run is left non-blocking and is not
-      # executed in CI yet (no perf baseline to gate against). TODO(EPIC-7).
-      - name: Bench (smoke)
-        run: cargo bench -p aterm-bench -- --test
+      # Criterion throughput smoke (runs anywhere; the iai-callgrind `tier1`
+      # bench needs valgrind, so it runs in the dedicated Linux job below).
+      - name: Bench (criterion smoke)
+        run: cargo bench -p aterm-bench --bench engine -- --test
+
+  tier1-bench:
+    name: Tier-1 instruction-count gate (Linux)
+    # iai-callgrind runs under valgrind, which is reliable on Linux (not macOS),
+    # and instruction counts are noise-immune on shared runners (the whole point
+    # of Tier 1; see 09-performance-60fps.md section 9). Non-blocking for now:
+    # promote to a required gate once it is confirmed green on a real runner and a
+    # main-branch baseline is persisted (save `--save-baseline=main` on push to
+    # main, then `--baseline=main` on PRs) or Bencher is wired (ticket T-1.7).
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tier1-${{ hashFiles('**/Cargo.lock') }}
+
+      # The runner binary version MUST match the iai-callgrind library version.
+      - name: Install iai-callgrind-runner
+        run: cargo install iai-callgrind-runner --version 0.16.1 --locked
+
+      # Run the four Tier-1 micro-benches and fail on a >5% instruction-count (Ir)
+      # regression (generous to start; tighten later). On the first run there is no
+      # baseline to compare against, so it records counts; the gate bites once a
+      # baseline is persisted across runs (see the note above).
+      - name: Tier-1 benches (gate at 5% Ir regression)
+        run: cargo bench -p aterm-bench --bench tier1 -- --callgrind-limits='ir=5%'

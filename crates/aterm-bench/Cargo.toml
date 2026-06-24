@@ -17,7 +17,13 @@ aterm-core.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
+iai-callgrind.workspace = true
 
 [[bench]]
 name = "engine"
+harness = false
+
+# Tier-1 instruction-count micro-benches (T-1.7). Runs under valgrind on Linux CI.
+[[bench]]
+name = "tier1"
 harness = false
