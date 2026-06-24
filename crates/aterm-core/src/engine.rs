@@ -53,8 +53,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{after, bounded, never, select, unbounded, Receiver, Sender, TryRecvError};
 
 use crate::{
-    BlockList, BlockSegmenter, OscScanner, Pty, PtyDimensions, PtyError, PtyEvent, Snapshot,
-    Terminal, TerminalEvent,
+    BlockList, BlockSegmenter, OscScanner, Pty, PtyDimensions, PtyError, PtyEvent, Signal,
+    Snapshot, Terminal, TerminalEvent,
 };
 
 /// Reader read-buffer size. 64 KiB matches Zellij's PTY read buffer; the buffer
@@ -120,6 +120,14 @@ pub struct Engine {
     /// VT window events (title/bell/clipboard/PtyWrite/...) the app drains.
     events: Receiver<TerminalEvent>,
     metrics: Arc<EngineMetrics>,
+    /// A `dup` of the PTY master fd (Unix), held so [`Engine::signal_foreground`]
+    /// can `tcgetpgrp`/`killpg` from the main thread independently of the model
+    /// thread's `Pty`. Owning a dup (not a bare `RawFd`) means the fd stays valid
+    /// for the handle's lifetime and can never be a *reused* descriptor - signalling
+    /// the wrong process group would be a real hazard (ticket T-1.9). `None` if the
+    /// backend exposed no master fd or the dup failed.
+    #[cfg(unix)]
+    fg_fd: Option<std::os::fd::OwnedFd>,
     reader: Option<JoinHandle<()>>,
     model: Option<JoinHandle<()>>,
 }
@@ -153,6 +161,19 @@ impl Engine {
         let terminal =
             Terminal::with_scrollback(dims.rows as usize, dims.cols as usize, scrollback);
         let events = terminal.events().clone();
+        let replies = terminal.replies().clone();
+
+        // Dup the master fd so the handle can resolve + signal the foreground
+        // process group from the main thread (Ctrl-C / agent-cancel) independently
+        // of the `Pty`, which moves into the model thread. A dup (an `OwnedFd`, not
+        // a copied `RawFd`) cannot become a reused descriptor while we hold it.
+        #[cfg(unix)]
+        let fg_fd = pty.master_fd().and_then(|fd| {
+            // SAFETY: `fd` is the live master fd of `pty` (still owned here, before
+            // it moves into the model thread); we only borrow it for the dup.
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            borrowed.try_clone_to_owned().ok()
+        });
 
         let metrics = Arc::new(EngineMetrics::default());
         let rows = dims.rows as usize;
@@ -176,6 +197,8 @@ impl Engine {
             osc: OscScanner::untrusted(),
             segmenter: BlockSegmenter::new(),
             blocks: BlockList::new(),
+            replies,
+            pending_reply: Vec::new(),
             version: 0,
             latest: Arc::clone(&latest),
             back,
@@ -191,6 +214,8 @@ impl Engine {
             latest,
             events,
             metrics,
+            #[cfg(unix)]
+            fg_fd,
             reader: Some(reader_handle),
             model: Some(model_handle),
         })
@@ -242,6 +267,50 @@ impl Engine {
     }
 }
 
+#[cfg(unix)]
+impl Engine {
+    /// The terminal's foreground process group id, or `None` if it cannot be
+    /// resolved (no master fd, or the fd is no longer a terminal). This is the
+    /// group a Ctrl-C / agent-cancel should target, not the shell's own group
+    /// (ticket T-1.9).
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        use std::os::fd::AsFd;
+        crate::pty::foreground_pgid(self.fg_fd.as_ref()?.as_fd())
+    }
+
+    /// Send `sig` to the terminal's foreground process group (Ctrl-C interrupts the
+    /// running command, not the hidden shell). Errors if there is no master fd or
+    /// the signal cannot be delivered.
+    ///
+    /// Note: like all pgid-based signalling this races process-group teardown - if
+    /// the foreground group has already exited and its pgid been reused, the signal
+    /// could reach an unrelated group. Callers should only signal a group they have
+    /// reason to believe is alive.
+    pub fn signal_foreground(&self, sig: Signal) -> Result<(), PtyError> {
+        use std::os::fd::AsFd;
+        let fd = self
+            .fg_fd
+            .as_ref()
+            .ok_or_else(|| PtyError::Signal("no master fd to signal".into()))?;
+        crate::pty::signal_foreground(fd.as_fd(), sig)
+    }
+}
+
+#[cfg(not(unix))]
+impl Engine {
+    /// Foreground-pgroup lookup is Unix-only; always `None` elsewhere.
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        None
+    }
+
+    /// Foreground signalling is Unix-only; always an error elsewhere.
+    pub fn signal_foreground(&self, _sig: Signal) -> Result<(), PtyError> {
+        Err(PtyError::Signal(
+            "foreground signalling is only supported on Unix".into(),
+        ))
+    }
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         // 1. Drop the mailbox sender so the model thread's `select!` sees the
@@ -268,6 +337,14 @@ struct Model {
     osc: OscScanner,
     segmenter: BlockSegmenter,
     blocks: BlockList,
+    /// PTY query replies (DA/DSR/cursor-position) the VT engine raised during
+    /// parsing; drained after each feed and written back to the master so probing
+    /// programs get their answers (ticket T-1.9).
+    replies: Receiver<Vec<u8>>,
+    /// The unwritten tail of the reply currently being delivered to the master.
+    /// Holds at most one reply at a time so a short (non-blocking) write resumes
+    /// next cycle without truncating the escape sequence (see [`Model::write_replies`]).
+    pending_reply: Vec<u8>,
     /// Monotonic publish counter; stamped into each published snapshot.
     version: u64,
     latest: Arc<Mutex<Arc<Snapshot>>>,
@@ -302,12 +379,95 @@ impl Model {
             self.segmenter.apply(mark, *offset, &mut self.blocks);
         }
         self.terminal.feed(&scan.passthrough);
+        // The feed above may have raised DA/DSR/cursor-position replies into the
+        // terminal's reply channel; write them back to the PTY (ticket T-1.9).
+        self.write_replies();
         self.metrics
             .bytes_drained
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.metrics
             .blocks
             .store(self.blocks.len(), Ordering::Relaxed);
+    }
+
+    /// Drain terminal reply bytes and write them back to the PTY master, so a
+    /// program probing the terminal (DA `\x1b[c`, DSR `\x1b[6n`) gets its answer
+    /// (ticket T-1.9).
+    ///
+    /// **Deadlock-safe, even mid-reply.** A blocking `write_all` here would be a
+    /// real hazard: a child that floods queries while never draining its own input
+    /// (`yes $'\x1b[6n'`) fills the master's input buffer, and a blocking write
+    /// would stall the model's read loop, fill the output pipe, and block the
+    /// child's stdout - a cycle. The master fd is blocking and `poll(POLLOUT)` only
+    /// promises that *one* byte will not block, NOT that a whole multi-byte reply
+    /// fits - so we never call `write_all`. Instead: poll, then a SINGLE `write()`,
+    /// which on a blocking fd with room writes what fits and returns *short* rather
+    /// than blocking (the model thread is the sole writer, so the room poll saw
+    /// cannot vanish before the write). Any unwritten tail is kept in
+    /// `pending_reply` and resumed next cycle - so a reply is never truncated (which
+    /// would corrupt the child's input stream) and the thread never blocks.
+    ///
+    /// Memory stays bounded: `pending_reply` holds at most one reply's tail (we
+    /// refill it from the channel only when empty), and the reply channel is itself
+    /// bounded + drop-on-full, so a child that never drains its input cannot grow
+    /// either without bound.
+    fn write_replies(&mut self) {
+        loop {
+            // Refill the one-reply tail buffer from the bounded channel only when
+            // empty, so at most a single reply is ever pulled out at a time.
+            if self.pending_reply.is_empty() {
+                match self.replies.try_recv() {
+                    Ok(reply) => self.pending_reply = reply,
+                    Err(_) => return, // nothing pending, nothing queued
+                }
+                if self.pending_reply.is_empty() {
+                    continue; // skip an empty reply
+                }
+            }
+            // Only write while the master accepts bytes without blocking.
+            if !self.pty_writable() {
+                return; // keep the tail; resume on the next chunk
+            }
+            match self.writer.write(&self.pending_reply) {
+                Ok(0) => return, // defensive: no progress despite POLLOUT
+                Ok(n) => {
+                    self.pending_reply.drain(..n);
+                    let _ = self.writer.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    log::warn!("pty reply write failed: {e}");
+                    self.pending_reply.clear();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether the PTY master can accept a write right now, probed non-blockingly
+    /// so the read loop never blocks on a reply write (see [`Model::write_replies`]).
+    /// On a backend with no master fd, or on non-Unix, we optimistically return
+    /// `true` (the reply write then uses normal blocking I/O).
+    #[cfg(unix)]
+    fn pty_writable(&self) -> bool {
+        let Some(fd) = self.pty.master_fd() else {
+            return true;
+        };
+        // SAFETY: a plain libc::poll over one pollfd with a zero timeout; `fd` is
+        // the live master fd of `self.pty`. POLLOUT set means a write of at least
+        // one byte will not block.
+        let mut pfd = nix::libc::pollfd {
+            fd,
+            events: nix::libc::POLLOUT,
+            revents: 0,
+        };
+        let n = unsafe { nix::libc::poll(&mut pfd, 1, 0) };
+        n > 0 && (pfd.revents & nix::libc::POLLOUT) != 0
+    }
+
+    #[cfg(not(unix))]
+    fn pty_writable(&self) -> bool {
+        true
     }
 
     /// Render and publish the latest snapshot, stamping the next version.
@@ -642,41 +802,137 @@ mod tests {
     }
 
     #[test]
-    fn control_sequence_flood_keeps_event_channel_bounded() {
-        use crate::terminal::EVENT_CHANNEL_CAP;
-        // AC1's yes/cat flood emits no control sequences, leaving the VT
-        // window-event channel's bound untested. `yes $'\x1b[6n'` floods DSR
-        // (cursor-position) queries; alacritty raises a `PtyWrite` event per
-        // query, synchronously on the model thread. With NO drain (the bare
-        // engine has no app draining terminal_events), the bounded + drop-on-full
-        // event channel must still cap the backlog while the model keeps
-        // publishing. An unbounded channel (the original bug) would grow into the
-        // thousands here.
+    fn dsr_flood_does_not_deadlock_the_reply_path() {
+        // `yes $'\x1b[6n'` floods DSR (cursor-position) queries AND never drains
+        // its own stdin. The model writes each reply back to the master (T-1.9); a
+        // *blocking* write would deadlock here - the child won't read input while
+        // we won't read its output - so the model must keep draining + publishing
+        // under the flood, never wedging. Over a sustained flood the master's input
+        // buffer fills (the child never reads it), so this exercises the full-buffer
+        // + short-write path: each reply write is a single poll-guarded `write()`
+        // that returns short and buffers its tail rather than blocking mid-reply.
+        // This is the regression guard for that deadlock (it would HANG, not just
+        // fail, on a regression). The reply channel is bounded + drop-on-full, so
+        // engine memory stays bounded by construction.
         let engine = Engine::spawn_command("/usr/bin/yes", &["\x1b[6n"], dims(), 1_000)
             .expect("spawn yes with a DSR payload");
         wait_for_version_at_least(&engine, 1, Duration::from_secs(5));
 
         let p1 = engine.metrics().snapshots_published.load(Ordering::Relaxed);
+        let b1 = engine.metrics().bytes_drained.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(400));
         let p2 = engine.metrics().snapshots_published.load(Ordering::Relaxed);
+        let b2 = engine.metrics().bytes_drained.load(Ordering::Relaxed);
         assert!(
             p2 > p1,
-            "model must keep publishing under a control-sequence flood: {p1} -> {p2}"
+            "model must keep publishing under a DSR flood (no deadlock): {p1} -> {p2}"
+        );
+        assert!(
+            b2 > b1,
+            "model must keep draining bytes under a DSR flood (no deadlock): {b1} -> {b2}"
         );
 
-        // Deliberately do NOT drain terminal_events: the bounded channel caps the
-        // backlog on its own. `len()` must be in [1, cap] - positive (the DSR path
-        // really is producing events) and never exceeding the bound.
-        let backlog = engine.terminal_events().len();
+        // Reaching here without hanging is the core guarantee; teardown must also
+        // not hang while the flood + reply writes are in flight.
+        drop(engine);
+    }
+
+    #[test]
+    fn da_query_gets_a_reply_written_back_to_the_pty() {
+        // AC: a program issuing a Primary DA query (`\x1b[c`) over the PTY gets a
+        // reply written back to the master. The child prints the query (the VT
+        // engine parses it and raises a PtyWrite reply, which the model writes to
+        // the master), then echoes its own stdin with `cat -v` (ESC shown as `^[`),
+        // so the reply round-trips into the visible grid. `-icanon` makes `cat`
+        // deliver the newline-less reply immediately; `-echo` keeps the line
+        // discipline from doubling it. The DA report is `CSI ? ... c`, so the grid
+        // must contain the characteristic `[?` once the reply has come back.
+        let engine = Engine::spawn_command(
+            "/bin/sh",
+            &["-c", "stty -echo -icanon; printf '\\033[c'; cat -v"],
+            dims(),
+            1_000,
+        )
+        .expect("spawn sh DA-probe");
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(8);
+        let mut saw_reply = false;
+        while Instant::now() < deadline {
+            if grid_text(&engine.latest_snapshot()).contains("[?") {
+                saw_reply = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
-            backlog > 0,
-            "the DSR flood should have produced VT events into the channel"
-        );
-        assert!(
-            backlog <= EVENT_CHANNEL_CAP,
-            "VT event backlog {backlog} exceeded the bounded cap {EVENT_CHANNEL_CAP}"
+            saw_reply,
+            "the DA reply (CSI ? ... c) should have been written back to the PTY \
+             and echoed into the grid; grid was: {:?}",
+            grid_text(&engine.latest_snapshot())
         );
         drop(engine);
+    }
+
+    #[test]
+    fn foreground_pgid_reports_a_running_child() {
+        // AC: foreground_pgid() returns the pgid of a running foreground child.
+        // `cat` runs forever as the terminal's foreground (session-leader) group.
+        let engine = Engine::spawn_command("/bin/cat", &[], dims(), 1_000).expect("spawn cat");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut pgid = None;
+        while Instant::now() < deadline {
+            if let Some(p) = engine.foreground_pgid() {
+                if p > 0 {
+                    pgid = Some(p);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pgid.is_some(),
+            "foreground_pgid() should report a running child's process group"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn signal_foreground_interrupts_a_running_sleep() {
+        // AC: signal_foreground(SIGINT) interrupts a running `sleep` (it exits).
+        // Spawn `sleep 10`; without the signal the reader would not hit EOF for
+        // ~10s. After SIGINT to the foreground group the child dies, the reader
+        // hits EOF, and the model publishes its final frame and shuts down - so the
+        // engine tears down promptly (well under 10s). We assert the teardown join
+        // completes inside a bound, on a worker thread so a regression fails the
+        // test instead of hanging it.
+        let engine =
+            Engine::spawn_command("/bin/sleep", &["10"], dims(), 1_000).expect("spawn sleep");
+        // Wait for `sleep` to become the foreground group.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && engine.foreground_pgid().is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            engine.foreground_pgid().is_some(),
+            "sleep should be the foreground group before signalling"
+        );
+
+        engine
+            .signal_foreground(Signal::Interrupt)
+            .expect("signal_foreground(SIGINT) should succeed");
+
+        let (done_tx, done_rx) = bounded::<()>(1);
+        std::thread::spawn(move || {
+            // Drop joins the reader+model threads, which only finish once the child
+            // is gone (EOF). A successful SIGINT makes that prompt.
+            drop(engine);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "SIGINT to the foreground group should kill `sleep 10` so teardown is prompt"
+        );
     }
 
     #[test]

@@ -37,8 +37,45 @@ pub enum PtyError {
     Reader(String),
     #[error("failed to resize pty: {0}")]
     Resize(String),
+    #[error("foreground signal failed: {0}")]
+    Signal(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// A signal aterm can deliver to the terminal's foreground process group - the
+/// Ctrl-C / agent-cancel path (ticket T-1.9). Platform-neutral at the API surface;
+/// it maps to the corresponding OS signal on Unix and is unsupported elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// `SIGINT` - interrupt (Ctrl-C).
+    Interrupt,
+    /// `SIGQUIT` - quit (Ctrl-\).
+    Quit,
+    /// `SIGTERM` - polite terminate.
+    Terminate,
+    /// `SIGKILL` - force kill (uncatchable).
+    Kill,
+    /// `SIGTSTP` - stop (Ctrl-Z).
+    Stop,
+    /// `SIGCONT` - continue a stopped group.
+    Continue,
+}
+
+#[cfg(unix)]
+impl Signal {
+    /// Map to the `nix` signal. Kept private so `nix` does not leak into the API.
+    fn to_nix(self) -> nix::sys::signal::Signal {
+        use nix::sys::signal::Signal as S;
+        match self {
+            Signal::Interrupt => S::SIGINT,
+            Signal::Quit => S::SIGQUIT,
+            Signal::Terminate => S::SIGTERM,
+            Signal::Kill => S::SIGKILL,
+            Signal::Stop => S::SIGTSTP,
+            Signal::Continue => S::SIGCONT,
+        }
+    }
 }
 
 /// A chunk of bytes read from the PTY, or an end-of-stream signal.
@@ -236,6 +273,41 @@ impl Pty {
     }
 }
 
+/// The terminal's foreground process group id, read from the pty `fd` via
+/// `tcgetpgrp(3)` (ticket T-1.9). `None` if there is no foreground group or the
+/// call fails (e.g. the fd is no longer a terminal). Both the master and slave
+/// fds of a pty report the same controlling-terminal foreground group, so the
+/// retained master fd is a valid argument.
+#[cfg(unix)]
+pub(crate) fn foreground_pgid(fd: std::os::fd::BorrowedFd<'_>) -> Option<i32> {
+    nix::unistd::tcgetpgrp(fd).ok().map(|pid| pid.as_raw())
+}
+
+/// Send `sig` to the terminal's foreground process group (`killpg` on the result
+/// of `tcgetpgrp`) so Ctrl-C / agent-cancel hits the right process, not the
+/// session leader (ticket T-1.9). Returns [`PtyError::Signal`] if the foreground
+/// group cannot be resolved or the signal cannot be delivered.
+#[cfg(unix)]
+pub(crate) fn signal_foreground(
+    fd: std::os::fd::BorrowedFd<'_>,
+    sig: Signal,
+) -> Result<(), PtyError> {
+    let pgid =
+        nix::unistd::tcgetpgrp(fd).map_err(|e| PtyError::Signal(format!("tcgetpgrp: {e}")))?;
+    // SAFETY-CRITICAL guard: `killpg` with a pgrp <= 1 is platform-specific and
+    // dangerous - `killpg(0, ..)` signals the CALLER's own process group (us!) and
+    // 1 is init. A genuine terminal foreground group always has a pgid > 1, so a
+    // value <= 1 means "no real foreground group"; refuse rather than signal.
+    if pgid.as_raw() <= 1 {
+        return Err(PtyError::Signal(format!(
+            "refusing to signal non-foreground pgid {}",
+            pgid.as_raw()
+        )));
+    }
+    nix::sys::signal::killpg(pgid, sig.to_nix())
+        .map_err(|e| PtyError::Signal(format!("killpg({}): {e}", pgid.as_raw())))
+}
+
 impl Drop for Pty {
     /// Best-effort terminate-and-reap so the facade leaks nothing: a spawned shell
     /// is a session leader (`setsid` + `TIOCSCTTY`), so it does NOT die when this
@@ -392,6 +464,59 @@ mod tests {
             "a live master fd is a valid (non-negative) descriptor"
         );
         pty.kill().expect("kill cat");
+    }
+
+    #[test]
+    fn foreground_pgid_and_signal_interrupt_sleep() {
+        use std::os::fd::BorrowedFd;
+        // `sleep 10` becomes the pty's foreground (session-leader) process group.
+        let mut pty = Pty::spawn(
+            "/bin/sleep",
+            &["10"],
+            small(),
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("spawn sleep");
+        let fd = pty.master_fd().expect("master fd for T-1.9");
+
+        // foreground_pgid() resolves the running child's group.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut pgid = None;
+        while Instant::now() < deadline {
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            match foreground_pgid(borrowed) {
+                Some(p) if p > 0 => {
+                    pgid = Some(p);
+                    break;
+                }
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            pgid.is_some(),
+            "foreground_pgid should resolve the running `sleep` group"
+        );
+
+        // SIGINT to the foreground group must interrupt `sleep` so it exits well
+        // before its 10s elapse - observed directly via try_wait reaping.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        signal_foreground(borrowed, Signal::Interrupt).expect("signal_foreground(SIGINT)");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            match pty.try_wait().expect("try_wait") {
+                Some(_status) => {
+                    exited = true;
+                    break;
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            exited,
+            "SIGINT to the foreground group should make `sleep 10` exit early"
+        );
     }
 
     #[test]

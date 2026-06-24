@@ -44,6 +44,10 @@ thiserror = "2"
 anyhow = "1"
 # --- channels ---
 crossbeam-channel = "0.5"
+# --- unix syscalls (aterm-core, unix-only): foreground-pgroup signalling (T-1.9).
+# Pinned to 0.28 to unify with what is already in the tree (via portable-pty).
+# `term`+`signal` cover tcgetpgrp + killpg + Signal; `signal` pulls `process`.
+nix = { version = "0.28", default-features = false, features = ["term", "signal"] }
 # --- ui: window + gpu ---
 # winit 0.30 + wgpu 29 + glyphon 0.11 are a mutually-aligned trio (glyphon 0.11
 # pins wgpu 29; wgpu 29 targets winit 0.30). This is the #1 alignment to keep.

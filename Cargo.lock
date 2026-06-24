@@ -233,6 +233,7 @@ dependencies = [
  "alacritty_terminal",
  "crossbeam-channel",
  "log",
+ "nix",
  "portable-pty",
  "thiserror 2.0.18",
 ]

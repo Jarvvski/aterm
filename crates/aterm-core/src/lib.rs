@@ -19,7 +19,7 @@ pub use block::{Block, BlockList, BlockSegmenter, OutputSpan};
 pub use engine::{Engine, EngineMetrics, ToModel};
 pub use input::{InputEvent, InputMode, InputModel, InputOutcome};
 pub use osc::{Mark, OscScanner, PromptKind, ScanResult};
-pub use pty::{Pty, PtyDimensions, PtyError, PtyEvent};
+pub use pty::{Pty, PtyDimensions, PtyError, PtyEvent, Signal};
 pub use terminal::{
     CellColor, CursorPos, Damage, LineDamage, Snapshot, SnapshotCell, Terminal, TerminalEvent,
     DEFAULT_SCROLLBACK,

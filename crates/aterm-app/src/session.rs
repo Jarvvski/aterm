@@ -48,17 +48,15 @@ impl Session {
     }
 
     /// Drain the VT engine's window events so its channel does not grow. Most are
-    /// surfaced for later wiring (title -> window title, PtyWrite -> the reply
-    /// path in T-1.9); for now we log and otherwise discard them.
+    /// surfaced for later wiring (title -> window title); for now we log and
+    /// otherwise discard them. (DA/DSR/CPR replies are no longer here - the engine
+    /// writes them straight back to the PTY on the model thread; ticket T-1.9.)
     fn drain_terminal_events(&mut self) {
         use aterm_core::TerminalEvent;
         while let Ok(event) = self.engine.terminal_events().try_recv() {
             match event {
                 TerminalEvent::Title(title) => log::debug!("title: {title}"),
                 TerminalEvent::Bell => log::debug!("bell"),
-                TerminalEvent::PtyWrite(_reply) => {
-                    // TODO(T-1.9): write DA/DSR/CPR replies back to the PTY master.
-                }
                 other => log::trace!("terminal event: {other:?}"),
             }
         }

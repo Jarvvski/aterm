@@ -35,14 +35,22 @@ use crossbeam_channel::{Receiver, Sender};
 /// dossier; surfaced as a config knob via [`Terminal::with_scrollback`].
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
 
-/// Bound on the VT window-event channel (title/bell/clipboard/`PtyWrite`/...). The
-/// channel is drained by the app at frame rate, but the VT engine *produces* into
-/// it synchronously on the model thread while parsing, so an adversarial child (a
-/// tight `\x1b[6n` DSR or bell loop) could otherwise enqueue events without bound.
-/// A bounded channel plus drop-on-full (see [`ChannelListener::send_event`]) keeps
+/// Bound on the VT window-event channel (title/bell/clipboard/...). The channel is
+/// drained by the app at frame rate, but the VT engine *produces* into it
+/// synchronously on the model thread while parsing, so an adversarial child (a
+/// tight bell or title loop) could otherwise enqueue events without bound. A
+/// bounded channel plus drop-on-full (see [`ChannelListener::send_event`]) keeps
 /// engine memory bounded by construction (ticket T-1.3). Generous enough that a
 /// legitimate burst (a TUI redraw's handful of title/cursor events) never drops.
 pub(crate) const EVENT_CHANNEL_CAP: usize = 1_024;
+
+/// Bound on the separate PTY *reply* channel (DA/DSR/cursor-position answers the
+/// VT engine raises as `PtyWrite`; ticket T-1.9). Kept off the app-facing event
+/// channel because replies are written straight back to the PTY by the model
+/// thread, never surfaced to the UI. Same bounded + drop-on-full discipline: a
+/// `\x1b[6n` DSR flood from a child that never drains its own input cannot grow
+/// this without bound, and the model's poll-guarded write never blocks on it.
+pub(crate) const REPLY_CHANNEL_CAP: usize = 1_024;
 
 /// Color of a cell as resolved by the VT engine, in a renderer-neutral form.
 ///
@@ -182,8 +190,9 @@ pub struct LineDamage {
 ///
 /// Only the variants aterm acts on are surfaced; reply-formatter events
 /// (`ColorRequest`, `TextAreaSizeRequest`) and pure redraw hints (`Wakeup`,
-/// `MouseCursorDirty`) are dropped here. `PtyWrite` carries DA/DSR/cursor-query
-/// replies that ticket T-1.9 wires back to the PTY master.
+/// `MouseCursorDirty`) are dropped here. `PtyWrite` (DA/DSR/cursor-query replies)
+/// does NOT appear: it is engine-internal and travels a separate reply channel the
+/// model thread writes straight back to the PTY (ticket T-1.9), never to the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvent {
     /// OSC 0/2 window title set.
@@ -196,9 +205,6 @@ pub enum TerminalEvent {
     ClipboardStore(String),
     /// A clipboard-load (paste) request; the reply path is ticket T-1.9.
     ClipboardLoad,
-    /// Text the engine wants written back to the PTY (DA/DSR/CPR replies). Wired
-    /// to the master writer in ticket T-1.9.
-    PtyWrite(String),
     /// Cursor blink state changed.
     CursorBlinkingChange,
     /// The engine requested shutdown.
@@ -213,38 +219,51 @@ fn map_event(event: Event) -> Option<TerminalEvent> {
         Event::Bell => TerminalEvent::Bell,
         Event::ClipboardStore(_, s) => TerminalEvent::ClipboardStore(s),
         Event::ClipboardLoad(_, _) => TerminalEvent::ClipboardLoad,
-        Event::PtyWrite(s) => TerminalEvent::PtyWrite(s),
         Event::CursorBlinkingChange => TerminalEvent::CursorBlinkingChange,
         Event::Exit => TerminalEvent::Exit,
-        // MouseCursorDirty, ColorRequest, TextAreaSizeRequest, Wakeup, ChildExit:
-        // either pure redraw hints or reply-formatters not used by aterm's loop.
+        // PtyWrite is intercepted before this in `send_event` (it goes to the reply
+        // channel, not the app). MouseCursorDirty, ColorRequest, TextAreaSizeRequest,
+        // Wakeup, ChildExit: pure redraw hints or reply-formatters aterm's loop
+        // does not consume.
         _ => return None,
     })
 }
 
-/// The `EventListener` alacritty calls synchronously during parsing; it forwards
-/// mapped events over a *bounded* channel. Cheap to clone (just clones the
-/// `Sender`).
+/// The `EventListener` alacritty calls synchronously during parsing. It splits the
+/// stream: terminal *replies* (`PtyWrite` - DA/DSR/cursor-position answers) go to a
+/// dedicated reply channel the model thread writes back to the PTY; every other
+/// surfaced window event goes to the app-facing event channel. Cheap to clone
+/// (just clones the two `Sender`s).
 #[derive(Clone)]
 struct ChannelListener {
     tx: Sender<TerminalEvent>,
+    reply_tx: Sender<Vec<u8>>,
 }
 
 impl EventListener for ChannelListener {
     fn send_event(&self, event: Event) {
-        if let Some(ev) = map_event(event) {
-            // `try_send`, never blocking. This runs synchronously inside the VT
-            // parser on the model thread, which is also the only guaranteed
-            // drainer - so a *blocking* send on a full channel could deadlock the
-            // model thread against itself. Under an adversarial control-sequence
-            // flood (a tight DSR/bell/title loop) we therefore DROP rather than
-            // grow the queue without bound, keeping engine memory bounded by
-            // construction (ticket T-1.3). The forwarded events are latest-wins or
-            // coalescable (Title/Bell/CursorBlink), and `PtyWrite` query replies
-            // degrade gracefully for a child querying faster than we can answer
-            // (the reply path is ticket T-1.9). `Err` (Full or Disconnected) is
-            // the intended drop.
-            let _ = self.tx.try_send(ev);
+        // Both sends are `try_send`, NEVER blocking. This runs synchronously inside
+        // the VT parser on the model thread, which is also the only guaranteed
+        // drainer - so a *blocking* send on a full channel could deadlock the model
+        // thread against itself. Under an adversarial control-sequence flood (a
+        // tight DSR/bell/title loop) we DROP rather than grow either queue without
+        // bound, keeping engine memory bounded by construction (ticket T-1.3).
+        match event {
+            // Terminal reply (e.g. answer to a DA `\x1b[c` or DSR `\x1b[6n` query):
+            // route to the reply channel; the model thread drains it and writes the
+            // bytes back to the PTY master (ticket T-1.9). Dropping on a full reply
+            // channel degrades gracefully for a child querying faster than it drains
+            // its own input - it never blocks the parser.
+            Event::PtyWrite(s) => {
+                let _ = self.reply_tx.try_send(s.into_bytes());
+            }
+            // Everything else: latest-wins / coalescable app events (Title/Bell/
+            // CursorBlink/...). `Err` (Full or Disconnected) is the intended drop.
+            other => {
+                if let Some(ev) = map_event(other) {
+                    let _ = self.tx.try_send(ev);
+                }
+            }
         }
     }
 }
@@ -278,6 +297,9 @@ pub struct Terminal {
     cols: usize,
     scrollback: usize,
     events_rx: Receiver<TerminalEvent>,
+    /// PTY reply bytes (DA/DSR/cursor-position answers) the engine must write back
+    /// to the master. Drained by the model thread, not the app (ticket T-1.9).
+    replies_rx: Receiver<Vec<u8>>,
 }
 
 impl Terminal {
@@ -291,12 +313,13 @@ impl Terminal {
         // alacritty's grid underflows on a 0 dimension; a terminal is at least 1x1.
         let (rows, cols) = (rows.max(1), cols.max(1));
         let (tx, events_rx) = crossbeam_channel::bounded(EVENT_CHANNEL_CAP);
+        let (reply_tx, replies_rx) = crossbeam_channel::bounded(REPLY_CHANNEL_CAP);
         let dims = GridDims { rows, cols };
         let config = Config {
             scrolling_history: scrollback,
             ..Config::default()
         };
-        let term = Term::new(config, &dims, ChannelListener { tx });
+        let term = Term::new(config, &dims, ChannelListener { tx, reply_tx });
         Self {
             term,
             parser: Processor::new(),
@@ -304,6 +327,7 @@ impl Terminal {
             cols,
             scrollback,
             events_rx,
+            replies_rx,
         }
     }
 
@@ -340,9 +364,16 @@ impl Terminal {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Borrow the channel of window events (title/bell/clipboard/PtyWrite/...).
+    /// Borrow the channel of window events (title/bell/clipboard/...).
     pub fn events(&self) -> &Receiver<TerminalEvent> {
         &self.events_rx
+    }
+
+    /// Borrow the channel of PTY reply bytes (DA/DSR/cursor-position answers). The
+    /// model thread drains this and writes the bytes back to the master so programs
+    /// probing the terminal get their replies (ticket T-1.9).
+    pub fn replies(&self) -> &Receiver<Vec<u8>> {
+        &self.replies_rx
     }
 
     /// Read and clear the accumulated line damage since the last call. The

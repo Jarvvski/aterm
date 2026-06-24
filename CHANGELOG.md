@@ -11,6 +11,19 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ## Unreleased
 
+### Added
+
+- **Terminal query replies.** Programs that probe the terminal - Primary Device
+  Attributes (`\x1b[c`), cursor-position / status (`\x1b[6n`) - now receive their
+  answers: the VT engine writes the reply straight back to the PTY on the model
+  thread instead of dropping it, so terminal-capability detection works (ticket
+  T-1.9). The write is `poll(POLLOUT)`-guarded, so a program that floods queries
+  while never reading its own input cannot deadlock the engine.
+- **Foreground-process-group signalling (Unix).** `Engine::signal_foreground` and
+  `Engine::foreground_pgid` let Ctrl-C / agent-cancel target the *running command's*
+  process group (resolved via the terminal's foreground pgid), not the hidden shell.
+  Guarded against signalling pgid <= 1 (which would hit our own group or init).
+
 ### Changed
 
 - **Frame pacing (render loop).** The window now presents on a keep-warm schedule

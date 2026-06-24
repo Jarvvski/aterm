@@ -19,3 +19,10 @@ alacritty_terminal.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 log.workspace = true
+
+# Unix-only: foreground-process-group lookup (tcgetpgrp) + signalling (killpg) for
+# Ctrl-C / agent-cancel (T-1.9). Target-gated so the crate still builds on non-Unix
+# (where the signal API compiles as an unsupported stub). nix re-exports `libc`,
+# which the model thread uses for the non-blocking poll(POLLOUT) reply-write guard.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
