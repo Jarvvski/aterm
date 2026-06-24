@@ -16,7 +16,7 @@ use std::sync::Arc;
 use aterm_core::{BlockList, Engine, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK};
 use aterm_ui::{NamedKey, UiCallbacks, Window};
 
-use aterm_core::{InputEvent, InputModel, InputOutcome};
+use aterm_core::{InputEvent, InputMode, InputModel, Motion};
 
 /// One terminal session.
 pub struct Session {
@@ -61,19 +61,6 @@ impl Session {
             }
         }
     }
-
-    /// Route an input outcome to the engine.
-    fn route_outcome(&mut self, outcome: InputOutcome) {
-        match outcome {
-            InputOutcome::ToPty(bytes) => self.engine.send_input(bytes),
-            InputOutcome::Submitted { line, mode } => {
-                // Agent-mode submit: hand off to the agent loop. EPIC-5.
-                log::info!("agent submit ({mode:?}): {line}");
-                // TODO(ticket EPIC-5): dispatch to AgentTurn on the agent thread.
-            }
-            InputOutcome::None => {}
-        }
-    }
 }
 
 impl UiCallbacks for Session {
@@ -113,32 +100,89 @@ impl UiCallbacks for Session {
     }
 
     fn on_key(&mut self, text: Option<&str>, named: Option<NamedKey>) -> Option<Vec<u8>> {
-        // Map the winit key into an InputEvent, reduce, and route to the engine.
-        let event = match named {
-            Some(NamedKey::Enter) => Some(InputEvent::Submit),
-            Some(NamedKey::Backspace) => Some(InputEvent::Backspace),
-            Some(NamedKey::ArrowLeft) => Some(InputEvent::CursorLeft),
-            Some(NamedKey::ArrowRight) => Some(InputEvent::CursorRight),
-            Some(NamedKey::Home) => Some(InputEvent::Home),
-            Some(NamedKey::End) => Some(InputEvent::End),
-            Some(NamedKey::Space) => Some(InputEvent::Insert(" ".to_string())),
-            // The mode-toggle hotkey: Tab for the scaffold (real build uses a
-            // dedicated chord). Mutates ONLY the mode.
-            Some(NamedKey::Tab) => Some(InputEvent::ToggleMode),
-            _ => text
-                .filter(|t| !t.is_empty())
-                .map(|t| InputEvent::Insert(t.to_string())),
-        }?;
-
-        let outcome = self.input.reduce(event);
-        // Capture the bytes (if any) before routing, so a headless host could
-        // observe them; then route to the engine.
-        let echoed = match &outcome {
-            InputOutcome::ToPty(b) => Some(b.clone()),
-            _ => None,
+        // T-3.3 STOPGAP routing. The pure `InputModel` reducer (ticket T-3.1) owns
+        // the in-progress line - editing, selection, mode. The real routing brain
+        // (disposition gates, IME preedit, the toggle hotkey) is T-3.3 and the input
+        // widget that renders the buffer is T-3.6; until they land, Shell-mode
+        // keystrokes are ALSO mirrored raw to the PTY so the shell's own line editor
+        // echoes them and the app stays interactive. The model is kept live in
+        // parallel (so the mode toggle and reducer are exercised) but is not yet the
+        // source of truth for what reaches the PTY. The bytes sent here are
+        // byte-for-byte what the previous scaffold sent.
+        let shell = self.input.mode() == InputMode::Shell;
+        let bytes = match named {
+            // The caller decides submission: read the line, then reset the model
+            // (the T-3.1 caller-owns-submit contract). Shell mode runs the
+            // shell-echoed line with a CR; Agent mode hands off to EPIC-5.
+            Some(NamedKey::Enter) => {
+                let line = self.input.take();
+                if shell {
+                    Some(b"\r".to_vec())
+                } else {
+                    log::info!("agent submit: {line}");
+                    // TODO(ticket EPIC-5): dispatch to AgentTurn on the agent thread.
+                    None
+                }
+            }
+            // Scaffold mode-toggle hotkey (the real chord is a T-3.3 product call);
+            // mutates ONLY the mode, never the text.
+            Some(NamedKey::Tab) => {
+                self.input.reduce(InputEvent::ToggleMode);
+                None
+            }
+            Some(NamedKey::Backspace) => {
+                // DEL only when a char is actually erased - mirrors the prior
+                // scaffold's `cursor > 0` guard so an empty/at-start prompt sends
+                // nothing (the buffer is tiny; reading it pre-reduce is free).
+                let erases = self.input.caret() > 0 || !self.input.selection().is_empty();
+                self.input.reduce(InputEvent::Backspace);
+                (shell && erases).then(|| vec![0x7f])
+            }
+            Some(NamedKey::Delete) => {
+                self.input.reduce(InputEvent::Delete);
+                None
+            }
+            Some(NamedKey::ArrowLeft) => {
+                self.input.reduce(InputEvent::Move(Motion::Left, false));
+                None
+            }
+            Some(NamedKey::ArrowRight) => {
+                self.input.reduce(InputEvent::Move(Motion::Right, false));
+                None
+            }
+            Some(NamedKey::ArrowUp) => {
+                self.input.reduce(InputEvent::Move(Motion::Up, false));
+                None
+            }
+            Some(NamedKey::ArrowDown) => {
+                self.input.reduce(InputEvent::Move(Motion::Down, false));
+                None
+            }
+            Some(NamedKey::Home) => {
+                self.input.reduce(InputEvent::Move(Motion::Home, false));
+                None
+            }
+            Some(NamedKey::End) => {
+                self.input.reduce(InputEvent::Move(Motion::End, false));
+                None
+            }
+            Some(NamedKey::Space) => {
+                self.input.reduce(InputEvent::Insert(" ".to_string()));
+                shell.then(|| b" ".to_vec())
+            }
+            _ => {
+                let t = text.filter(|t| !t.is_empty())?;
+                self.input.reduce(InputEvent::Insert(t.to_string()));
+                shell.then(|| t.as_bytes().to_vec())
+            }
         };
-        self.route_outcome(outcome);
-        echoed
+
+        // Mirror to the PTY (Shell mode only) and also surface the bytes so a
+        // headless host can observe them.
+        if let Some(b) = &bytes {
+            self.engine.send_input(b.clone());
+        }
+        bytes
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) {

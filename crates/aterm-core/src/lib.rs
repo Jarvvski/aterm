@@ -21,7 +21,9 @@ pub use block::{
     COLLAPSED_OUTPUT_ROWS,
 };
 pub use engine::{Engine, EngineMetrics, ToModel};
-pub use input::{InputEvent, InputMode, InputModel, InputOutcome};
+pub use input::{
+    GhostText, Highlight, InputEvent, InputMode, InputModel, Motion, Preedit, Selection,
+};
 pub use integration::{Integration, IntegrationMonitor, IntegrationReason, IntegrationStatus};
 pub use osc::{Mark, OscScanner, PromptKind, ScanResult};
 pub use pty::{Pty, PtyDimensions, PtyError, PtyEvent, Signal};
