@@ -3,8 +3,8 @@
 //! Opens a `winit` 0.30 window, brings up a `wgpu` device/surface, and runs the
 //! event loop, clearing every frame to the active `aterm-tokens` theme's canvas
 //! color. The [`Renderer`] trait is the swappable seam; [`gpu::GpuRenderer`] is
-//! the wgpu implementation, which includes a `glyphon` text fast-path (stretch)
-//! for drawing the terminal grid snapshot.
+//! the wgpu implementation, which draws the terminal grid snapshot through the
+//! instanced glyph-atlas pipeline ([`grid_render::GridRenderer`], swash-rasterized).
 //!
 //! Depends on `aterm-core` (the grid snapshot) and `aterm-tokens` (colors/fonts).
 
@@ -12,6 +12,7 @@ pub mod app;
 pub mod fonts;
 pub mod glyph;
 pub mod gpu;
+pub mod grid_render;
 pub mod indicator;
 pub mod present;
 pub mod renderer;
@@ -23,6 +24,7 @@ pub mod window;
 pub use app::{run, run_with, AtermApp, HeadlessCallbacks, RenderConfig, UiCallbacks};
 pub use glyph::{CellMetrics, GlyphRasterizer, RasterGlyph};
 pub use gpu::GpuRenderer;
+pub use grid_render::{FrameSize, GridRenderer};
 pub use indicator::IntegrationIndicator;
 pub use present::{DisplayLink, FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
 pub use renderer::{Frame, RenderError, Renderer};

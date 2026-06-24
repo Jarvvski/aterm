@@ -372,6 +372,16 @@ impl GlyphCache {
         self.map.contains_key(key)
     }
 
+    /// The cached atlas rect for `key`, or `None` if not yet rasterized. Lets the
+    /// GPU layer reuse a hit WITHOUT the `(glyph_w, glyph_h)` that
+    /// [`Self::get_or_insert`] requires - the renderer rasterizes (which produces
+    /// those dimensions) only on a miss, so on a hit it has neither but still needs
+    /// the rect.
+    #[must_use]
+    pub fn get(&self, key: &GlyphKey) -> Option<AtlasRect> {
+        self.map.get(key).copied()
+    }
+
     /// Total distinct glyphs rasterized so far (the ticket's no-re-raster counter).
     #[must_use]
     pub fn rasterizations(&self) -> u64 {
@@ -663,6 +673,20 @@ mod tests {
             .get_or_insert(bold, |_| raster_calls += 1, 8, 16)
             .unwrap();
         assert_eq!(cache.rasterizations(), 2);
+    }
+
+    #[test]
+    fn glyph_cache_get_returns_hit_without_dimensions() {
+        let mut cache = GlyphCache::new(64, 64);
+        let key = GlyphKey {
+            glyph_id: 7,
+            face: FaceStyle::Regular,
+            px: 13,
+        };
+        assert_eq!(cache.get(&key), None, "miss before insert");
+        let rect = cache.get_or_insert(key, |_| {}, 5, 9).unwrap();
+        // `get` returns the same rect a fresh `get_or_insert` would, with no (w, h).
+        assert_eq!(cache.get(&key), Some(rect));
     }
 
     #[test]

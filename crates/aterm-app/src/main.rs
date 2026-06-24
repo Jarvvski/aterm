@@ -1,7 +1,7 @@
 //! aterm — native macOS GPU terminal binary.
 //!
-//! Wires `aterm-core` (PTY/VT/blocks), `aterm-ui` (winit window + wgpu/glyphon
-//! renderer), and `aterm-agent` (input mode + safety spine). `main` loads config,
+//! Wires `aterm-core` (PTY/VT/blocks), `aterm-ui` (winit window + wgpu instanced
+//! grid renderer), and `aterm-agent` (input mode + safety spine). `main` loads config,
 //! spawns the login-shell PTY, and runs the UI event loop with a [`Session`] as
 //! the callback set so PTY bytes flow to the renderer and keystrokes flow to the
 //! shell.

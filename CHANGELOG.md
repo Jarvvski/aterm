@@ -13,6 +13,18 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **GPU instanced grid renderer (the typing-lag cure).** The terminal grid now draws
+  through a custom wgpu instanced atlas pipeline instead of the interim glyphon
+  whole-buffer reshape. Each unique glyph is rasterized once (swash) into a shared
+  8-bit alpha atlas; the whole visible grid then renders as one background pass plus a
+  single instanced glyph draw call, with per-cell foreground/background color,
+  bold/italic faces, underline, inverse, and wide (two-column) cells. This removes the
+  per-keystroke full-grid reshape that made typing feel sluggish (seconds per keystroke
+  with Nerd Font icon glyphs on screen). The instance build is gated on a cheap
+  `(snapshot version, viewport, theme)` signature, so an unchanged frame reuses the
+  GPU buffers with zero work and zero allocation - the steady-state present allocates
+  nothing. Grayscale AA only (no LCD subpixel). Verified by offscreen
+  render-to-texture pixel tests on Metal (ticket T-1.8, completing the T-1.6 GPU half).
 - **Virtualized block-timeline layout.** The block list is now published to the
   renderer and laid out as a single vertically-scrolling timeline, virtualized over the
   SumTree height index so a 10k-block history costs O(visible rows) per frame, not

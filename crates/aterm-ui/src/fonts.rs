@@ -3,9 +3,9 @@
 //! always present regardless of what the user has installed.
 //!
 //! Family names are sourced from `aterm-tokens::font` so the token layer remains
-//! the single source of truth for which family each role uses.
-
-use glyphon::FontSystem;
+//! the single source of truth for which family each role uses. The grid renderer
+//! ([`crate::grid_render`]) rasterizes these via swash directly; the raw bytes are
+//! the interface (no `FontSystem` indirection).
 
 /// The grid (monospace) faces, embedded at compile time. These are the
 /// load-bearing terminal faces ([`aterm_tokens::font::GRID`]).
@@ -26,12 +26,12 @@ pub const UI_REGULAR: &[u8] =
     include_bytes!("../../../assets/fonts/iMWritingQuatNerdFont-Regular.ttf");
 pub const UI_BOLD: &[u8] = include_bytes!("../../../assets/fonts/iMWritingQuatNerdFont-Bold.ttf");
 
-/// Build a `FontSystem` preloaded with the bundled faces (plus system fonts as a
-/// fallback for glyphs the bundled faces lack).
-pub fn font_system_with_bundled() -> FontSystem {
-    let mut fs = FontSystem::new();
-    let db = fs.db_mut();
-    for face in [
+/// All bundled faces (grid + prose + UI), for callers that want to iterate them
+/// (e.g. a future `FontSystem`-backed proportional path for agent prose - T-3.6 /
+/// T-4.6). The grid renderer uses the typed `GRID_*` constants directly.
+#[must_use]
+pub fn all_bundled() -> [&'static [u8]; 8] {
+    [
         GRID_REGULAR,
         GRID_BOLD,
         GRID_ITALIC,
@@ -40,10 +40,7 @@ pub fn font_system_with_bundled() -> FontSystem {
         PROSE_BOLD,
         UI_REGULAR,
         UI_BOLD,
-    ] {
-        db.load_font_data(face.to_vec());
-    }
-    fs
+    ]
 }
 
 #[cfg(test)]

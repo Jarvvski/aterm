@@ -16,7 +16,6 @@ aterm-core.workspace = true
 aterm-tokens.workspace = true
 winit.workspace = true
 wgpu.workspace = true
-glyphon.workspace = true
 swash.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true

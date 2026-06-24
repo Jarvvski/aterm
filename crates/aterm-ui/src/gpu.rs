@@ -1,44 +1,31 @@
 //! The wgpu implementation of the [`Renderer`] seam.
 //!
-//! `GpuRenderer` owns the wgpu device/queue/surface and a glyphon text layer. It
-//! clears every frame to the active theme's canvas color (the hard requirement)
-//! and draws the terminal grid snapshot through glyphon when one is supplied.
+//! `GpuRenderer` owns the wgpu device/queue/surface and the instanced terminal-grid
+//! pipeline ([`crate::grid_render::GridRenderer`]). It clears every frame to the
+//! active theme's canvas color (the hard requirement) and draws the terminal grid
+//! snapshot through the atlas + instanced pipeline when one is supplied - the
+//! per-cell glyph fast-path that replaced the interim glyphon whole-buffer reshape
+//! (ticket T-1.8, the GPU half of T-1.6; the typing-lag cure).
 
 use std::sync::Arc;
 
-use glyphon::{
-    Attrs, Buffer, Cache, Color as GColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
-};
 use winit::window::Window;
 
-use aterm_tokens::{font as tfont, Rgba};
+use aterm_tokens::Rgba;
 
-use crate::fonts::font_system_with_bundled;
+use crate::grid_render::GridRenderer;
 use crate::renderer::{Frame, RenderError, Renderer};
 
-/// wgpu-backed renderer with a glyphon text fast-path.
+/// wgpu-backed renderer with the instanced grid fast-path.
 pub struct GpuRenderer {
     // Surface must be declared before `window` so it drops first.
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    // Text pipeline.
-    font_system: FontSystem,
-    swash_cache: SwashCache,
-    atlas: TextAtlas,
-    viewport: Viewport,
-    text_renderer: TextRenderer,
-    // Persistent grid-text state, reused across frames so a steady-state present
-    // does not allocate (ticket T-1.5 AC5). The buffer + scratch String are built
-    // once and only re-shaped when the snapshot version or the surface size
-    // changes; an unchanged warm frame reuses them with zero allocation.
-    text_buffer: Buffer,
-    text_scratch: String,
-    /// `(version, width, height)` currently shaped into `text_buffer`, or `None`
-    /// when nothing is shaped (cleared / no snapshot).
-    text_state: Option<(u64, u32, u32)>,
+    /// The instanced terminal-grid pipeline: glyph atlas + bg/glyph instanced draws,
+    /// with version-gated rebuild (ticket T-1.8).
+    grid: GridRenderer,
     /// Virtualized-timeline scroll position (ticket T-2.7). Auto-follows the bottom
     /// (the live-terminal default) until scroll input lands (EPIC-3).
     scroll: crate::timeline::Scroll,
@@ -87,7 +74,8 @@ impl GpuRenderer {
         .map_err(|e| RenderError::Backend(format!("request_device: {e}")))?;
 
         let caps = surface.get_capabilities(&adapter);
-        // Prefer an sRGB format so our linear clear color is presented correctly.
+        // Prefer an sRGB format so our linear clear + linear instance colors are
+        // presented correctly (the shader output is encoded to sRGB on store).
         let format = caps
             .formats
             .iter()
@@ -107,34 +95,14 @@ impl GpuRenderer {
         };
         surface.configure(&device, &config);
 
-        // glyphon text pipeline.
-        let cache = Cache::new(&device);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let viewport = Viewport::new(&device, &cache);
-        let text_renderer =
-            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let mut font_system = font_system_with_bundled();
-        let swash_cache = SwashCache::new();
-
-        // The persistent grid-text buffer (reused every frame; see AC5). Metrics
-        // are the fixed GRID type style; its size is set on first render / resize.
-        let grid = aterm_tokens::type_scale::GRID;
-        let metrics = Metrics::new(grid.size_pt, grid.size_pt * grid.line_height);
-        let text_buffer = Buffer::new(&mut font_system, metrics);
+        let grid = GridRenderer::new(&device, format);
 
         Ok(Self {
             surface,
             device,
             queue,
             config,
-            font_system,
-            swash_cache,
-            atlas,
-            viewport,
-            text_renderer,
-            text_buffer,
-            text_scratch: String::new(),
-            text_state: None,
+            grid,
             scroll: crate::timeline::Scroll::default(),
             last_visible_blocks: 0,
             _window: window,
@@ -158,34 +126,32 @@ impl GpuRenderer {
         self.last_visible_blocks
     }
 
-    /// Render the snapshot text (and always clear). Split out so `render` reads
+    /// Glyph-layer draw calls from the last frame (ticket T-1.6 AC c: exactly 1 when
+    /// the grid has text). Exposed for tests / instrumentation.
+    #[must_use]
+    pub fn last_glyph_draw_calls(&self) -> u32 {
+        self.grid.last_glyph_draw_calls()
+    }
+
+    /// Render the snapshot grid (and always clear). Split out so `render` reads
     /// cleanly.
     fn render_inner(&mut self, frame: Frame<'_>) -> Result<(), RenderError> {
         let clear = linear_to_wgpu(frame.theme.colors.bg_canvas);
-        let fg = frame.theme.colors.fg_primary;
 
         // Resolve the shell-integration indicator (ticket T-2.6) so the state reaches
         // the renderer and the presentation seam is exercised every frame. Drawing it
-        // (a glyph + tooltip in the gutter/status strip) is EPIC-4 visual polish;
-        // this ticket wires the state through.
+        // (a glyph + tooltip in the gutter/status strip) is EPIC-4 visual polish.
         let _indicator =
             crate::indicator::IntegrationIndicator::resolve(frame.integration, frame.theme);
 
-        // Virtualized-timeline bookkeeping (ticket T-2.7). When a block list is
-        // published, count the blocks intersecting the viewport - the AC1
-        // virtualization counter - via the SumTree (O(log n), no allocation). The
-        // on-screen view stays the grid for now: drawing the timeline cards needs the
-        // finished-block OUTPUT-row capture that T-2.4/T-2.5 deferred (see the ticket
-        // notes), and the card styling is T-4.6. This wires + exercises the publish
-        // seam end to end and proves the virtualization against the live list.
+        // Virtualized-timeline bookkeeping (ticket T-2.7): count the blocks
+        // intersecting the viewport via the SumTree (O(log n), no allocation). The
+        // on-screen view stays the raw grid for now; drawing the timeline cards is
+        // T-4.6 (it consumes this geometry + the captured block output).
         let alt_screen = frame.snapshot.is_some_and(|s| s.alt_screen);
         let viewport_rows = self.viewport_rows();
         self.last_visible_blocks = match frame.blocks {
             Some(blocks) => {
-                // Auto-follow the latest output (pin to the bottom) until scroll input
-                // (EPIC-3) drives `self.scroll`. Skip while a full-screen app owns the
-                // screen so the timeline scroll is PRESERVED across the alt-screen
-                // round-trip (ticket T-2.7 AC3): exiting vim resumes where we were.
                 if !alt_screen {
                     self.scroll
                         .to_bottom(blocks.total_height_rows(), viewport_rows);
@@ -193,6 +159,24 @@ impl GpuRenderer {
                 crate::timeline::visible_block_count(blocks, alt_screen, self.scroll, viewport_rows)
             }
             None => 0,
+        };
+
+        // Build the grid instances BEFORE acquiring the surface texture - rebuilds
+        // only when the snapshot version / size / theme changed (the damage gate),
+        // and reuses the buffers with zero work + zero allocation otherwise.
+        let has_text = match frame.snapshot {
+            Some(snap) => self.grid.prepare(
+                &self.device,
+                &self.queue,
+                snap,
+                frame.theme,
+                crate::grid_render::FrameSize {
+                    width: self.config.width,
+                    height: self.config.height,
+                    scale: self.scale_factor,
+                },
+            ),
+            None => false,
         };
 
         // wgpu 29: `get_current_texture` returns a `CurrentSurfaceTexture` enum.
@@ -214,47 +198,6 @@ impl GpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Update the PERSISTENT text buffer from the snapshot (if any), reshaping
-        // only when the content or size changed; an unchanged warm frame reuses it
-        // with no allocation (ticket T-1.5 AC5).
-        let has_text = self.update_text_buffer(frame.snapshot);
-
-        self.viewport.update(
-            &self.queue,
-            Resolution {
-                width: self.config.width,
-                height: self.config.height,
-            },
-        );
-
-        if has_text {
-            let text_areas = [TextArea {
-                buffer: &self.text_buffer,
-                left: 8.0,
-                top: 8.0,
-                scale: self.scale_factor,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: self.config.width as i32,
-                    bottom: self.config.height as i32,
-                },
-                default_color: rgba_to_gcolor(fg),
-                custom_glyphs: &[],
-            }];
-            self.text_renderer
-                .prepare(
-                    &self.device,
-                    &self.queue,
-                    &mut self.font_system,
-                    &mut self.atlas,
-                    &self.viewport,
-                    text_areas,
-                    &mut self.swash_cache,
-                )
-                .map_err(|e| RenderError::Backend(format!("text prepare: {e}")))?;
-        }
-
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -262,7 +205,7 @@ impl GpuRenderer {
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-clear+text"),
+                label: Some("aterm-clear+grid"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -279,72 +222,13 @@ impl GpuRenderer {
             });
 
             if has_text {
-                self.text_renderer
-                    .render(&self.atlas, &self.viewport, &mut pass)
-                    .map_err(|e| RenderError::Backend(format!("text render: {e}")))?;
+                self.grid.draw(&mut pass);
             }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_tex.present();
-        self.atlas.trim();
         Ok(())
-    }
-
-    /// Update the persistent grid-text buffer from the snapshot, reshaping ONLY
-    /// when the content (snapshot version) or the surface size changed. Returns
-    /// whether there is text to draw.
-    ///
-    /// Reusing `text_buffer` + `text_scratch` keeps a steady-state present
-    /// allocation-free (ticket T-1.5 AC5): an unchanged warm frame hits the
-    /// `text_state` cache and returns immediately, doing no work. When the content
-    /// *does* change (active output), it reuses the scratch String's heap and the
-    /// buffer's storage; the residual per-change shaping cost is what the per-cell
-    /// glyph/quad fast-path (ticket T-1.6) replaces - this stays the simple
-    /// monospaced-rows stretch path, with no per-cell color/attr yet.
-    fn update_text_buffer(&mut self, snapshot: Option<&aterm_core::Snapshot>) -> bool {
-        let Some(snap) = snapshot else {
-            self.text_state = None;
-            return false;
-        };
-        let key = (snap.version, self.config.width, self.config.height);
-        if self.text_state == Some(key) {
-            return true; // unchanged: reuse the already-shaped buffer (no alloc)
-        }
-
-        self.text_buffer.set_size(
-            &mut self.font_system,
-            Some(self.config.width as f32),
-            Some(self.config.height as f32),
-        );
-        fill_grid_text(&mut self.text_scratch, snap);
-        let attrs = Attrs::new().family(Family::Name(tfont::GRID));
-        self.text_buffer.set_text(
-            &mut self.font_system,
-            &self.text_scratch,
-            &attrs,
-            Shaping::Advanced,
-            None,
-        );
-        self.text_buffer
-            .shape_until_scroll(&mut self.font_system, false);
-        self.text_state = Some(key);
-        true
-    }
-}
-
-/// Fill `scratch` with the snapshot's visible grid as monospaced rows (one `\n`
-/// per row). Clears then refills so the String's heap is reused across frames
-/// (no realloc once warmed at a stable size). Pulled out as a free function so
-/// the reuse behavior is unit-testable without a GPU device (ticket T-1.5 AC5).
-fn fill_grid_text(scratch: &mut String, snap: &aterm_core::Snapshot) {
-    scratch.clear();
-    scratch.reserve(snap.rows * (snap.cols + 1));
-    for row in 0..snap.rows {
-        for cell in snap.row(row) {
-            scratch.push(cell.c);
-        }
-        scratch.push('\n');
     }
 }
 
@@ -378,37 +262,5 @@ fn linear_to_wgpu(c: Rgba) -> wgpu::Color {
         g: g as f64,
         b: b as f64,
         a: a as f64,
-    }
-}
-
-/// Convert to glyphon's packed RGBA color.
-fn rgba_to_gcolor(c: Rgba) -> GColor {
-    GColor::rgba(c.r, c.g, c.b, c.a)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fill_grid_text;
-    use aterm_core::Snapshot;
-
-    #[test]
-    fn fill_grid_text_has_one_newline_per_row_and_reuses_capacity() {
-        // A blank 3x4 grid: 3 rows * (4 cells + 1 newline) = 15 chars, 3 newlines.
-        let snap = Snapshot::empty(3, 4);
-        let mut s = String::new();
-        fill_grid_text(&mut s, &snap);
-        assert_eq!(s.chars().count(), 3 * (4 + 1));
-        assert_eq!(s.matches('\n').count(), 3);
-
-        // Re-filling at the same dims reuses the heap: capacity must not shrink
-        // (it is the same buffer cleared + refilled, so no reallocation) - this is
-        // the steady-state no-alloc property the persistent buffer depends on.
-        let cap = s.capacity();
-        fill_grid_text(&mut s, &snap);
-        assert_eq!(s.chars().count(), 3 * (4 + 1));
-        assert!(
-            s.capacity() >= cap,
-            "reuse must not shrink/realloc the scratch String"
-        );
     }
 }
