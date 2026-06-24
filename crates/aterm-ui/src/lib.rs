@@ -13,6 +13,7 @@ pub mod fonts;
 pub mod gpu;
 pub mod present;
 pub mod renderer;
+pub mod text;
 pub mod widgets;
 pub mod window;
 
@@ -20,6 +21,10 @@ pub use app::{run, run_with, AtermApp, HeadlessCallbacks, RenderConfig, UiCallba
 pub use gpu::GpuRenderer;
 pub use present::{DisplayLink, FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
 pub use renderer::{Frame, RenderError, Renderer};
+pub use text::{
+    build_grid_cells, classify_run, is_ascii_fast, resolve_color, AtlasRect, FaceStyle, GlyphCache,
+    GlyphKey, GridCell, RunLayout, ShelfAllocator,
+};
 
 // Re-export the winit key types the host app needs for input routing.
 pub use winit::keyboard::NamedKey;

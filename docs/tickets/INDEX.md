@@ -67,7 +67,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-1.3 | Three-thread reader/model/render split + bounded backpressure | ready-for-agent | T-1.1, T-1.2 |
 | T-1.4 | Output coalescing + grid snapshot publication | ready-for-agent | T-1.3 |
 | T-1.5 | wgpu device/surface + CADisplayLink present loop + keep-warm | ready-for-human | T-1.3 |
-| T-1.6 | Glyph atlas + monospace grid fast-path (cosmic-text/swash) | ready-for-agent | T-1.5 |
+| T-1.6 | Glyph atlas + monospace grid fast-path (cosmic-text/swash) | ready-for-human | T-1.5 |
 | T-1.7 | Tier-1 iai-callgrind micro-benches (parse/grid/frame-build) | ready-for-human | T-1.4 |
 | T-1.8 | Render-path perf validation (folded-in spike) + damage tracking | ready-for-agent | T-1.5, T-1.6 |
 | T-1.9 | Event::PtyWrite reply channel + foreground pgid tracking | ready-for-agent | T-1.1, T-1.2 |
