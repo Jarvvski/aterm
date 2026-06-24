@@ -138,6 +138,13 @@ impl GpuRenderer {
         let clear = linear_to_wgpu(frame.theme.colors.bg_canvas);
         let fg = frame.theme.colors.fg_primary;
 
+        // Resolve the shell-integration indicator (ticket T-2.6) so the state reaches
+        // the renderer and the presentation seam is exercised every frame. Drawing it
+        // (a glyph + tooltip in the gutter/status strip) is EPIC-4 visual polish;
+        // this ticket wires the state through.
+        let _indicator =
+            crate::indicator::IntegrationIndicator::resolve(frame.integration, frame.theme);
+
         // wgpu 29: `get_current_texture` returns a `CurrentSurfaceTexture` enum.
         let surface_tex = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)

@@ -11,6 +11,7 @@
 pub mod app;
 pub mod fonts;
 pub mod gpu;
+pub mod indicator;
 pub mod present;
 pub mod renderer;
 pub mod text;
@@ -19,6 +20,7 @@ pub mod window;
 
 pub use app::{run, run_with, AtermApp, HeadlessCallbacks, RenderConfig, UiCallbacks};
 pub use gpu::GpuRenderer;
+pub use indicator::IntegrationIndicator;
 pub use present::{DisplayLink, FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
 pub use renderer::{Frame, RenderError, Renderer};
 pub use text::{

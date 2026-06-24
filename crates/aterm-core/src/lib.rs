@@ -9,15 +9,19 @@
 pub mod block;
 pub mod engine;
 pub mod input;
+pub mod integration;
 pub mod osc;
 pub mod pty;
 pub mod shell_integration;
 pub mod terminal;
 
 // Re-export the load-bearing public types at the crate root for ergonomics.
-pub use block::{Block, BlockList, BlockSegmenter, HeightIndex, OutputSpan, RowSnapshot};
+pub use block::{
+    Block, BlockList, BlockSegmenter, HeightIndex, HeuristicSegmenter, OutputSpan, RowSnapshot,
+};
 pub use engine::{Engine, EngineMetrics, ToModel};
 pub use input::{InputEvent, InputMode, InputModel, InputOutcome};
+pub use integration::{Integration, IntegrationMonitor, IntegrationReason, IntegrationStatus};
 pub use osc::{Mark, OscScanner, PromptKind, ScanResult};
 pub use pty::{Pty, PtyDimensions, PtyError, PtyEvent, Signal};
 pub use shell_integration::{IntegrationDir, ShellKind, ShimNonce};

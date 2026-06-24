@@ -13,6 +13,16 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Shell-integration status indicator.** aterm now surfaces a visible three-state
+  integration status - Integrated / Heuristic / None - so it degrades loudly instead
+  of silently (the prototype's worst sin). "Integrated" is shown only after a
+  nonce-matched OSC-133 `A` confirms the shell's hooks are live; a supported shell
+  whose hooks never fire falls back to clearly-labeled *approximate* command blocks
+  (prompt-line heuristic); an unsupported shell honestly reports no integration. Each
+  non-Integrated state carries a one-click "why?" (e.g. "shell-integration hooks did
+  not load"), and the status transitions are observable as they happen. The engine
+  publishes the live state; the renderer is handed it each frame with a glyph + tooltip
+  presentation (the on-screen placement is EPIC-4 polish) (ticket T-2.6).
 - **Command-block lifecycle.** The block segmenter now drives the full lifecycle from
   the shell's OSC-133 marks: a normal command cycle yields one finalized block (its
   command line taken from `cmdline=`), a Ctrl-C'd command auto-closes with an unknown

@@ -73,6 +73,14 @@ pub struct Block {
     /// block VARIANT; the full `Block` enum redesign is the owner-confirm item from
     /// T-2.4, to be designed once alongside Epic-5's agent variants.)
     pub interactive: bool,
+    /// This block was segmented by the heuristic fallback ([`HeuristicSegmenter`]),
+    /// not by trusted OSC-133 marks (ticket T-2.6). Its boundaries are a best-effort
+    /// guess (prompt-line detection), it has no authoritative command text, cwd, or
+    /// exit code, and the renderer labels it as approximate so the user knows blocks
+    /// are not integration-confirmed. Mark-driven blocks set this `false`.
+    ///
+    /// (Like [`Block::interactive`], a flag stand-in until the `Block` enum redesign.)
+    pub approximate: bool,
 }
 
 impl Block {
@@ -502,6 +510,8 @@ impl BlockSegmenter {
                     // BlockList::set_block_output (grid-row capture is a follow-up).
                     output: Vec::new(),
                     interactive: false,
+                    // Mark-driven: authoritative, not an approximation.
+                    approximate: false,
                 });
             }
             Mark::Prompt(PromptKind::CommandDone { exit_code }) => {
@@ -526,6 +536,148 @@ impl BlockSegmenter {
         if let Some(b) = list.last_mut() {
             b.command = command.into();
         }
+    }
+}
+
+/// The labeled-heuristic block detector (ticket T-2.6, ADR-0008,
+/// [`04-shell-integration.md`] recommendation 7). Used ONLY when a supported shell
+/// fails to confirm our nonce-matched OSC-133 marks (see
+/// [`crate::integration::IntegrationMonitor::heuristic_active`]): rather than show a
+/// broken/blank block UI, it approximates command boundaries and labels every block
+/// it makes [`Block::approximate`] so the user knows they are not mark-confirmed.
+///
+/// **Signal: the dossier's structural "newline + cursor-at-col-0" prompt detection,
+/// NOT a prompt-text/sigil match.** A sigil match (a line ending in `$`/`%`/`#`/`>`)
+/// is fragile: it produces zero blocks for the very common `❯`/arrow prompts of
+/// starship/powerlevel10k, and it false-fires on REPL sub-prompts, `PS2` line
+/// continuations, and any output line that happens to end in such a glyph. Instead
+/// this keys off structure the shell cannot avoid:
+///
+/// - **Quiescence + cursor not at column 0 = sitting at a prompt.** When output
+///   settles (the engine's coalescing tick fires with nothing more to drain) and the
+///   cursor rests mid-line (`col > 0`), the shell has typically drawn a prompt and is
+///   waiting for input. A pause that rests at column 0 (the last line ended in a
+///   newline) is an output pause, not a prompt. This holds for any prompt theme.
+/// - **A newline since the last prompt = a command actually ran.** The engine feeds
+///   every clean output byte through [`Self::observe_output`], which counts newlines.
+///   Typing on the prompt line echoes characters but emits NO newline until Enter, so
+///   re-sampling the same prompt while the user types adds no block (fixes the
+///   "phantom block per keystroke" trap); a real command submits at least one newline.
+///   Counting newlines (not comparing cursor rows) is also robust to scrollback.
+/// - **A carriage-return-redrawn line is NOT a prompt.** A running command's in-place
+///   progress bar (`Downloading 45%`, `npm install`, `cargo` spinner) redraws its line
+///   with `\r` and stalls mid-line, which would otherwise look exactly like a settled
+///   prompt. We track whether the current line was reached via a `\r` redraw and
+///   suppress the prompt signal there, so a progress bar does not fragment its command
+///   into spurious blocks.
+///
+/// Each detected command cycle is emitted as one **finished** approximate block
+/// spanning `[previous prompt offset, this prompt offset)` - created retroactively at
+/// the *next* prompt, so there is never a phantom empty/leading block and the
+/// in-flight command is simply not bracketed until it completes. It carries no
+/// command text, cwd, or exit code (those need real hooks).
+///
+/// **Inherent limit (degrade-honestly note).** A pure output-stream heuristic cannot
+/// perfectly tell a settled shell prompt from a command that printed a partial line
+/// (no `\r`, no trailing newline) and is *waiting* - a `Password:` prompt, `read -p`,
+/// or a bespoke inline progress indicator. Such a command may get one extra labeled
+/// approximate block. This is the open product question in [`04-shell-integration.md`]
+/// (the labeled-heuristic fallback vs. an honest "no blocks" mode) and is flagged for
+/// the owner; the blocks are always labeled `approximate`, never mark-confirmed.
+///
+/// The engine must drive it only while heuristic-active and NOT on the alt screen (a
+/// full-screen TUI's cursor would otherwise fabricate boundaries, the same hazard the
+/// mark-driven [`BlockSegmenter`] guards against). When marks later confirm, the
+/// engine stops driving it and the authoritative segmenter takes over.
+#[derive(Debug, Default)]
+pub struct HeuristicSegmenter {
+    /// Have we anchored the first prompt yet? Until then there is no interval to
+    /// close, so a login banner before the first prompt creates no block.
+    seen_prompt: bool,
+    /// Clean-stream offset of the most recently anchored prompt - the open edge of
+    /// the next approximate block's span.
+    last_prompt_offset: usize,
+    /// Newlines fed since the last anchored prompt. Zero means "the user is only
+    /// typing at the prompt" (no command ran), so re-detecting the prompt is a no-op.
+    newlines_since_prompt: usize,
+    /// Whether the cursor's current line was reached by an in-place `\r` redraw (and
+    /// not yet ended by a newline) - i.e. a progress-bar line, NOT a prompt. Set by
+    /// a lone `\r`, cleared by the next `\n`. Suppresses the prompt signal so a
+    /// stalled progress bar does not fabricate blocks.
+    current_line_has_cr: bool,
+}
+
+impl HeuristicSegmenter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the clean (passthrough) output bytes so the detector can track its two
+    /// signals: the newline count ("a command actually ran") and whether the current
+    /// line was `\r`-redrawn (a progress bar, not a prompt). One pass over the chunk;
+    /// the engine calls this for every chunk it feeds to the grid while heuristic and
+    /// off the alt screen.
+    pub fn observe_output(&mut self, clean_bytes: &[u8]) {
+        for &b in clean_bytes {
+            match b {
+                b'\n' => {
+                    self.newlines_since_prompt += 1;
+                    // A newline starts a fresh line - any prior `\r` redraw on the
+                    // old line is irrelevant now (this also resolves `\r\n`, where
+                    // the `\r` is just part of the line ending, to "not redrawn").
+                    self.current_line_has_cr = false;
+                }
+                b'\r' => self.current_line_has_cr = true,
+                _ => {}
+            }
+        }
+    }
+
+    /// Note that the terminal has gone idle, with the cursor at column `cursor_col`
+    /// and the clean stream at byte `offset`. Call at each *idle* publish (the
+    /// coalescing flush), while heuristic-active and off the alt screen.
+    ///
+    /// A column-0 cursor (a fresh line / output pause) or a `\r`-redrawn current line
+    /// (a progress bar) is not a settled prompt and is ignored. Otherwise the shell is
+    /// sitting at a prompt: if a newline has been seen since the last prompt a command
+    /// cycle completed, so emit the finished approximate block for
+    /// `[last_prompt_offset, offset)` and re-anchor here. The first prompt only anchors
+    /// (no preceding command to bracket).
+    pub fn note_prompt_if_idle(&mut self, cursor_col: usize, offset: usize, list: &mut BlockList) {
+        if cursor_col == 0 || self.current_line_has_cr {
+            // A fresh line (output pause) or an in-place `\r` redraw (progress bar) -
+            // not a settled prompt.
+            return;
+        }
+        if !self.seen_prompt {
+            self.seen_prompt = true;
+            self.last_prompt_offset = offset;
+            self.newlines_since_prompt = 0;
+            return;
+        }
+        if self.newlines_since_prompt == 0 {
+            return; // same prompt, the user is only typing - no command ran
+        }
+        // A command cycle ran in [last_prompt_offset, offset). Emit it, labeled
+        // approximate and already finished (the heuristic has no running tail).
+        let now = Instant::now();
+        list.push(Block {
+            command: String::new(),
+            output_span: OutputSpan {
+                start: self.last_prompt_offset,
+                end: Some(offset),
+            },
+            exit_code: None,
+            started_at: now,
+            finished_at: Some(now),
+            cwd: None,
+            output: Vec::new(),
+            interactive: false,
+            approximate: true,
+        });
+        self.last_prompt_offset = offset;
+        self.newlines_since_prompt = 0;
     }
 }
 
@@ -1066,6 +1218,201 @@ mod tests {
         assert!(
             !scan.marks.is_empty(),
             "correctly-nonced marks pass the gate"
+        );
+    }
+
+    // --- T-2.6 heuristic fallback block detector --------------------------------
+
+    #[test]
+    fn heuristic_progress_bar_redraw_does_not_fabricate_blocks() {
+        // Regression (review): a running command's in-place `\r`-redrawn progress bar
+        // stalls mid-line (cursor col > 0, output quiet) and would otherwise look like
+        // a settled prompt - fragmenting the single command into spurious blocks. The
+        // `\r`-redraw guard suppresses every redraw stall; the command yields exactly
+        // one block, at its real next prompt.
+        let mut list = BlockList::new();
+        let mut h = HeuristicSegmenter::new();
+        h.note_prompt_if_idle(2, 0, &mut list); // P0 anchored at the prompt
+
+        h.observe_output(b"wget url\r\n"); // submit: a newline, `\r\n` is not a redraw
+                                           // Each progress update redraws the line in place with a leading `\r`, then the
+                                           // command stalls (network wait) - an idle publish samples the cursor mid-line.
+        for chunk in [
+            b"\rDownloading   0%".as_slice(),
+            b"\rDownloading  50%".as_slice(),
+            b"\rDownloading 100%".as_slice(),
+        ] {
+            h.observe_output(chunk);
+            h.note_prompt_if_idle(16, 40, &mut list); // stalled mid-redraw -> suppressed
+        }
+        assert_eq!(
+            list.len(),
+            0,
+            "a `\\r`-redrawn progress bar must not fabricate blocks mid-command"
+        );
+
+        // The command finishes and the real prompt redraws on a fresh line.
+        h.observe_output(b"\ndone\nP> ");
+        h.note_prompt_if_idle(2, 60, &mut list);
+        assert_eq!(
+            list.len(),
+            1,
+            "exactly one block for the whole wget command"
+        );
+        assert_eq!(list.get(0).unwrap().output_span.start, 0);
+    }
+
+    #[test]
+    fn heuristic_segments_one_finished_block_per_command_cycle() {
+        // The structural signal: idle-at-prompt (cursor col > 0) bracketed by a
+        // command that emitted at least one newline. Each cycle becomes one finished,
+        // labeled-approximate block spanning [prev prompt, this prompt).
+        let mut list = BlockList::new();
+        let mut h = HeuristicSegmenter::new();
+
+        h.note_prompt_if_idle(2, 0, &mut list); // P0: anchor only, no block
+        assert_eq!(list.len(), 0, "the first prompt alone creates no block");
+
+        h.observe_output(b"ls -la\r\nfile1\nfile2\n"); // echo + output -> 3 newlines
+        h.note_prompt_if_idle(2, 30, &mut list); // P1: a command ran -> emit [0,30)
+        assert_eq!(list.len(), 1);
+        let b0 = list.get(0).unwrap();
+        assert!(
+            !b0.is_running(),
+            "heuristic blocks are emitted already finished"
+        );
+        assert_eq!(
+            b0.output_span,
+            OutputSpan {
+                start: 0,
+                end: Some(30)
+            }
+        );
+
+        h.observe_output(b"pwd\r\n/home/me\n"); // 2 newlines
+        h.note_prompt_if_idle(2, 50, &mut list); // P2 -> emit [30,50)
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            list.get(1).unwrap().output_span,
+            OutputSpan {
+                start: 30,
+                end: Some(50)
+            }
+        );
+    }
+
+    #[test]
+    fn heuristic_does_not_fabricate_a_block_while_only_typing() {
+        // The phantom-block-per-keystroke trap: typing on the prompt line echoes
+        // characters but emits NO newline, so re-detecting the same prompt while the
+        // cursor advances must create nothing. Only a submitted command (a newline)
+        // makes a block.
+        let mut list = BlockList::new();
+        let mut h = HeuristicSegmenter::new();
+        h.note_prompt_if_idle(2, 0, &mut list); // P0 anchored
+
+        h.observe_output(b"git st"); // typing echo, no newline
+        h.note_prompt_if_idle(8, 6, &mut list); // re-idle at the same prompt
+        h.observe_output(b"atus"); // more typing
+        h.note_prompt_if_idle(12, 10, &mut list);
+        assert_eq!(list.len(), 0, "typing must not fabricate a block");
+
+        h.observe_output(b"\r\non branch main\n"); // Enter + output
+        h.note_prompt_if_idle(2, 30, &mut list); // next prompt -> one block
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn heuristic_treats_col0_idle_as_an_output_pause_not_a_prompt() {
+        // A mid-output pause rests at column 0 (the last line ended in a newline);
+        // that is NOT a settled prompt and must not split the command's output.
+        let mut list = BlockList::new();
+        let mut h = HeuristicSegmenter::new();
+        h.note_prompt_if_idle(2, 0, &mut list); // P0
+        h.observe_output(b"line1\nline2\n");
+        h.note_prompt_if_idle(0, 12, &mut list); // idle at col 0 -> output pause, ignored
+        assert_eq!(list.len(), 0, "an output pause is not a command boundary");
+        h.observe_output(b"line3\n");
+        h.note_prompt_if_idle(2, 18, &mut list); // the real next prompt
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list.get(0).unwrap().output_span,
+            OutputSpan {
+                start: 0,
+                end: Some(18)
+            },
+            "the whole output run is one block, not split at the pause"
+        );
+    }
+
+    #[test]
+    fn heuristic_works_for_non_sigil_modern_prompts() {
+        // AC2 for the common case: starship/powerlevel10k prompts end in `❯`/arrows,
+        // never `$`/`%`/`#`/`>`. The structural detector keys off cursor-not-at-col-0,
+        // not a sigil, so these segment normally (the old sigil match produced zero
+        // blocks here - a silent AC2 failure).
+        let mut list = BlockList::new();
+        let mut h = HeuristicSegmenter::new();
+        h.note_prompt_if_idle(2, 0, &mut list); // "❯ " - cursor at col 2
+        h.observe_output(b"echo hi\r\nhi\n");
+        h.note_prompt_if_idle(2, 20, &mut list);
+        assert_eq!(list.len(), 1, "a non-sigil prompt still produces a block");
+    }
+
+    #[test]
+    fn heuristic_blocks_are_labeled_approximate_and_lack_authoritative_fields() {
+        // AC2: heuristic blocks must be clearly labeled approximate, and (having no
+        // real hooks) carry no exit code / command text / cwd.
+        let mut list = BlockList::new();
+        let mut h = HeuristicSegmenter::new();
+        h.note_prompt_if_idle(2, 0, &mut list);
+        h.observe_output(b"true\r\n");
+        h.note_prompt_if_idle(2, 10, &mut list);
+
+        let b = list.get(0).unwrap();
+        assert!(b.approximate, "heuristic blocks are labeled approximate");
+        assert_eq!(b.exit_code, None, "no authoritative exit code");
+        assert!(b.command.is_empty(), "no authoritative command text");
+        assert!(b.cwd.is_none(), "no authoritative cwd");
+        assert!(!b.interactive);
+    }
+
+    #[test]
+    fn heuristic_ignores_output_before_the_first_prompt() {
+        // A login banner / motd printed before the first prompt must NOT fabricate a
+        // leading block; segmentation begins only once the first prompt is anchored.
+        let mut list = BlockList::new();
+        let mut h = HeuristicSegmenter::new();
+        h.observe_output(b"Welcome to the machine\nLast login: today\n");
+        h.note_prompt_if_idle(2, 40, &mut list); // first prompt: anchors, no block
+        assert_eq!(list.len(), 0, "pre-prompt banner output creates no block");
+
+        h.observe_output(b"hi\r\nhi\n");
+        h.note_prompt_if_idle(2, 60, &mut list);
+        assert_eq!(list.len(), 1, "the first real command cycle then segments");
+        assert_eq!(
+            list.get(0).unwrap().output_span.start,
+            40,
+            "the block starts at the first prompt, not in the banner"
+        );
+    }
+
+    #[test]
+    fn heuristic_idle_resampling_at_the_same_prompt_is_a_no_op() {
+        // The engine notes idle on every coalescing flush; repeated idle samples at
+        // the same prompt (no intervening command/newline) must not duplicate blocks.
+        let mut list = BlockList::new();
+        let mut h = HeuristicSegmenter::new();
+        h.note_prompt_if_idle(2, 0, &mut list);
+        h.observe_output(b"ls\r\nout\n");
+        for off in [30, 31, 32] {
+            h.note_prompt_if_idle(2, off, &mut list); // resampled idle at the new prompt
+        }
+        assert_eq!(list.len(), 1, "one block despite repeated idle samples");
+        assert_eq!(
+            list.get(0).unwrap().output_span.end,
+            Some(30),
+            "emitted at the first idle sample of the new prompt"
         );
     }
 }

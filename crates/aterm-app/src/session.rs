@@ -97,6 +97,13 @@ impl UiCallbacks for Session {
         Some(self.engine.latest_snapshot())
     }
 
+    fn integration_status(&mut self) -> aterm_core::Integration {
+        // The live three-state shell-integration indicator (ticket T-2.6): a cheap
+        // atomic load the engine's model thread keeps current. The renderer maps it
+        // to a glyph + "why?" tooltip.
+        self.engine.integration_status()
+    }
+
     fn on_key(&mut self, text: Option<&str>, named: Option<NamedKey>) -> Option<Vec<u8>> {
         // Map the winit key into an InputEvent, reduce, and route to the engine.
         let event = match named {

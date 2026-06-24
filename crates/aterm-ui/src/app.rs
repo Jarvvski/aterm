@@ -73,6 +73,13 @@ pub trait UiCallbacks {
         0
     }
 
+    /// The shell-integration indicator state to show this frame (ticket T-2.6).
+    /// Defaults to "no integration" for a host with no engine (e.g.
+    /// [`HeadlessCallbacks`]); a real session returns its engine's live status.
+    fn integration_status(&mut self) -> aterm_core::Integration {
+        aterm_core::Integration::from(aterm_core::IntegrationReason::UnsupportedShell)
+    }
+
     /// A key was pressed; return bytes to forward to the PTY (Shell mode), if any.
     fn on_key(&mut self, _text: Option<&str>, _named: Option<NamedKey>) -> Option<Vec<u8>> {
         None
@@ -139,10 +146,12 @@ impl<C: UiCallbacks> AtermApp<C> {
     /// snapshot, the grid text. Called only when the scheduler says to present.
     fn redraw(&mut self) {
         let snapshot = self.callbacks.snapshot();
+        let integration = self.callbacks.integration_status();
         if let Some(renderer) = self.renderer.as_mut() {
             let frame = Frame {
                 theme: &self.theme,
                 snapshot: snapshot.as_deref(),
+                integration,
             };
             if let Err(e) = renderer.render(frame) {
                 log::warn!("frame render error: {e}");

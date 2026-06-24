@@ -46,17 +46,19 @@
 
 use std::io;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{after, bounded, never, select, unbounded, Receiver, Sender, TryRecvError};
 
+use crate::integration::{Integration, IntegrationMonitor};
+use crate::osc::{Mark, PromptKind};
 use crate::shell_integration::{should_inject_zsh, IntegrationDir, ShellKind, ShimNonce};
 use crate::{
-    BlockList, BlockSegmenter, OscScanner, Pty, PtyDimensions, PtyError, PtyEvent, Signal,
-    Snapshot, Terminal, TerminalEvent,
+    BlockList, BlockSegmenter, HeuristicSegmenter, OscScanner, Pty, PtyDimensions, PtyError,
+    PtyEvent, Signal, Snapshot, Terminal, TerminalEvent,
 };
 
 /// Reader read-buffer size. 64 KiB matches Zellij's PTY read buffer; the buffer
@@ -79,6 +81,15 @@ const READER_QUEUE_DEPTH: usize = 16;
 /// dossier's 4-8ms starting point, after the GPUI `cat`-flood precedent); T-7.2's
 /// `output_flood` scenario tunes it against real hardware.
 pub(crate) const COALESCE_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How long, after spawn, the model waits for the first nonce-matched OSC-133 `A`
+/// before giving up and concluding a supported shell's hooks are silent (ticket
+/// T-2.6). A working shell prints its first prompt - and thus emits `A` - within
+/// tens of milliseconds, so this is generous: it bounds only how long the indicator
+/// shows the transient "probing" state for a genuinely broken/un-hooked session
+/// before it commits to the labeled heuristic fallback. A tuning knob, not a
+/// protocol constant.
+pub(crate) const INTEGRATION_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 
 /// Lightweight, lock-free counters the model thread updates and the handle (and
 /// tests) read. Cheap observability into the pipeline; not on the render path.
@@ -138,10 +149,15 @@ pub struct Engine {
     _integration: Option<IntegrationDir>,
     /// The detected login [`ShellKind`] (`Other` for an unrecognised shell or a test
     /// command). Feeds the T-2.6 integration indicator (Integrated / Heuristic /
-    /// Unknown) together with [`Engine::integration_active`].
+    /// None) together with [`Engine::integration_active`].
     shell_kind: ShellKind,
     /// Whether a nonce-armed integration shim was actually installed this session.
     integration_active: bool,
+    /// The current [`Integration`] state, published lock-free by the model thread as
+    /// it confirms marks / times out (ticket T-2.6). The handle decodes it for the UI
+    /// indicator via [`Engine::integration_status`]. Seeded at construction so a read
+    /// before the model's first event already reflects the spawn configuration.
+    integration_code: Arc<AtomicU8>,
     reader: Option<JoinHandle<()>>,
     model: Option<JoinHandle<()>>,
 }
@@ -214,9 +230,20 @@ impl Engine {
             dims,
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         )?;
-        let mut engine = Self::spawn_with_pty(pty, dims, scrollback, osc, integration)?;
-        engine.shell_kind = kind;
-        Ok(engine)
+        // The nonce-armed scanner is active iff a shim loaded.
+        let shim_installed = integration.is_some();
+        Self::spawn_with_pty(
+            pty,
+            dims,
+            scrollback,
+            IntegrationSetup {
+                osc,
+                dir: integration,
+                shell_kind: kind,
+                shim_installed,
+                confirm_window: INTEGRATION_CONFIRM_WINDOW,
+            },
+        )
     }
 
     /// Spawn an arbitrary `program` with `args` on a fresh PTY and start the
@@ -229,20 +256,74 @@ impl Engine {
         scrollback: usize,
     ) -> Result<Self, PtyError> {
         let pty = Pty::spawn(program, args, dims, std::iter::empty::<(&str, &str)>())?;
-        Self::spawn_with_pty(pty, dims, scrollback, OscScanner::untrusted(), None)
+        // A raw command host is not a recognised login shell: ShellKind::Other ->
+        // the integration indicator reports "None" (no blocks). No shim, untrusted
+        // scanner.
+        Self::spawn_with_pty(
+            pty,
+            dims,
+            scrollback,
+            IntegrationSetup {
+                osc: OscScanner::untrusted(),
+                dir: None,
+                shell_kind: ShellKind::Other,
+                shim_installed: false,
+                confirm_window: INTEGRATION_CONFIRM_WINDOW,
+            },
+        )
     }
 
-    /// Wire the reader + model threads around an already-spawned [`Pty`]. `osc` is
-    /// the (nonce-armed or untrusted) OSC scanner the model thread uses; `integration`
-    /// is the materialized shim dir, held for the engine's lifetime and removed when
-    /// it drops.
+    /// Test-only: spawn an arbitrary `program` while declaring the integration
+    /// configuration the engine would otherwise derive from a real login-shell spawn
+    /// (ticket T-2.6). Lets a deterministic test drive the Heuristic/None paths and
+    /// the confirm gate without a real shell or the production confirmation window:
+    /// `shell_kind` + `nonce` (`Some` -> a nonce-armed scanner + shim "installed";
+    /// `None` -> an untrusted scanner + no shim) + a short `confirm_window`.
+    #[cfg(test)]
+    pub(crate) fn spawn_command_with_integration(
+        program: &str,
+        args: &[&str],
+        dims: PtyDimensions,
+        scrollback: usize,
+        shell_kind: ShellKind,
+        nonce: Option<&str>,
+        confirm_window: Duration,
+    ) -> Result<Self, PtyError> {
+        let pty = Pty::spawn(program, args, dims, std::iter::empty::<(&str, &str)>())?;
+        let (osc, shim_installed) = match nonce {
+            Some(n) => (OscScanner::with_nonce(n), true),
+            None => (OscScanner::untrusted(), false),
+        };
+        Self::spawn_with_pty(
+            pty,
+            dims,
+            scrollback,
+            IntegrationSetup {
+                osc,
+                dir: None,
+                shell_kind,
+                shim_installed,
+                confirm_window,
+            },
+        )
+    }
+
+    /// Wire the reader + model threads around an already-spawned [`Pty`]. `setup`
+    /// carries the integration wiring (the OSC scanner, the held shim dir, and the
+    /// integration-indicator inputs); see [`IntegrationSetup`].
     fn spawn_with_pty(
         pty: Pty,
         dims: PtyDimensions,
         scrollback: usize,
-        osc: OscScanner,
-        integration: Option<IntegrationDir>,
+        setup: IntegrationSetup,
     ) -> Result<Self, PtyError> {
+        let IntegrationSetup {
+            osc,
+            dir: integration,
+            shell_kind,
+            shim_installed,
+            confirm_window,
+        } = setup;
         // Clone the reader and take the writer *before* the Pty moves into the
         // model thread (both take `&self`).
         let reader = pty.try_clone_reader()?;
@@ -272,6 +353,14 @@ impl Engine {
         // The second half of the publish double-buffer (T-1.4).
         let back = Arc::new(Snapshot::empty(rows, cols));
 
+        // Integration indicator state (T-2.6). The monitor's decision logic is pure;
+        // the model thread drives it (confirm on a nonce-matched A, time out the
+        // confirmation window) and publishes the resulting Integration through this
+        // atomic, which the handle decodes for the UI. `shim_installed` is the
+        // nonce-armed-scanner fact (the callers pass `integration.is_some()`).
+        let monitor = IntegrationMonitor::new(shell_kind, shim_installed);
+        let integration_code = Arc::new(AtomicU8::new(monitor.integration().code()));
+
         let (byte_tx, byte_rx) = bounded::<PtyEvent>(READER_QUEUE_DEPTH);
         let (to_model_tx, to_model_rx) = unbounded::<ToModel>();
 
@@ -286,7 +375,11 @@ impl Engine {
             terminal,
             osc,
             segmenter: BlockSegmenter::new(),
+            heuristic: HeuristicSegmenter::new(),
             blocks: BlockList::new(),
+            integration: monitor,
+            integration_code: Arc::clone(&integration_code),
+            confirm_window,
             replies,
             pending_reply: Vec::new(),
             clean_offset: 0,
@@ -307,10 +400,10 @@ impl Engine {
             metrics,
             #[cfg(unix)]
             fg_fd,
-            integration_active: integration.is_some(),
+            integration_active: shim_installed,
             _integration: integration,
-            // Set by `spawn_login_shell`; a raw `spawn_command` host is `Other`.
-            shell_kind: ShellKind::Other,
+            shell_kind,
+            integration_code,
             reader: Some(reader_handle),
             model: Some(model_handle),
         })
@@ -370,10 +463,20 @@ impl Engine {
 
     /// Whether a nonce-armed integration shim was installed for this session. `false`
     /// for an unsupported shell or when shim install failed (the T-2.6 indicator then
-    /// shows "Unknown" / "Heuristic" rather than "Integrated").
+    /// shows "None" / "Heuristic" rather than "Integrated").
     #[must_use]
     pub fn integration_active(&self) -> bool {
         self.integration_active
+    }
+
+    /// The current shell-integration indicator state (ticket T-2.6): the three-state
+    /// status (Integrated / Heuristic / None) plus the "why?" reason. Read cheaply
+    /// (one relaxed atomic load); the model thread updates it as it confirms the
+    /// shim's nonce-matched marks or times out waiting for them, so a UI polling this
+    /// observes the live transitions (Probing -> Integrated, or Probing -> Heuristic).
+    #[must_use]
+    pub fn integration_status(&self) -> Integration {
+        Integration::from_code(self.integration_code.load(Ordering::Relaxed))
     }
 }
 
@@ -438,6 +541,20 @@ impl Drop for Engine {
     }
 }
 
+/// The integration-wiring inputs [`Engine::spawn_with_pty`] needs, bundled so its
+/// signature stays small (ticket T-2.6 added several). `osc` is the (nonce-armed or
+/// untrusted) OSC scanner; `dir` is the materialized shim dir, held for the engine's
+/// lifetime and removed when it drops; `shell_kind` + `shim_installed` seed the
+/// integration monitor; `confirm_window` bounds how long the model waits for the
+/// first nonce-matched `A` before falling back to the heuristic.
+struct IntegrationSetup {
+    osc: OscScanner,
+    dir: Option<IntegrationDir>,
+    shell_kind: ShellKind,
+    shim_installed: bool,
+    confirm_window: Duration,
+}
+
 /// The model-thread state: owns the `Term`, the block model, the PTY (for resize
 /// + child reaping on drop) and writer, and the publish + metrics handles.
 struct Model {
@@ -446,7 +563,22 @@ struct Model {
     terminal: Terminal,
     osc: OscScanner,
     segmenter: BlockSegmenter,
+    /// The labeled-heuristic fallback segmenter (ticket T-2.6). Sampled each publish
+    /// while [`IntegrationMonitor::heuristic_active`] (a supported shell whose marks
+    /// never confirmed), it approximates command blocks from the idle grid; dormant
+    /// otherwise.
+    heuristic: HeuristicSegmenter,
     blocks: BlockList,
+    /// Integration-indicator decision machine (ticket T-2.6). The model confirms it
+    /// on a nonce-matched `A` and times it out via the confirmation-window timer in
+    /// [`run_model`], publishing the result through `integration_code`.
+    integration: IntegrationMonitor,
+    /// The handle's view of [`Self::integration`], published lock-free on change.
+    integration_code: Arc<AtomicU8>,
+    /// How long [`run_model`] waits for the first nonce-matched `A` before concluding
+    /// the hooks are silent (ticket T-2.6). [`INTEGRATION_CONFIRM_WINDOW`] in
+    /// production; tests inject a short window to exercise the heuristic path fast.
+    confirm_window: Duration,
     /// PTY query replies (DA/DSR/cursor-position) the VT engine raised during
     /// parsing; drained after each feed and written back to the master so probing
     /// programs get their answers (ticket T-1.9).
@@ -507,11 +639,27 @@ impl Model {
             self.segmenter
                 .set_alt_screen(self.terminal.is_alt_screen(), &mut self.blocks);
             self.segmenter.apply(mark, *offset, &mut self.blocks);
+            // A nonce-matched `A` confirms the shim's hooks are live (ticket T-2.6).
+            // Gate on the shim being installed: only the nonce-armed scanner yields
+            // trusted marks, so an untrusted scanner (no shim) must not let a forged
+            // `A` in command output falsely flip the indicator to "Integrated".
+            if self.integration.shim_installed()
+                && matches!(mark, Mark::Prompt(PromptKind::PromptStart))
+            {
+                self.integration.confirm();
+            }
         }
         if fed < passthrough.len() {
             self.terminal.feed(&passthrough[fed..]);
         }
         self.clean_offset += passthrough.len();
+        // Feed the heuristic detector its newline signal (ticket T-2.6) - "a command
+        // actually ran since the last prompt" - but ONLY in the labeled-heuristic
+        // fallback and OFF the alt screen, so a full-screen TUI cannot drive block
+        // boundaries. The common mark-driven path skips this entirely.
+        if self.integration.heuristic_active() && !self.terminal.is_alt_screen() {
+            self.heuristic.observe_output(passthrough);
+        }
         // The feed above may have raised DA/DSR/cursor-position replies into the
         // terminal's reply channel; write them back to the PTY (ticket T-1.9).
         self.write_replies();
@@ -521,6 +669,16 @@ impl Model {
         self.metrics
             .blocks
             .store(self.blocks.len(), Ordering::Relaxed);
+        // Publish any integration-state change (e.g. a just-confirmed `A`) so the UI
+        // indicator sees it without waiting for the next publish tick (T-2.6).
+        self.publish_integration();
+    }
+
+    /// Publish the current [`Integration`] to the handle's lock-free slot (T-2.6).
+    /// Cheap (one relaxed store); called whenever the monitor may have changed.
+    fn publish_integration(&self) {
+        self.integration_code
+            .store(self.integration.integration().code(), Ordering::Relaxed);
     }
 
     /// Drain terminal reply bytes and write them back to the PTY master, so a
@@ -612,7 +770,7 @@ impl Model {
     /// the `Vec` nor the `Arc` is reallocated per publish. The one exception: if a
     /// consumer still holds the spare (`Arc::get_mut` fails), we allocate a fresh
     /// buffer rather than block - correctness over the zero-alloc fast path.
-    fn publish(&mut self) {
+    fn publish(&mut self, idle: bool) {
         self.version += 1;
 
         // Ensure the spare is uniquely owned so we can write into it in place.
@@ -623,6 +781,30 @@ impl Model {
         if let Some(snap) = Arc::get_mut(&mut self.back) {
             self.terminal.snapshot_into(snap);
             snap.version = self.version;
+        }
+
+        // Labeled-heuristic fallback (ticket T-2.6): at an IDLE flush, once a
+        // supported shell's marks have failed to confirm, detect command-cycle
+        // boundaries structurally - the cursor settled mid-line (`col > 0`) after
+        // output has gone quiet is the shell sitting at a prompt (the dossier's
+        // "newline + cursor-at-col-0" signal; the newline count comes from
+        // `observe_output`). Gated on `idle` so a mid-flood publish never mistakes a
+        // streaming pause for a prompt, on `heuristic_active` so the common
+        // mark-driven path pays nothing, and OFF the alt screen so a full-screen TUI's
+        // cursor cannot fabricate blocks (the hazard the mark-driven segmenter guards
+        // against). Reuses the freshly-rendered `back` snapshot.
+        if idle && self.integration.heuristic_active() {
+            let (cursor_col, alt_screen) = {
+                let snap = &*self.back;
+                (snap.cursor.col, snap.alt_screen)
+            };
+            if !alt_screen {
+                self.heuristic
+                    .note_prompt_if_idle(cursor_col, self.clean_offset, &mut self.blocks);
+                self.metrics
+                    .blocks
+                    .store(self.blocks.len(), Ordering::Relaxed);
+            }
         }
 
         // Publish the freshly-written buffer and reclaim the previous one as the
@@ -732,6 +914,18 @@ fn run_model(mut model: Model, byte_rx: &Receiver<PtyEvent>, mailbox: &Receiver<
     let mut deadline: Option<Instant> = None;
     let mut timer: Receiver<Instant> = never();
 
+    // One-shot confirmation-window timer (ticket T-2.6): armed only while we are
+    // probing a supported shell with a live shim. If the first nonce-matched `A`
+    // arrives first we disarm it (integration confirmed); if it fires first the
+    // shell's hooks are silent and we fall back to the labeled heuristic. A session
+    // that cannot reach "Integrated" (unsupported shell, or a shim that failed to
+    // install) never arms it - there is nothing to wait for.
+    let mut integration_timer: Receiver<Instant> = if model.integration.awaiting_confirmation() {
+        after(model.confirm_window)
+    } else {
+        never()
+    };
+
     loop {
         select! {
             recv(mailbox) -> msg => match msg {
@@ -782,7 +976,9 @@ fn run_model(mut model: Model, byte_rx: &Receiver<PtyEvent>, mailbox: &Receiver<
                         }
                     }
                     if exited {
-                        model.publish(); // final coherent frame, then shut down
+                        // Final coherent frame, then shut down. Not an idle prompt
+                        // flush - the shell is gone, so no heuristic sampling.
+                        model.publish(false);
                         break;
                     }
                     // Anti-starvation: service control + detect Engine-drop.
@@ -790,11 +986,17 @@ fn run_model(mut model: Model, byte_rx: &Receiver<PtyEvent>, mailbox: &Receiver<
                     if shutdown {
                         break;
                     }
+                    // A nonce-matched `A` confirmed integration during this drain:
+                    // stop waiting for it (ticket T-2.6).
+                    if model.integration.is_confirmed() {
+                        integration_timer = never();
+                    }
                     // Flush if the window elapsed during this drain (sustained
                     // flood); otherwise keep coalescing and let the timer flush
-                    // once the bytes go idle.
+                    // once the bytes go idle. A sustained-flood flush is NOT idle -
+                    // output is still streaming - so it does not sample the heuristic.
                     if Instant::now() >= dl {
-                        model.publish();
+                        model.publish(false);
                         deadline = None;
                         timer = never();
                     }
@@ -802,11 +1004,31 @@ fn run_model(mut model: Model, byte_rx: &Receiver<PtyEvent>, mailbox: &Receiver<
                 Err(_) => break, // reader gone (PTY closed) -> shut down
             },
             recv(timer) -> _ => {
-                // The window elapsed with no further bytes: publish the merged
-                // state once. (Disarmed to `never()` so it does not refire.)
-                model.publish();
+                // The window elapsed with no further bytes: the burst went idle.
+                // Publish the merged state once (an IDLE flush, so the heuristic
+                // detector samples for a settled prompt). Disarmed so it does not
+                // refire.
+                model.publish(true);
                 deadline = None;
                 timer = never();
+            },
+            recv(integration_timer) -> _ => {
+                // The confirmation window elapsed with no nonce-matched `A`: a
+                // supported shell's hooks are silent. Commit to the labeled heuristic
+                // fallback and publish the transition for the indicator (ticket
+                // T-2.6). Disarmed so it fires once.
+                model.integration.note_window_elapsed();
+                model.publish_integration();
+                // Seed the now-active heuristic detector from the current grid: the
+                // shell is typically sitting idle at its first prompt, which produced
+                // no pending output to trigger a coalesced publish - so without this
+                // idle sample the detector would not anchor that first prompt. `publish`
+                // samples only when the heuristic is active, so this is a no-op when it
+                // confirmed instead.
+                model.publish(true);
+                deadline = None;
+                timer = never();
+                integration_timer = never();
             },
         }
     }
@@ -1234,6 +1456,201 @@ mod tests {
         assert!(
             last > 0,
             "the model should have published at least once during the window"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn unsupported_command_host_reports_integration_none() {
+        // AC3 (T-2.6): a raw command host is `ShellKind::Other` - the integration
+        // indicator reports None, with a populated "why", and no shim is active.
+        // Deterministic: needs no real shell.
+        let engine = Engine::spawn_command("/bin/cat", &[], dims(), 1_000).expect("spawn cat");
+        assert_eq!(engine.shell_kind(), ShellKind::Other);
+        assert!(!engine.integration_active(), "no shim for a raw command");
+        let integ = engine.integration_status();
+        assert_eq!(integ.status, crate::IntegrationStatus::None);
+        assert!(integ.why().is_some(), "AC4: the None state carries a why");
+        drop(engine);
+    }
+
+    #[test]
+    fn login_shell_reaches_integrated_after_first_prompt() {
+        // AC1 + AC5 (T-2.6), end-to-end: a real supported login shell installs the
+        // shim, emits a nonce-matched `A` on its first prompt, and the engine
+        // transitions the indicator from probing to Integrated. Skip when $SHELL is
+        // unsupported or the shim could not arm (so CI hosts stay honest without
+        // flaking) - mirrors the real-shell PTY tests' skip-if pattern.
+        let engine = Engine::spawn_login_shell(dims(), 1_000).expect("spawn login shell");
+        if engine.shell_kind() == ShellKind::Other || !engine.integration_active() {
+            eprintln!(
+                "skip login_shell_reaches_integrated: no nonce-armed shim for $SHELL \
+                 (kind={:?}, active={})",
+                engine.shell_kind(),
+                engine.integration_active()
+            );
+            return;
+        }
+        // The first prompt's `A` arrives within milliseconds; poll for the
+        // Integrated transition well inside the 5s confirmation window.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut status = engine.integration_status().status;
+        while status != crate::IntegrationStatus::Integrated && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            status = engine.integration_status().status;
+        }
+        assert_eq!(
+            status,
+            crate::IntegrationStatus::Integrated,
+            "a supported login shell should confirm integration via its first prompt's \
+             nonce-matched A (never silently)"
+        );
+        drop(engine);
+    }
+
+    /// Poll `integration_status().status` until it equals `want` or `timeout`.
+    fn wait_for_status(
+        engine: &Engine,
+        want: crate::IntegrationStatus,
+        timeout: Duration,
+    ) -> crate::IntegrationStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let s = engine.integration_status().status;
+            if s == want || Instant::now() >= deadline {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn nonce_matched_a_confirms_integrated_at_the_engine() {
+        // AC1, deterministic at the engine layer: a child emitting a correctly-nonced
+        // OSC-133 `A` through the nonce-armed scanner confirms integration -> the
+        // indicator transitions to Integrated. (The skip-if real-shell test above is
+        // the end-to-end counterpart; this pins the wiring without a real shell.)
+        let nonce = "ATERMTESTNONCE0";
+        let script = format!("printf '\\033]133;A;aterm_nonce={nonce}\\007'; sleep 1");
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", &script],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            Some(nonce),
+            Duration::from_millis(300),
+        )
+        .expect("spawn sh emitting a nonced A");
+        let status = wait_for_status(
+            &engine,
+            crate::IntegrationStatus::Integrated,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            status,
+            crate::IntegrationStatus::Integrated,
+            "a nonce-matched A must confirm Integrated"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn forged_a_without_a_shim_never_confirms_integrated() {
+        // AC1 crown-jewel gate (review): in a supported-shell session whose shim did
+        // NOT install (untrusted scanner), a forged un-nonced `133;A` in output must
+        // NOT flip the indicator to Integrated - it stays Heuristic. This is the
+        // `shim_installed()` confirm gate, tested where it actually lives (the engine).
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", "printf '\\033]133;A\\007'; sleep 1"],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            None, // no shim -> untrusted scanner -> confirm gate must reject the A
+            Duration::from_millis(200),
+        )
+        .expect("spawn sh emitting a forged A");
+        // Give the A time to be parsed and the (short) confirmation window to elapse.
+        std::thread::sleep(Duration::from_millis(600));
+        let integ = engine.integration_status();
+        assert_ne!(
+            integ.status,
+            crate::IntegrationStatus::Integrated,
+            "a forged A with no shim must never confirm Integrated"
+        );
+        assert_eq!(
+            integ.status,
+            crate::IntegrationStatus::Heuristic,
+            "a supported shell with no shim stays Heuristic"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn nonce_mismatched_a_never_confirms_integrated() {
+        // A child emitting an `A` stamped with the WRONG nonce (the nonce-armed
+        // scanner drops it) must not confirm - the indicator never reaches Integrated.
+        let script = "printf '\\033]133;A;aterm_nonce=WRONGNONCE\\007'; sleep 1";
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", script],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            Some("REALNONCE0"),
+            Duration::from_millis(200),
+        )
+        .expect("spawn sh emitting a mismatched-nonce A");
+        std::thread::sleep(Duration::from_millis(600));
+        assert_ne!(
+            engine.integration_status().status,
+            crate::IntegrationStatus::Integrated,
+            "a wrong-nonce A is dropped by the scanner and must not confirm"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn heuristic_session_produces_approximate_blocks() {
+        // AC2, end-to-end at the engine: a supported shell with no live hooks
+        // (Heuristic) must still produce labeled approximate blocks. A no-shim
+        // session is heuristic-active immediately; the `/bin/sh` script prints a
+        // prompt (cursor mid-line), runs a "command" (newlines), and redraws the
+        // prompt - one command cycle per redraw - with pauses so each settles into an
+        // idle publish the detector samples.
+        let script = "printf 'P> '; sleep 0.4; printf 'a\\nb\\nP> '; sleep 0.4; \
+                      printf 'c\\nP> '; sleep 0.8";
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", script],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            None, // no shim -> Heuristic (ShimInstallFailed), detector active now
+            Duration::from_millis(100),
+        )
+        .expect("spawn sh simulating a no-hooks shell");
+        assert_eq!(
+            engine.integration_status().status,
+            crate::IntegrationStatus::Heuristic,
+            "a supported shell with no shim is Heuristic"
+        );
+        // The script is a deterministic two-cycle scenario (anchor at `P> `, then the
+        // `a\nb` cycle, then the `c` cycle), so the heuristic must segment EXACTLY two
+        // approximate blocks. Asserting the exact count (not just >= 1) guards against
+        // the over-segmentation a mid-line/progress-pause regression would cause.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while engine.block_count() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Let any (erroneous) extra segmentation settle, then pin the exact count.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            engine.block_count(),
+            2,
+            "the heuristic must segment exactly two command cycles, no more (no \
+             mid-output over-segmentation)"
         );
         drop(engine);
     }

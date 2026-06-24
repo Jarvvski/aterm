@@ -80,7 +80,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-2.3 | bash + fish hooks (version-branched) | ready-for-human | T-2.2 |
 | T-2.4 | BlockList + SumTree height index + immutable snapshots | ready-for-human | T-2.1 |
 | T-2.5 | Block lifecycle state machine + alt-screen suppression | ready-for-human | T-2.1, T-2.4 |
-| T-2.6 | Three-state integration indicator + heuristic fallback | ready-for-agent | T-2.3, T-2.5 |
+| T-2.6 | Three-state integration indicator + heuristic fallback | ready-for-human | T-2.3, T-2.5 |
 | T-2.7 | Block/timeline rendering (virtualized) | ready-for-agent | T-2.4, T-1.6 |
 
 ### EPIC-3 - Unified input box
