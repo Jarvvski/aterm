@@ -57,6 +57,8 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
     pub fn disposition_for_command(&self, command_line: &str) -> ToolDisposition {
         // The gate classifies against the SAME `Secrets` the sanitizer redacts
         // from (`self.secrets`) - one source, so the two defenses cannot drift.
+        // `decide` routes through the multi-line buffer gate, so an embedded `\n`
+        // cannot smuggle a dangerous second command past a head-keyed rule.
         match self.policy.decide(command_line, self.secrets) {
             Approval::AutoApprove => ToolDisposition::AutoRun,
             Approval::RequireConfirm(a) => ToolDisposition::NeedsConfirm(a.reasons),
@@ -151,7 +153,7 @@ mod tests {
         // `rm -rf ~` is shell-active (the `~`) AND a recursive-force removal.
         match turn.disposition_for_command("rm -rf ~") {
             ToolDisposition::NeedsConfirm(reasons) => {
-                assert!(reasons.contains(&crate::risk::RiskReason::RmRecursiveForce));
+                assert!(reasons.contains(&crate::risk::RiskReason::Destructive));
             }
             ToolDisposition::AutoRun => panic!("rm -rf ~ must never auto-run"),
         }
@@ -186,7 +188,7 @@ mod tests {
         match turn.disposition_for_command("cat vault-keys") {
             ToolDisposition::NeedsConfirm(reasons) => {
                 assert!(
-                    reasons.contains(&crate::risk::RiskReason::SecretPathAccess),
+                    reasons.contains(&crate::risk::RiskReason::SecretAccess),
                     "the registered sensitive path must drive a secret-path escalation"
                 );
             }

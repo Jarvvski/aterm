@@ -2,7 +2,7 @@
 id: T-5.5
 epic: EPIC-5-agent-loop-safety
 title: Deterministic risk gate (zsh-aware argv parse)
-status: ready-for-agent
+status: done
 labels: [agent, safety]
 depends_on: []
 ---
@@ -63,3 +63,48 @@ escalating to `Dangerous`/`SecretPathAccess`, and add red-capable tests
 a benign carrier like `echo env` stays Safe). Latent today (no execution path is
 wired - T-5.9 not landed - and T-5.9 depends on this ticket), but it MUST be
 closed before any command-execution sink goes live.
+
+# Resolution
+
+**2026-06-25 (agent): Landed.** Ported the prototype risk gate to Rust to
+port-parity and closed the env-dump fail-open. All ACs met.
+
+- `command.rs` - rewrote `ShellCommand` as the zsh-aware argv parse (ports
+  `ShellCommand.kt`): word-split, head past env-assignment prefixes
+  (`^[A-Za-z0-9_]+\+?=`), per-word `command_base` (strips control bytes, quotes,
+  leading `\`, then `substringAfterLast('/')`), and the detector flags
+  (`has_shell_metachar`, `has_redirect`, `has_leading_tilde`,
+  `has_history_expansion`, `is_fork_bomb`, cwd-resolved `path_haystack`).
+- `risk.rs` - `DefaultRiskClassifier::classify` runs the full rule pipeline
+  (remote baseline -> shell-active grammar -> per-word deny-set scan ->
+  code-execution -> ENV_DUMP -> package-mutator -> chmod 777 -> aterm-write ->
+  credential-path via lowercased `path_haystack` substring match against
+  `secrets.sensitive_paths()`). `classify_buffer` splits on `\n`, skips blanks,
+  takes MAX level + UNION of reasons. `Risk` is `Ord`; `RiskReason` carries
+  `is_dangerous()` and `pub(crate) is_shell_active()`; `RemoteContext` +
+  `gloss_for` (RiskGloss port, exhaustive) round it out. Const sets
+  (`DESTRUCTIVE`/`NETWORK`/`PRIVILEGE`/`SECRET_TOOLS`/`ENV_DUMP`/
+  `CODE_INTERPRETERS`/`EXEC_TOOLS`/`PACKAGE_MANAGERS`/...) ported verbatim.
+- **Env-dump fail-open CLOSED:** `env`/`printenv` removed from any safe listing;
+  `head in ENV_DUMP -> SecretAccess -> Dangerous`. `env`, `printenv`,
+  `printenv AWS_SECRET_ACCESS_KEY` all classify Dangerous + RequireConfirm; the
+  benign carrier `echo env` stays Safe. Red-capable tests added.
+- `policy.rs` - `ApprovalPolicy` with the AUTO-SAFE default (`new()`) and the
+  `ask_always()` tier. The ONLY path to `AutoApprove` is
+  `auto_run && level == Safe && !is_shell_active()`; the shell-active reason guard
+  is defense-in-depth (refuses on the reason, not just the level). `decide` routes
+  through the multi-line buffer gate so an embedded `\n` cannot smuggle a
+  dangerous second command past a head-keyed rule.
+- **Single Secrets source preserved (T-5.6 invariant):** the gate borrows
+  `&Secrets` threaded through `classify(...)` rather than holding a private copy -
+  an improvement over the prototype's constructor-held secrets; `turn.rs`'s
+  `disposition_for_command` proves gate + sanitizer read the SAME instance.
+- Tests: 91 `aterm-agent` tests (up from 54), all green;
+  `mise run fmt && lint && build && test` clean at `RUSTFLAGS="-D warnings"`. A
+  4-lens adversarial review (rule-parity / parse-semantics / fail-open-hunt /
+  AC-buffer-remote, with skeptic verification) returned 0 confirmed findings.
+
+**Deliberate deviations (in scope, recorded):** the session-scoped
+"auto-run-in-session" tier and the autonomy-toggle UI are deferred to T-5.11
+(only `ask-always` + `auto-safe` are implemented here); `curl | sh` classifies
+Caution (matches the prototype - no dedicated reason, still RequireConfirm).

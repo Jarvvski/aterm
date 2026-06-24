@@ -20,13 +20,13 @@ pub mod secrets;
 pub mod turn;
 
 // Root re-exports for the load-bearing public surface.
-pub use command::{ShellCommand, ShellStructure};
+pub use command::ShellCommand;
 pub use policy::{Approval, ApprovalPolicy};
 pub use provider::{
     AgentEvent, AnthropicProvider, Effort, LlmProvider, Message, OpenAiProvider, ProviderDelta,
     ProviderError, Role, StopReason, ToolCall, ToolSpec, TurnRequest,
 };
-pub use risk::{DefaultRiskClassifier, Risk, RiskAssessment, RiskReason};
+pub use risk::{gloss_for, DefaultRiskClassifier, RemoteContext, Risk, RiskAssessment, RiskReason};
 pub use sandbox::{
     ConfinedCommand, NoSandbox, Sandbox, SandboxError, SandboxPolicy, SeatbeltSandbox,
 };
