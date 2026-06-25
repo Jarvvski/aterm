@@ -2,7 +2,7 @@
 id: T-4.1
 epic: EPIC-4-design-system
 title: aterm-tokens - semantic tokens + spacing/type scale
-status: ready-for-agent
+status: done
 labels: [tokens, design]
 depends_on: []
 ---
@@ -35,3 +35,37 @@ Populate `aterm-tokens` with the typed semantic color tokens (light "paper" + da
 
 - ANSI-16 palettes + runtime theme switching plumbing (T-4.2).
 - Component specs (T-4.6).
+
+# Resolution
+
+**2026-06-25 (agent): Done.** Audited the existing 420-line `aterm-tokens`
+scaffold against the four ACs; three were already met, AC2 was the real gap.
+
+- **AC1 (every semantic token, both themes, typed API) - already met.**
+  Cross-checked every value in the `LIGHT`/`DARK` consts against
+  `docs/design/tokens.toml`: all 17 semantic colors + 16 ANSI colors per theme,
+  the type scale, spacing, motion, caret, and font names match the toml verbatim.
+  `SemanticColors` exposes the full `[color.*]` set; `Theme::for_kind` is the
+  typed accessor.
+- **AC3 (leaf, no internal deps) - preserved.** `Cargo.toml` has zero
+  dependencies; the new WCAG code adds NO dependency (computed by hand, reusing
+  the crate's existing sRGB linearization).
+- **AC4 (theme switch returns the correct value set) - met** (existing
+  `theme_for_kind_resolves` + new `theme_switch_returns_distinct_value_sets`).
+- **AC2 (real WCAG contrast test) - implemented (the gap).** Added
+  `Rgba::relative_luminance` and `contrast_ratio` (WCAG 2.1: linearize sRGB,
+  weight `0.2126/0.7152/0.0722`, `(L_hi+0.05)/(L_lo+0.05)`, order-free) plus
+  tests. `contrast_ratio_endpoints_are_correct` pins the math to its fixed points
+  (black/white = 21:1, x/x = 1:1); `wcag_contrast_key_pairs_meet_thresholds`
+  asserts, for BOTH themes, the AC-mandated thresholds with real computed margin:
+  fg.primary/bg.canvas approx 13.7:1 (light) / 13.5:1 (dark) >= 7:1 (AAA);
+  fg.secondary approx 6.5/8.5:1 >= 4.5:1 (AA); accent.primary approx 3.12:1 (light,
+  the tightest pair) / 6.5:1 (dark) >= 3:1 (AA large/UI). The accent blue stays
+  flagged OWNER-CONFIRM (derived, not sampled) at its single point of change.
+
+8 `aterm-tokens` tests green; `mise run fmt && lint && build && test` clean at
+`-D warnings`. A 3-lens adversarial review (WCAG-math correctness / value
+port-parity vs `tokens.toml` / AC-completeness, each skeptic-verified) returned 0
+findings. No version bump / CHANGELOG entry: leaf tokens crate, no user-visible
+runtime change yet. The ANSI palette data already present in the crate is left in
+place (consumed by T-4.2, which owns the palette + runtime-switching plumbing).

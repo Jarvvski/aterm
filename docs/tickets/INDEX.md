@@ -97,7 +97,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 ### EPIC-4 - Design system pass
 | id | title | status | depends_on |
 |---|---|---|---|
-| T-4.1 | aterm-tokens: semantic tokens + spacing/type scale | ready-for-agent | - |
+| T-4.1 | aterm-tokens: semantic tokens + spacing/type scale | done | - |
 | T-4.2 | aterm-tokens: two ANSI-16 palettes + theme switching | ready-for-agent | T-4.1 |
 | T-4.3 | Bundle Duo/Quattro + three-register font wiring | ready-for-agent | T-1.6 |
 | T-4.4 | Nerd Font per-codepoint constraint table | ready-for-agent | T-1.6 |

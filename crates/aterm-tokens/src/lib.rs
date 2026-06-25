@@ -74,6 +74,37 @@ impl Rgba {
             self.a as f32 / 255.0,
         ]
     }
+
+    /// WCAG 2.1 relative luminance (0.0 black .. 1.0 white): linearize each sRGB
+    /// channel, then weight `0.2126 R + 0.7152 G + 0.0722 B`. Alpha is ignored -
+    /// contrast is defined over opaque colors and every token here is opaque.
+    ///
+    /// The linearization matches [`Rgba::to_linear_f32`] (sRGB EOTF, 0.04045
+    /// breakpoint); WCAG's published 0.03928 is a known rounding of the same sRGB
+    /// boundary, so the corrected 0.04045 is used (as modern tooling does). The
+    /// difference is far below the assertion margins.
+    pub fn relative_luminance(self) -> f32 {
+        fn lin(u: u8) -> f32 {
+            let s = u as f32 / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * lin(self.r) + 0.7152 * lin(self.g) + 0.0722 * lin(self.b)
+    }
+}
+
+/// WCAG 2.1 contrast ratio between two opaque colors, in `1.0..=21.0`. Order does
+/// not matter: `(L_lighter + 0.05) / (L_darker + 0.05)`. Used to verify the token
+/// palette meets WCAG thresholds for real, rather than trusting the dossier's
+/// hand-estimated ratios. Reference: black-on-white is exactly `21.0`, any color
+/// against itself is `1.0`.
+pub fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
+    let (la, lb) = (a.relative_luminance(), b.relative_luminance());
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
 }
 
 /// The two themes that ship day one. Both are drawn from one hue family so ANSI
@@ -416,5 +447,66 @@ mod tests {
             Theme::for_kind(ThemeKind::Light).colors.bg_canvas,
             Rgba::hex(0xFAF9F6)
         );
+    }
+
+    #[test]
+    fn theme_switch_returns_distinct_value_sets() {
+        // AC: switching Theme returns the correct value set (the two themes are
+        // genuinely different palettes, resolved by kind).
+        let light = Theme::for_kind(ThemeKind::Light);
+        let dark = Theme::for_kind(ThemeKind::Dark);
+        assert_ne!(light.colors.bg_canvas, dark.colors.bg_canvas);
+        assert_ne!(light.colors.fg_primary, dark.colors.fg_primary);
+        assert_eq!(light.colors.fg_primary, Rgba::hex(0x2A2A28));
+        assert_eq!(dark.colors.fg_primary, Rgba::hex(0xE6E5E1));
+    }
+
+    #[test]
+    fn contrast_ratio_endpoints_are_correct() {
+        // Sanity-check the WCAG computation against its known fixed points before
+        // trusting it on the palette: black-on-white is the 21:1 maximum, and any
+        // color against itself is 1:1.
+        let white = Rgba::hex(0xFFFFFF);
+        let black = Rgba::hex(0x000000);
+        assert!((contrast_ratio(white, black) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(black, white) - 21.0).abs() < 0.01); // order-free
+        assert!((contrast_ratio(white, white) - 1.0).abs() < 1e-4);
+        assert!(
+            (contrast_ratio(LIGHT.colors.accent_primary, LIGHT.colors.accent_primary) - 1.0).abs()
+                < 1e-4
+        );
+    }
+
+    #[test]
+    fn wcag_contrast_key_pairs_meet_thresholds() {
+        // AC: assert WCAG contrast for key pairs using a REAL contrast computation
+        // (the dossier ratios were estimates). For BOTH themes:
+        //   - fg.primary on bg.canvas   >= 7:1  (WCAG AAA body text)
+        //   - fg.secondary on bg.canvas >= 4.5:1 (WCAG AA body text)
+        //   - accent.primary on bg.canvas >= 3:1 (WCAG AA large-text / UI)
+        // The accent is the tightest pair (the derived blue is provisional, owner
+        // confirm pending) and is exactly why the >=3:1 UI bar is the one asserted
+        // for it; `accent_primary_text` is the separate AA-small-text variant.
+        for theme in [&LIGHT, &DARK] {
+            let c = &theme.colors;
+            let fg_primary = contrast_ratio(c.fg_primary, c.bg_canvas);
+            let fg_secondary = contrast_ratio(c.fg_secondary, c.bg_canvas);
+            let accent = contrast_ratio(c.accent_primary, c.bg_canvas);
+            assert!(
+                fg_primary >= 7.0,
+                "{:?}: fg_primary on bg_canvas is {fg_primary:.2}:1, want >= 7:1 (AAA)",
+                theme.kind
+            );
+            assert!(
+                fg_secondary >= 4.5,
+                "{:?}: fg_secondary on bg_canvas is {fg_secondary:.2}:1, want >= 4.5:1 (AA)",
+                theme.kind
+            );
+            assert!(
+                accent >= 3.0,
+                "{:?}: accent_primary on bg_canvas is {accent:.2}:1, want >= 3:1 (AA large/UI)",
+                theme.kind
+            );
+        }
     }
 }
