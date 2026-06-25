@@ -124,17 +124,59 @@ pub struct Preedit {
     pub cursor: Option<(usize, usize)>,
 }
 
-/// Non-inheritable style spans (e.g. syntax highlight, error underlines), computed
-/// async off the render loop. Reserved for ticket T-3.5; empty in this ticket.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Highlight {}
+/// The visual category of a highlighted span - maps to a token color / decoration
+/// in the renderer (T-3.6). The dossier names command/arg/flag tinting plus an
+/// error underline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanKind {
+    /// The command word (first token of a pipeline stage / after a separator).
+    Command,
+    /// A positional argument.
+    Argument,
+    /// An option/flag token (`-x` / `--long`).
+    Flag,
+    /// A quoted string (`'...'` or `"..."`).
+    QuotedString,
+    /// A shell operator/separator (`|`, `&`, `;`, `&&`, `||`, `<`, `>`).
+    Operator,
+    /// An error decoration (e.g. an unterminated quote) - rendered as an underline.
+    ErrorUnderline,
+}
 
-/// An async suggestion tail (fish-style ghost text). Reserved for ticket T-3.5; not
-/// populated by this ticket.
+/// A styled run over `[start, end)` CHAR offsets (the same units as [`Selection`]).
+/// Spans never overlap and are emitted left to right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StyleSpan {
+    /// First char offset (inclusive).
+    pub start: usize,
+    /// One-past-last char offset (exclusive).
+    pub end: usize,
+    pub kind: SpanKind,
+}
+
+/// Non-inheritable style spans (syntax highlight + error underlines), computed async
+/// off the render loop (ticket T-3.5) by [`crate::highlight`] and applied via
+/// [`InputModel::set_highlight`]. "Non-inheritable": the span set is recomputed from
+/// the whole text each time, so a character typed after a styled run is reclassified,
+/// never tinted by the preceding token. Empty by default (no overlay computed yet).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Highlight {
+    /// The styled runs, left to right, non-overlapping.
+    pub spans: Vec<StyleSpan>,
+}
+
+/// A fish-style ghost-text suggestion (ticket T-3.5): the FULL suggested command
+/// line (e.g. `git status -s`), not just the trailing fragment. The visible tail is
+/// derived live by [`InputModel::ghost_tail`] as the suggestion with the current
+/// text stripped as a prefix, so a suggestion the buffer has since diverged from
+/// (the worker is debounced, so the text can advance ahead of the next recompute)
+/// neither displays nor accepts - it is simply no longer a prefix. Computed by
+/// [`crate::highlight::ghost_for`] and applied via [`InputModel::set_ghost`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhostText {
-    /// The suggested completion text shown after the caret.
-    pub text: String,
+    /// The full suggested command line. The shown tail is this minus the current
+    /// input prefix (see [`InputModel::ghost_tail`]).
+    pub suggestion: String,
 }
 
 /// A point-in-time copy of the editable state, for undo/redo.
@@ -216,6 +258,68 @@ impl InputModel {
         self.ghost.as_ref()
     }
 
+    // --- T-3.5 overlay mutators (driven by the async highlight/ghost worker) ---
+
+    /// Replace the style overlay. The async worker (aterm-ui) computes spans off the
+    /// render thread (via [`crate::highlight::highlight_for`]) and applies the
+    /// last-good set here; the render path only ever *reads* [`Self::highlight`], so
+    /// it never blocks on the highlighter.
+    pub fn set_highlight(&mut self, highlight: Highlight) {
+        self.overlay = highlight;
+    }
+
+    /// Set (or clear) the ghost-text suggestion. The worker computes it from history
+    /// ([`crate::highlight::ghost_for`]) and applies it here. Staleness is handled by
+    /// [`Self::ghost_tail`]/[`Self::accept_ghost`] re-deriving the tail against the
+    /// live text, so the worker need not race to clear an out-of-date suggestion.
+    pub fn set_ghost(&mut self, ghost: Option<GhostText>) {
+        self.ghost = ghost;
+    }
+
+    /// The visible ghost tail: the suggestion with the current text stripped as a
+    /// prefix, or `None` when there is no ghost, the line is empty, or the buffer has
+    /// diverged from the suggestion (so it is no longer a prefix). This is what the
+    /// widget renders after the caret, and the single source of truth for whether a
+    /// suggestion is still live - a debounced worker can lag without ever showing a
+    /// stale tail.
+    pub fn ghost_tail(&self) -> Option<&str> {
+        if self.text.is_empty() {
+            return None;
+        }
+        let tail = self
+            .ghost
+            .as_ref()?
+            .suggestion
+            .strip_prefix(self.text.as_str())?;
+        if tail.is_empty() {
+            None
+        } else {
+            Some(tail)
+        }
+    }
+
+    /// Accept the ghost-text suggestion (zsh-autosuggestions semantics: `Right`/`End`
+    /// at end of line). Inserts the live tail as one undo unit and clears the ghost;
+    /// returns whether anything was accepted. It is a no-op unless the selection is
+    /// collapsed, the caret is at the end of the text, AND a live tail exists
+    /// ([`Self::ghost_tail`]) - so it never fires mid-line, over a selection, or for a
+    /// stale suggestion the buffer has typed past. The widget (T-3.6) binds the keys;
+    /// this is the pure operation they invoke.
+    pub fn accept_ghost(&mut self) -> bool {
+        if !(self.sel.is_empty() && self.sel.caret == self.char_len()) {
+            return false;
+        }
+        // Re-derive the tail against the live buffer, so a stale ghost (the worker is
+        // debounced; the text may have advanced past it) is never appended verbatim.
+        let tail = match self.ghost_tail() {
+            Some(t) => t.to_string(),
+            None => return false,
+        };
+        self.ghost = None;
+        self.insert(&tail);
+        true
+    }
+
     // --- the reducer --------------------------------------------------------
 
     /// Apply an event to the model. Pure: no I/O, no interpretation of the text.
@@ -252,6 +356,9 @@ impl InputModel {
         self.undo.clear();
         self.redo.clear();
         self.preedit = None;
+        // The suggestion was for the now-submitted line; drop it so it cannot carry
+        // onto the fresh empty buffer (the worker recomputes for the new line).
+        self.ghost = None;
         line
     }
 
@@ -753,5 +860,136 @@ mod tests {
         assert!(m.preedit().is_none());
         assert!(m.ghost().is_none());
         assert_eq!(m.highlight(), &Highlight::default());
+    }
+
+    #[test]
+    fn set_highlight_and_ghost_round_trip_through_accessors() {
+        let mut m = InputModel::new();
+        let h = Highlight {
+            spans: vec![StyleSpan {
+                start: 0,
+                end: 2,
+                kind: SpanKind::Command,
+            }],
+        };
+        m.set_highlight(h.clone());
+        assert_eq!(m.highlight(), &h);
+        m.set_ghost(Some(GhostText {
+            suggestion: "git --all".to_string(),
+        }));
+        assert_eq!(m.ghost().map(|g| g.suggestion.as_str()), Some("git --all"));
+        m.set_ghost(None);
+        assert!(m.ghost().is_none());
+    }
+
+    #[test]
+    fn ghost_tail_is_derived_live_and_hides_on_divergence_or_empty() {
+        let mut m = InputModel::new();
+        m.set_ghost(Some(GhostText {
+            suggestion: "git status".to_string(),
+        }));
+        // Empty line: no tail shown even with a ghost set.
+        assert_eq!(m.ghost_tail(), None, "no suggestion on a blank line");
+        // A matching prefix shows the remaining tail.
+        m.reduce(InputEvent::Insert("git st".to_string()));
+        assert_eq!(m.ghost_tail(), Some("atus"));
+        // Diverge from the suggestion: the tail disappears (no longer a prefix).
+        m.reduce(InputEvent::Insert("x".to_string()));
+        assert_eq!(m.text(), "git stx");
+        assert_eq!(
+            m.ghost_tail(),
+            None,
+            "a diverged buffer shows no stale tail"
+        );
+    }
+
+    #[test]
+    fn accept_ghost_inserts_the_live_tail_at_end_of_line_and_clears_it() {
+        // AC2: the suggestion is accepted (the live tail is inserted) at end of line.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("git st".to_string()));
+        m.set_ghost(Some(GhostText {
+            suggestion: "git status".to_string(),
+        }));
+        assert!(m.accept_ghost(), "a live ghost at end of line is accepted");
+        assert_eq!(m.text(), "git status");
+        assert!(m.ghost().is_none(), "accepting clears the ghost");
+        assert_eq!(
+            m.caret(),
+            "git status".chars().count(),
+            "caret follows the insert"
+        );
+    }
+
+    #[test]
+    fn accept_ghost_rejects_a_stale_suggestion_the_buffer_typed_past() {
+        // Regression (review finding): the worker is debounced, so the buffer can
+        // advance past a ghost before it is recomputed. Accepting must NOT append
+        // the stale tail verbatim ("git stash" + "atus" -> "git stashatus").
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("git st".to_string()));
+        m.set_ghost(Some(GhostText {
+            suggestion: "git status".to_string(),
+        }));
+        m.reduce(InputEvent::Insert("ash".to_string())); // buffer is now "git stash"
+        assert_eq!(m.text(), "git stash");
+        assert_eq!(
+            m.ghost_tail(),
+            None,
+            "the stale suggestion is no longer a prefix"
+        );
+        assert!(!m.accept_ghost(), "a stale ghost must not be accepted");
+        assert_eq!(m.text(), "git stash", "no stale tail appended");
+    }
+
+    #[test]
+    fn accept_ghost_is_a_noop_mid_line_or_with_no_ghost() {
+        // No ghost -> nothing to accept.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("ls".to_string()));
+        assert!(!m.accept_ghost());
+        assert_eq!(m.text(), "ls");
+        // Ghost present but caret NOT at end (moved left) -> not accepted, ghost kept.
+        m.set_ghost(Some(GhostText {
+            suggestion: "ls -la".to_string(),
+        }));
+        m.reduce(InputEvent::Move(Motion::Left, false));
+        assert!(!m.accept_ghost(), "mid-line caret must not accept");
+        assert_eq!(m.text(), "ls");
+        assert!(
+            m.ghost().is_some(),
+            "a rejected accept leaves the ghost in place"
+        );
+    }
+
+    #[test]
+    fn accept_ghost_is_a_noop_when_a_selection_is_active() {
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("echo".to_string()));
+        m.set_ghost(Some(GhostText {
+            suggestion: "echo hi".to_string(),
+        }));
+        // Caret AT end but a selection is active (Home, then shift-End selects all
+        // with the caret back at the end) - the collapsed-selection guard must block.
+        m.reduce(InputEvent::Move(Motion::Home, false));
+        m.reduce(InputEvent::Move(Motion::End, true));
+        assert_eq!(m.caret(), 4, "caret is at end of line");
+        assert!(!m.selection().is_empty(), "but a selection is active");
+        assert!(!m.accept_ghost(), "an active selection blocks accept");
+        assert_eq!(m.text(), "echo");
+    }
+
+    #[test]
+    fn take_clears_a_pending_ghost() {
+        // Regression (review finding): a submitted line must not carry its ghost onto
+        // the fresh empty buffer.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("ls".to_string()));
+        m.set_ghost(Some(GhostText {
+            suggestion: "ls -la".to_string(),
+        }));
+        assert_eq!(m.take(), "ls");
+        assert!(m.ghost().is_none(), "take() drops the stale ghost");
+        assert_eq!(m.ghost_tail(), None);
     }
 }

@@ -9,6 +9,7 @@
 
 pub mod block;
 pub mod engine;
+pub mod highlight;
 pub mod history;
 pub mod input;
 pub mod integration;
@@ -23,9 +24,11 @@ pub use block::{
     COLLAPSED_OUTPUT_ROWS,
 };
 pub use engine::{Engine, EngineMetrics, ToModel};
+pub use highlight::{ghost_for, highlight_command_line, highlight_for};
 pub use history::{HistoryEntry, HistoryRing, HistoryScope, Recall, DEFAULT_HISTORY_CAP};
 pub use input::{
-    GhostText, Highlight, InputEvent, InputMode, InputModel, Motion, Preedit, Selection,
+    GhostText, Highlight, InputEvent, InputMode, InputModel, Motion, Preedit, Selection, SpanKind,
+    StyleSpan,
 };
 pub use integration::{Integration, IntegrationMonitor, IntegrationReason, IntegrationStatus};
 pub use osc::{Mark, OscScanner, PromptKind, ScanResult};
