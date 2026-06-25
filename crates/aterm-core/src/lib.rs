@@ -13,6 +13,7 @@ pub mod highlight;
 pub mod history;
 pub mod input;
 pub mod integration;
+pub mod keys;
 pub mod osc;
 pub mod pty;
 pub mod shell_integration;

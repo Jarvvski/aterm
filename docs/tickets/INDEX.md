@@ -89,7 +89,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-3.1 | Pure InputModel reducer (text + selection + mode) | done | - |
 | T-3.2 | IME via winit Ime events + preedit-active gate | ready-for-agent | T-1.5 |
 | T-3.3 | Routing brain (disposition gates) + hotkey toggle | ready-for-agent | T-3.1, T-2.1 |
-| T-3.4 | Key encoder (Kitty protocol + DECCKM) for raw passthrough | ready-for-agent | T-3.3 |
+| T-3.4 | Key encoder (Kitty protocol + DECCKM) for raw passthrough | done | T-3.3 |
 | T-3.5 | Async/debounced highlight + ghost text overlay | ready-for-agent | T-3.1 |
 | T-3.6 | Input box widget + iA mode indicator (prompt glyph + chip) | ready-for-agent | T-3.1, T-4.2 |
 | T-3.7 | Shared history ring + per-mode query lens | done | T-3.1 |
