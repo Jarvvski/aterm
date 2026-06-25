@@ -255,6 +255,8 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "objc2-quartz-core 0.2.2",
  "pollster",
+ "serde",
+ "serde_json",
  "swash",
  "thiserror 2.0.18",
  "tracing",

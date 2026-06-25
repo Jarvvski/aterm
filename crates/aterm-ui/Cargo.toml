@@ -21,6 +21,10 @@ pollster.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 thiserror.workspace = true
+# Frame-recorder sample (de)serialization for the JSON dump (T-7.1). Reuses the
+# workspace serde pins (already in the tree via aterm-agent); no new dependency.
+serde.workspace = true
+serde_json.workspace = true
 # Frame-zone instrumentation (T-1.8 AC4). `tracing` spans are always compiled and
 # cost nothing without a subscriber; the Tracy layer is opt-in (the `tracy` feature).
 tracing.workspace = true

@@ -33,6 +33,7 @@ use aterm_tokens::{Theme, ThemeKind};
 
 use crate::gpu::GpuRenderer;
 use crate::present::{DisplayLink, PresentScheduler};
+use crate::recorder::{FrameRecorder, FrameTiming};
 use crate::renderer::{Frame, Renderer};
 use crate::window::{grid_dims, window_attributes};
 
@@ -127,6 +128,14 @@ pub struct AtermApp<C: UiCallbacks> {
     /// The macOS vsync clock, if installed (opt-in + creation succeeded). `None`
     /// means the winit-driven present loop is driving presentation.
     display_link: Option<DisplayLink>,
+    /// Tier-2 frame recorder (ticket T-7.1), if installed via
+    /// [`Self::with_frame_recorder`]. `None` (the default) makes the per-frame
+    /// instrumentation zero-cost: the present path skips it entirely. The scenario
+    /// driver (T-7.2) installs one to capture a scripted stress run.
+    recorder: Option<FrameRecorder>,
+    /// Instant of the previous present, for the recorder's `present_interval`
+    /// (vsync-to-vsync delta). `None` until the first present.
+    last_present_at: Option<Instant>,
 }
 
 impl<C: UiCallbacks> AtermApp<C> {
@@ -140,6 +149,8 @@ impl<C: UiCallbacks> AtermApp<C> {
             scheduler: PresentScheduler::default(),
             config: RenderConfig::default(),
             display_link: None,
+            recorder: None,
+            last_present_at: None,
         }
     }
 
@@ -151,9 +162,35 @@ impl<C: UiCallbacks> AtermApp<C> {
         self
     }
 
+    /// Install a Tier-2 [`FrameRecorder`] (ticket T-7.1). Each presented frame is
+    /// then timed and recorded; read the captured window back with
+    /// [`Self::frame_recorder`]. Without this, the present path does no
+    /// instrumentation. The scenario driver (T-7.2) installs a recorder sized for
+    /// its run.
+    #[must_use]
+    pub fn with_frame_recorder(mut self, recorder: FrameRecorder) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// The installed frame recorder, if any - for the driver/analysis to read
+    /// percentiles or dump JSON after a run.
+    #[must_use]
+    pub fn frame_recorder(&self) -> Option<&FrameRecorder> {
+        self.recorder.as_ref()
+    }
+
     /// Draw exactly one frame: clear to the canvas color and, if the host has a
     /// snapshot, the grid text. Called only when the scheduler says to present.
+    ///
+    /// When a [`FrameRecorder`] is installed (T-7.1) the frame is timed and
+    /// recorded; with none installed (the default) this is exactly the bare
+    /// build-and-render with no added work.
     fn redraw(&mut self) {
+        // Frame-start clock ONLY when a recorder is installed: with none (the
+        // default) the whole instrumentation block below is skipped, so this is
+        // exactly the bare build-and-render - no clock read, no per-frame work.
+        let frame_start = self.recorder.is_some().then(Instant::now);
         let snapshot = self.callbacks.snapshot();
         let blocks = self.callbacks.blocks();
         let integration = self.callbacks.integration_status();
@@ -167,6 +204,35 @@ impl<C: UiCallbacks> AtermApp<C> {
             if let Err(e) = renderer.render(frame) {
                 log::warn!("frame render error: {e}");
             }
+        }
+        if let (Some(recorder), Some(started)) = (self.recorder.as_mut(), frame_start) {
+            // cpu_frame_ms = build + encode + submit on this (render) thread. GPU
+            // time is None (the device requests no TIMESTAMP_QUERY feature - see
+            // recorder module docs, T-7.1 AC4). present_interval is the delta from
+            // the previous present; `last_present_at` is cleared when the scheduler
+            // goes idle (see `RedrawRequested`), so the first frame of a warm burst
+            // reports 0 (a fresh burst, NOT a dropped frame) rather than the whole
+            // idle gap. Dirty extent: the renderer rebuilds the whole visible grid
+            // on any change (rebuild-or-skip; partial-damage redraw is a future
+            // optimization), so a snapshot-driven draw touches the visible grid; a
+            // bare clear (no snapshot) is zero cells.
+            let cpu_frame_ms = started.elapsed().as_secs_f32() * 1000.0;
+            let present_interval_ms = self
+                .last_present_at
+                .map(|prev| started.duration_since(prev).as_secs_f32() * 1000.0)
+                .unwrap_or(0.0);
+            let dirty_cells = snapshot
+                .as_deref()
+                .map(|s| u32::try_from(s.rows.saturating_mul(s.cols)).unwrap_or(u32::MAX))
+                .unwrap_or(0);
+            recorder.record(FrameTiming {
+                cpu_frame_ms,
+                gpu_frame_ms: None,
+                present_interval_ms,
+                dirty_cells,
+                allocations: None,
+            });
+            self.last_present_at = Some(started);
         }
     }
 
@@ -305,6 +371,13 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                 // Only pay for the snapshot clone + GPU work when actually warm.
                 if self.scheduler.decide(now).is_present() {
                     self.redraw();
+                } else {
+                    // Idle: this vsync draws zero frames (the keep-warm window
+                    // elapsed). Forget the last present so the FIRST frame of the
+                    // next warm burst reports a fresh interval (0) instead of the
+                    // whole idle gap - which the recorder would otherwise miscount
+                    // as a dropped frame (T-7.1).
+                    self.last_present_at = None;
                 }
             }
             _ => {}

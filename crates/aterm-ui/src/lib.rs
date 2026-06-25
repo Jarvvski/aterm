@@ -21,6 +21,7 @@ pub mod grid_render;
 pub mod indicator;
 pub mod present;
 pub mod profiling;
+pub mod recorder;
 pub mod renderer;
 pub mod text;
 pub mod timeline;
@@ -33,6 +34,10 @@ pub use gpu::GpuRenderer;
 pub use grid_render::{FrameSize, GridRenderer};
 pub use indicator::IntegrationIndicator;
 pub use present::{DisplayLink, FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
+pub use recorder::{
+    FrameRecorder, FrameSample, FrameStats, FrameTiming, Refresh, DEFAULT_CAPACITY,
+    DEFAULT_TOLERANCE_MS,
+};
 pub use renderer::{Frame, RenderError, Renderer};
 pub use text::{
     build_grid_cells, classify_run, is_ascii_fast, resolve_color, AtlasRect, FaceStyle, GlyphCache,
