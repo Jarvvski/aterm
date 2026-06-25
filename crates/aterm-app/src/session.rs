@@ -13,10 +13,14 @@
 
 use std::sync::Arc;
 
-use aterm_core::{BlockList, Engine, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK};
+use aterm_core::{
+    BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
+};
 use aterm_ui::{NamedKey, UiCallbacks, Window};
 
 use aterm_core::{InputEvent, InputMode, InputModel, Motion};
+
+use crate::routing::{decide, Disposition, KeyInput, RoutingContext};
 
 /// One terminal session.
 pub struct Session {
@@ -61,6 +65,125 @@ impl Session {
             }
         }
     }
+
+    /// Classify a winit key into the routing brain's [`KeyInput`] (ticket T-3.3).
+    ///
+    /// LIMITATION: the [`UiCallbacks::on_key`] seam does not yet carry keyboard
+    /// MODIFIERS, so the real toggle chord (`Cmd-/`) and `Opt-Enter` cannot be
+    /// detected here. `Tab` stands in for the toggle (as the prior scaffold did) and
+    /// Enter is always non-alt. Wiring the modifier seam (and thus the real chords)
+    /// is the remaining work; the brain already decides them correctly.
+    fn classify_key(named: Option<NamedKey>) -> KeyInput {
+        match named {
+            Some(NamedKey::Enter) => KeyInput::Enter { alt: false },
+            Some(NamedKey::Escape) => KeyInput::Escape,
+            // Placeholder toggle chord (real chord is `Cmd-/`, pending the modifier
+            // seam). NOTE: this means `Tab` toggles even inside a TUI - a known
+            // interim limitation carried from the scaffold, resolved once `Cmd-/`
+            // frees `Tab`.
+            Some(NamedKey::Tab) => KeyInput::ToggleHotkey,
+            _ => KeyInput::Other,
+        }
+    }
+
+    /// Build the routing context from live state. `degraded` (integration `None`)
+    /// and `alt_screen` are sourced live; `preedit_active` (T-3.2),
+    /// `agent_turn_active` (EPIC-5), and `foreground_reading_stdin` are not yet
+    /// available and read `false` (documented residuals).
+    fn routing_context(&mut self) -> RoutingContext {
+        let degraded = matches!(
+            self.engine.integration_status().status,
+            IntegrationStatus::None
+        );
+        let alt_screen = self.engine.latest_snapshot().alt_screen;
+        RoutingContext {
+            mode: self.input.mode(),
+            preedit_active: false,
+            degraded,
+            alt_screen,
+            foreground_reading_stdin: false,
+            agent_turn_active: false,
+        }
+    }
+
+    /// Apply an editing key to the [`InputModel`]; returns whether a backspace
+    /// actually erased a character (so the Shell-echo mirror only sends DEL when
+    /// something was deleted - the scaffold's guard). Enter/Tab/Escape never reach
+    /// here (the routing brain dispatches them).
+    fn apply_edit_key(&mut self, named: Option<NamedKey>, text: Option<&str>) -> bool {
+        match named {
+            Some(NamedKey::Backspace) => {
+                let erases = self.input.caret() > 0 || !self.input.selection().is_empty();
+                self.input.reduce(InputEvent::Backspace);
+                erases
+            }
+            Some(NamedKey::Delete) => {
+                self.input.reduce(InputEvent::Delete);
+                false
+            }
+            Some(NamedKey::ArrowLeft) => {
+                self.input.reduce(InputEvent::Move(Motion::Left, false));
+                false
+            }
+            Some(NamedKey::ArrowRight) => {
+                self.input.reduce(InputEvent::Move(Motion::Right, false));
+                false
+            }
+            Some(NamedKey::ArrowUp) => {
+                self.input.reduce(InputEvent::Move(Motion::Up, false));
+                false
+            }
+            Some(NamedKey::ArrowDown) => {
+                self.input.reduce(InputEvent::Move(Motion::Down, false));
+                false
+            }
+            Some(NamedKey::Home) => {
+                self.input.reduce(InputEvent::Move(Motion::Home, false));
+                false
+            }
+            Some(NamedKey::End) => {
+                self.input.reduce(InputEvent::Move(Motion::End, false));
+                false
+            }
+            Some(NamedKey::Space) => {
+                self.input.reduce(InputEvent::Insert(" ".to_string()));
+                false
+            }
+            // Esc with no agent turn (and integrated, not alt-screen) is ordinary
+            // input; the input box has no Esc action yet, so it is a no-op.
+            Some(NamedKey::Escape) => false,
+            _ => {
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.input.reduce(InputEvent::Insert(t.to_string()));
+                }
+                false
+            }
+        }
+    }
+
+    /// The raw bytes a key sends to the PTY (the Shell-echo mirror and raw
+    /// passthrough). `erased` gates Backspace -> DEL so an empty input box does not
+    /// echo a stray DEL. Arrows/Delete/Home/End send nothing yet - full key->bytes
+    /// encoding (Kitty protocol / DECCKM) is ticket T-3.4.
+    fn raw_key_bytes(named: Option<NamedKey>, text: Option<&str>, erased: bool) -> Option<Vec<u8>> {
+        match named {
+            Some(NamedKey::Enter) => Some(b"\r".to_vec()),
+            Some(NamedKey::Backspace) => erased.then(|| vec![0x7f]),
+            Some(NamedKey::Space) => Some(b" ".to_vec()),
+            Some(
+                NamedKey::Delete
+                | NamedKey::ArrowLeft
+                | NamedKey::ArrowRight
+                | NamedKey::ArrowUp
+                | NamedKey::ArrowDown
+                | NamedKey::Home
+                | NamedKey::End,
+            ) => None,
+            _ => text
+                .filter(|t| !t.is_empty())
+                .map(|t| t.as_bytes().to_vec()),
+        }
+    }
 }
 
 impl UiCallbacks for Session {
@@ -100,85 +223,59 @@ impl UiCallbacks for Session {
     }
 
     fn on_key(&mut self, text: Option<&str>, named: Option<NamedKey>) -> Option<Vec<u8>> {
-        // T-3.3 STOPGAP routing. The pure `InputModel` reducer (ticket T-3.1) owns
-        // the in-progress line - editing, selection, mode. The real routing brain
-        // (disposition gates, IME preedit, the toggle hotkey) is T-3.3 and the input
-        // widget that renders the buffer is T-3.6; until they land, Shell-mode
-        // keystrokes are ALSO mirrored raw to the PTY so the shell's own line editor
-        // echoes them and the app stays interactive. The model is kept live in
-        // parallel (so the mode toggle and reducer are exercised) but is not yet the
-        // source of truth for what reaches the PTY. The bytes sent here are
-        // byte-for-byte what the previous scaffold sent.
-        let shell = self.input.mode() == InputMode::Shell;
-        let bytes = match named {
-            // The caller decides submission: read the line, then reset the model
-            // (the T-3.1 caller-owns-submit contract). Shell mode runs the
-            // shell-echoed line with a CR; Agent mode hands off to EPIC-5.
-            Some(NamedKey::Enter) => {
-                let line = self.input.take();
-                if shell {
-                    Some(b"\r".to_vec())
-                } else {
-                    log::info!("agent submit: {line}");
-                    // TODO(ticket EPIC-5): dispatch to AgentTurn on the agent thread.
-                    None
-                }
-            }
-            // Scaffold mode-toggle hotkey (the real chord is a T-3.3 product call);
-            // mutates ONLY the mode, never the text.
-            Some(NamedKey::Tab) => {
+        // T-3.3 routing brain. The pure `InputModel` reducer (T-3.1) owns the
+        // in-progress line; this layer is the caller that decides where a key goes
+        // (the caller-owns-submit contract). `decide` (routing.rs) applies the
+        // disposition gates; we perform the result here. INTERACTIVITY: until the
+        // T-3.6 widget renders the `InputModel`, Shell-mode editing keys are still
+        // mirrored raw to the PTY so the shell's own line editor echoes them - the
+        // byte stream stays what the prior scaffold sent.
+        let key = Self::classify_key(named);
+        let ctx = self.routing_context();
+        let bytes = match decide(key, &ctx) {
+            // The IME owns the key (T-3.2); nothing routes. Unreachable today
+            // (`preedit_active` is false until T-3.2 lands).
+            Disposition::ImeComposing => None,
+            // The hotkey flips ONLY the mode; text/selection/undo preserved (T-3.1).
+            Disposition::ToggleMode => {
                 self.input.reduce(InputEvent::ToggleMode);
                 None
             }
-            Some(NamedKey::Backspace) => {
-                // DEL only when a char is actually erased - mirrors the prior
-                // scaffold's `cursor > 0` guard so an empty/at-start prompt sends
-                // nothing (the buffer is tiny; reading it pre-reduce is free).
-                let erases = self.input.caret() > 0 || !self.input.selection().is_empty();
-                self.input.reduce(InputEvent::Backspace);
-                (shell && erases).then(|| vec![0x7f])
-            }
-            Some(NamedKey::Delete) => {
-                self.input.reduce(InputEvent::Delete);
+            // EPIC-5 stub: a real agent turn and its interrupt land with the loop.
+            Disposition::InterruptAgent => {
+                log::info!("agent interrupt (Esc)");
                 None
             }
-            Some(NamedKey::ArrowLeft) => {
-                self.input.reduce(InputEvent::Move(Motion::Left, false));
+            // Agent submit: read+reset the line, hand it to the agent (EPIC-5 stub).
+            Disposition::SubmitAgent => {
+                let line = self.input.take();
+                log::info!("agent submit: {line}");
                 None
             }
-            Some(NamedKey::ArrowRight) => {
-                self.input.reduce(InputEvent::Move(Motion::Right, false));
-                None
+            // Shell submit: the shell already received the chars via the Edit mirror
+            // below, so submitting is just the carriage return; reset the model.
+            Disposition::SubmitShell => {
+                let _ = self.input.take();
+                Some(b"\r".to_vec())
             }
-            Some(NamedKey::ArrowUp) => {
-                self.input.reduce(InputEvent::Move(Motion::Up, false));
-                None
-            }
-            Some(NamedKey::ArrowDown) => {
-                self.input.reduce(InputEvent::Move(Motion::Down, false));
-                None
-            }
-            Some(NamedKey::Home) => {
-                self.input.reduce(InputEvent::Move(Motion::Home, false));
-                None
-            }
-            Some(NamedKey::End) => {
-                self.input.reduce(InputEvent::Move(Motion::End, false));
-                None
-            }
-            Some(NamedKey::Space) => {
-                self.input.reduce(InputEvent::Insert(" ".to_string()));
-                shell.then(|| b" ".to_vec())
-            }
-            _ => {
-                let t = text.filter(|t| !t.is_empty())?;
-                self.input.reduce(InputEvent::Insert(t.to_string()));
-                shell.then(|| t.as_bytes().to_vec())
+            // Raw passthrough (alt-screen / foreground stdin / degraded): the keys
+            // belong to the PTY (a TUI or a classic ZLE line editor), NOT the input
+            // box, so we do not edit the `InputModel`. T-3.4 owns full encoding.
+            Disposition::PassthroughToPty => Self::raw_key_bytes(named, text, true),
+            // Ordinary editing: update the input line. In Shell mode ALSO mirror raw
+            // to the PTY for the shell's echo (until the T-3.6 widget is the source
+            // of truth). Agent mode edits the prompt only - no PTY bytes.
+            Disposition::Edit => {
+                let erased = self.apply_edit_key(named, text);
+                if ctx.mode == InputMode::Shell {
+                    Self::raw_key_bytes(named, text, erased)
+                } else {
+                    None
+                }
             }
         };
 
-        // Mirror to the PTY (Shell mode only) and also surface the bytes so a
-        // headless host can observe them.
+        // Mirror to the PTY and surface the bytes so a headless host can observe them.
         if let Some(b) = &bytes {
             self.engine.send_input(b.clone());
         }

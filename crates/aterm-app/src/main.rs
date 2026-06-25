@@ -7,6 +7,7 @@
 //! shell.
 
 mod config;
+mod routing;
 mod session;
 
 use config::Config;

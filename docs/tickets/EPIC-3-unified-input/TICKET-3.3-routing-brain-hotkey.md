@@ -43,3 +43,45 @@ Implement the input disposition brain that decides where a keystroke/Enter goes,
 - Key-to-bytes encoding (T-3.4).
 - The mode indicator visuals (T-3.6).
 - The agent loop itself (Epic 5).
+
+# Notes
+
+**2026-06-25 (agent): the disposition brain landed + replaced the session stopgap;
+ticket STAYS `ready-for-agent` (the keyboard-modifier seam remains).** The pure
+decision logic is implemented and tested, and `session.rs` now routes through it
+instead of the ad-hoc stopgap, preserving the shell-echo interactivity byte-for-byte.
+
+- New `aterm-app::routing`: `decide(KeyInput, &RoutingContext) -> Disposition` - the
+  priority-ordered gates (preedit -> toggle -> Esc-interrupt -> alt-Enter ->
+  degraded/alt-screen/in-flight passthrough -> Enter-by-mode -> edit). 9 unit tests
+  cover all 7 ACs at the decision level + the gate-precedence edges. The model's
+  opinion never enters the decision.
+- `session.rs` rewired: `on_key` builds the context from live state and performs the
+  disposition. Shell-mode editing still mirrors raw to the PTY (the shell echoes it -
+  the T-3.6 widget does not render the `InputModel` yet), so the PTY byte stream is
+  what the scaffold sent; a 3-lens adversarial review confirmed no interactivity
+  regression. The new alt-screen/degraded passthrough also fixes a latent stopgap
+  bug (alt-screen + Agent-mode keys now reach the TUI instead of the hidden box).
+
+**Honest AC status:**
+- AC2 (Enter Shell->PTY / Agent->agent) - MET (agent dispatch is the EPIC-5 log stub
+  the AC permits).
+- AC5 (alt-screen passthrough) + AC7 (integration `None` -> degraded/raw) - MET and
+  sourced LIVE (`Snapshot.alt_screen`, `IntegrationStatus::None`).
+- AC1 (toggle flips mode, text unchanged) - the toggle WORKS and `InputModel::toggle_mode`
+  preserves text, but it is bound to a `Tab` PLACEHOLDER; the real `Cmd-/` chord needs
+  the modifier seam (below).
+- AC6 (Esc interrupts an agent turn) - decision MET + stub-verifiable; a live turn is
+  EPIC-5.
+- AC3 (Opt-Enter -> agent) - the brain decides it, but it is NOT runtime-reachable: the
+  `aterm-ui` `on_key` seam does not pass keyboard modifiers, so `alt` is always false.
+- AC4 (IME composition -> no submit) - decision tested; `preedit_active` is always false
+  until the IME lands (joint with T-3.2).
+
+**Remaining to reach `done`:** wire the keyboard-MODIFIER seam through
+`aterm-ui::UiCallbacks::on_key` (track winit `ModifiersChanged`) so the real `Cmd-/`
+toggle chord + `Opt-Enter` work and `Tab` is freed; live IME `preedit` (T-3.2); a real
+agent turn for SubmitAgent/InterruptAgent (EPIC-5); `foreground_reading_stdin`
+detection; full key->bytes encoding for passthrough (T-3.4). 9 routing tests; full gate
+green at `-D warnings`. No version bump (no user-visible behaviour change - the byte
+stream is preserved).
