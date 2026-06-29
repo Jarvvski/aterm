@@ -3,10 +3,10 @@
 //! Depends on `aterm-core`. The SAFETY SPINE is implemented for real and tested
 //! hard ([`command`], [`risk`], [`secrets`], [`sanitizer`], [`policy`],
 //! [`sandbox`]); the typed custom tool set + registry + dispatch seam live in
-//! [`tools`]; the Anthropic provider is the real Messages-API client and the
-//! OpenAI provider is a compiling stub ([`provider`]); and the shared,
-//! provider-neutral agentic turn loop drives either provider plan->act->observe,
-//! gating every tool call through the safety spine ([`turn`]).
+//! [`tools`]; the Anthropic (Messages API) and OpenAI (Responses API) providers
+//! are both real streaming clients behind one `LlmProvider` trait ([`provider`]);
+//! and the shared, provider-neutral agentic turn loop drives either provider
+//! plan->act->observe, gating every tool call through the safety spine ([`turn`]).
 //!
 //! Design invariant: NEVER trust a model's self-reported risk. Every command a
 //! model proposes is re-classified locally by [`risk::DefaultRiskClassifier`]

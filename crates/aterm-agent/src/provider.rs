@@ -14,10 +14,11 @@
 //!    per call.
 //!
 //! [`AnthropicProvider`] (the default) is the real Messages-API client - it
-//! lives in [`anthropic`] (T-5.2); [`OpenAiProvider`] is still a compiling stub
-//! that returns `NotImplemented` and makes NO network calls (the real Responses
-//! client is T-5.3). A scriptable [`MockProvider`] drives the turn loop and tests
-//! with no network.
+//! lives in [`anthropic`] (T-5.2); [`OpenAiProvider`] is the real Responses-API
+//! client - it lives in [`openai`] (T-5.3). Both translate their provider SSE
+//! stream into the same neutral [`ProviderEvent`] sequence, so the shared turn
+//! loop drives either with no provider-specific branching. A scriptable
+//! [`MockProvider`] drives the turn loop and tests with no network.
 //!
 //! Divergences from the Kotlin prototype (deliberate, per aterm's locked
 //! decisions): the prototype models a SINGLE tool (`propose_command` ->
@@ -32,8 +33,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub mod anthropic;
+pub mod openai;
+pub(crate) mod sse;
 
 pub use anthropic::AnthropicProvider;
+pub use openai::OpenAiProvider;
 
 /// One message in a conversation, provider-neutral. Content is a list of typed
 /// [`ContentBlock`]s so an agentic history can carry assistant `tool_use` blocks
@@ -588,49 +592,6 @@ impl LlmProvider for MockProvider {
     }
 }
 
-/// OpenAI provider. STUB - returns `NotImplemented`, makes no network calls. The
-/// real Responses-API client is T-5.3.
-#[derive(Debug, Clone)]
-pub struct OpenAiProvider {
-    _api_key: String,
-    client: reqwest::Client,
-}
-
-impl OpenAiProvider {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            _api_key: api_key.into(),
-            client: reqwest::Client::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn http(&self) -> &reqwest::Client {
-        &self.client
-    }
-}
-
-impl LlmProvider for OpenAiProvider {
-    fn name(&self) -> &'static str {
-        "openai"
-    }
-
-    fn default_model(&self) -> &'static str {
-        "gpt-5"
-    }
-
-    async fn stream_turn(
-        &self,
-        _request: TurnRequest,
-        _sink: mpsc::Sender<ProviderEvent>,
-    ) -> Result<(), ProviderError> {
-        // TODO(T-5.3): Responses API streaming client -> ProviderEvent.
-        Err(ProviderError::NotImplemented(
-            "OpenAiProvider::stream_turn - client is T-5.3",
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,21 +934,6 @@ mod tests {
         }
         handle.await.unwrap().unwrap();
         assert_eq!(got, script);
-    }
-
-    #[tokio::test]
-    async fn openai_stub_returns_not_implemented() {
-        let p = OpenAiProvider::new("sk-test");
-        let (tx, _rx) = mpsc::channel(4);
-        let req = TurnRequest {
-            model: p.default_model().to_string(),
-            system: None,
-            messages: vec![],
-            tools: vec![],
-            effort: Effort::Low,
-            max_tokens: 1024,
-        };
-        assert!(p.stream_turn(req, tx).await.is_err());
     }
 
     #[test]
