@@ -24,7 +24,47 @@ reified in `aterm-tokens::font`):
 
 Only the faces aterm actually wires up are vendored; the full pack (Italic/
 BoldItalic for Duo/Quattro, the non-Mono Mono variants, etc.) lives in the
-upstream `iA-Writer.zip` and can be added when a role needs them.
+upstream `iA-Writer.zip` and can be added when a role needs them. All three
+registers are wired (T-4.3): the grid front-end (`crate::grid_render`) draws Mono,
+and the prose front-end (`crate::prose`) shapes Duo/Quattro - both through one
+shared glyph atlas (`crate::atlas`). Duo/Quattro ship Regular + Bold only, so a
+synthetic Italic falls back to Regular and BoldItalic to Bold.
 
 The faces are embedded into the binary at compile time via `include_bytes!` in
-`crates/aterm-ui/src/fonts.rs`, then loaded into the cosmic-text `FontSystem`.
+`crates/aterm-ui/src/fonts.rs` and rasterized / shaped directly with **swash**
+(no `FontSystem` indirection); `crate::fonts::face_bytes` is the single
+`(family, face) -> bytes` router both the rasterizer and the prose shaper use.
+
+## Measured metrics (T-4.3)
+
+Measured from the bundled `*-Regular.ttf` with swash (`units_per_em = 1000`).
+**Vertical metrics are identical across all three registers** - `ascent 1025,
+descent 275, leading 0, cap_height 698, x_height 516` - so prose and grid share
+one baseline geometry. Advance widths, in em-fractions (`advance / units_per_em`):
+
+| glyph        | Mono  | Duo   | Quattro |
+|--------------|-------|-------|---------|
+| space        | 0.667 | 0.600 | 0.450   |
+| i, l         | 0.667 | 0.600 | 0.300   |
+| r, f         | 0.667 | 0.600 | 0.450   |
+| s, a, 0, n   | 0.667 | 0.600 | 0.600   |
+| m, w, M, W   | 0.667 | 0.900 | 0.900   |
+| average      | 0.667 | 0.874 | 0.873   |
+
+So **Mono** is a constant 0.667em (the grid's column invariant), **Duo** is
+duospace (0.6em, with m/w/M/W at 0.9em = 1.5x), and **Quattro** spans four widths
+(0.3 / 0.45 / 0.6 / 0.9em). These values are asserted directly against the live
+faces by `crate::prose`'s `prose_metrics_match_the_documented_table` test, so the
+table cannot silently drift from the bundle.
+
+**Prose measure.** Agent prose wraps at a measure of `MEASURE_CH` (72) characters,
+where a character is the CSS `ch` unit - the advance of `'0'` (0.600em in Duo). The
+terminal grid is never capped; it follows the PTY column count.
+
+## Licensing (OFL 1.1)
+
+The patched iM Writing set carries two upstream licenses - the Nerd Fonts patch and
+iA's IBM Plex modification - both released under the **SIL Open Font License 1.1**,
+reproduced in `OFL-LICENSE.md`. The OFL permits bundling/redistribution inside a
+GPLv3 application as long as that notice travels with the fonts (it does, here). The
+in-app acknowledgements surface is tracked separately (EPIC-8 / T-8.2).

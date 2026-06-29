@@ -22,8 +22,7 @@ use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::Format;
 use swash::FontRef;
 
-use crate::fonts::{GRID_BOLD, GRID_BOLD_ITALIC, GRID_ITALIC, GRID_REGULAR};
-use crate::text::FaceStyle;
+use crate::text::{FaceStyle, FontFamily};
 
 /// A rasterized glyph: its 8-bit alpha coverage and placement relative to the pen
 /// origin (the cell's baseline-left point). `left`/`top` follow swash/zeno
@@ -87,40 +86,33 @@ impl GlyphRasterizer {
         }
     }
 
-    /// The bundled TTF bytes for a face style.
-    #[must_use]
-    fn face_bytes(face: FaceStyle) -> &'static [u8] {
-        match face {
-            FaceStyle::Regular => GRID_REGULAR,
-            FaceStyle::Bold => GRID_BOLD,
-            FaceStyle::Italic => GRID_ITALIC,
-            FaceStyle::BoldItalic => GRID_BOLD_ITALIC,
-        }
+    /// Parse a `(family, face)`'s font directory into a `FontRef` (cheap - it only
+    /// reads the table offsets; the heavy outline scaling is cached downstream). The
+    /// register -> bytes mapping (including the Prose/UI italic fallback) lives in
+    /// [`crate::fonts::face_bytes`]. Returns `None` only if the bundled bytes fail to
+    /// parse, which the build-time `bundled_faces_are_nonempty` test guards against.
+    fn font(family: FontFamily, face: FaceStyle) -> Option<FontRef<'static>> {
+        FontRef::from_index(crate::fonts::face_bytes(family, face), 0)
     }
 
-    /// Parse a face's font directory into a `FontRef` (cheap - it only reads the
-    /// table offsets; the heavy outline scaling is cached downstream). Returns
-    /// `None` only if the bundled bytes fail to parse, which the build-time
-    /// `bundled_faces_are_nonempty` test guards against.
-    fn font(face: FaceStyle) -> Option<FontRef<'static>> {
-        FontRef::from_index(Self::face_bytes(face), 0)
+    /// Map a character to its glyph id in `(family, face)`, WITHOUT shaping (the
+    /// constant-advance grid fast-path: a direct cmap lookup, no HarfBuzz run).
+    /// Returns `0` (`.notdef`) for a codepoint the face lacks - the renderer draws
+    /// whatever the face provides (tofu for, e.g., CJK in a Latin face; real font
+    /// fallback is a later text-polish pass). The proportional prose path does not
+    /// use this; it gets glyph ids from the shaper ([`crate::prose`]).
+    #[must_use]
+    pub fn glyph_id(&self, family: FontFamily, face: FaceStyle, ch: char) -> u16 {
+        Self::font(family, face).map_or(0, |f| f.charmap().map(ch))
     }
 
-    /// Map a character to its glyph id in `face`, WITHOUT shaping (the constant-
-    /// advance grid fast-path: a direct cmap lookup, no HarfBuzz run). Returns `0`
-    /// (`.notdef`) for a codepoint the face lacks - the renderer draws whatever the
-    /// face provides (tofu for, e.g., CJK in a Latin face; real font fallback is a
-    /// later text-polish pass).
+    /// Cell metrics from a family's Regular face at `px`. Regular is authoritative so
+    /// bold/italic cells (which can have a different advance) still align to the grid;
+    /// for the prose path it yields the line box (ascent/descent/leading) used to
+    /// place wrapped lines.
     #[must_use]
-    pub fn glyph_id(&self, face: FaceStyle, ch: char) -> u16 {
-        Self::font(face).map_or(0, |f| f.charmap().map(ch))
-    }
-
-    /// Cell metrics from the Regular face at `px`. Regular is authoritative so bold/
-    /// italic cells (which can have a different advance) still align to the grid.
-    #[must_use]
-    pub fn cell_metrics(&self, px: f32) -> CellMetrics {
-        let Some(font) = Self::font(FaceStyle::Regular) else {
+    pub fn cell_metrics(&self, family: FontFamily, px: f32) -> CellMetrics {
+        let Some(font) = Self::font(family, FaceStyle::Regular) else {
             return CellMetrics {
                 advance: px * 0.6,
                 ascent: px * 0.8,
@@ -139,13 +131,19 @@ impl GlyphRasterizer {
         }
     }
 
-    /// Rasterize `(face, glyph_id)` at `px` into an 8-bit alpha coverage bitmap.
-    /// Returns `None` if the face fails to parse or swash produces no image; an
-    /// outline-less glyph (space) returns `Some` with a zero-size image
+    /// Rasterize `(family, face, glyph_id)` at `px` into an 8-bit alpha coverage
+    /// bitmap. Returns `None` if the face fails to parse or swash produces no image;
+    /// an outline-less glyph (space) returns `Some` with a zero-size image
     /// ([`RasterGlyph::is_empty`]).
     #[must_use]
-    pub fn rasterize(&mut self, face: FaceStyle, glyph_id: u16, px: f32) -> Option<RasterGlyph> {
-        let font = Self::font(face)?;
+    pub fn rasterize(
+        &mut self,
+        family: FontFamily,
+        face: FaceStyle,
+        glyph_id: u16,
+        px: f32,
+    ) -> Option<RasterGlyph> {
+        let font = Self::font(family, face)?;
         let mut scaler = self.ctx.builder(font).size(px).hint(true).build();
         let image = Render::new(&[Source::Outline])
             .format(Format::Alpha)
@@ -170,8 +168,8 @@ mod tests {
     #[test]
     fn ascii_glyph_ids_are_present_and_distinct() {
         let r = GlyphRasterizer::new();
-        let a = r.glyph_id(FaceStyle::Regular, 'A');
-        let b = r.glyph_id(FaceStyle::Regular, 'B');
+        let a = r.glyph_id(FontFamily::Grid, FaceStyle::Regular, 'A');
+        let b = r.glyph_id(FontFamily::Grid, FaceStyle::Regular, 'B');
         assert_ne!(a, 0, "the Latin face must have 'A'");
         assert_ne!(b, 0, "the Latin face must have 'B'");
         assert_ne!(a, b, "distinct chars map to distinct glyphs");
@@ -182,15 +180,18 @@ mod tests {
         let r = GlyphRasterizer::new();
         // A Latin mono face has no CJK glyph -> .notdef (0). It still LAYS OUT (the
         // wide flag drives the 2-column advance); real fallback rendering is later.
-        assert_eq!(r.glyph_id(FaceStyle::Regular, '\u{4e2d}'), 0);
+        assert_eq!(
+            r.glyph_id(FontFamily::Grid, FaceStyle::Regular, '\u{4e2d}'),
+            0
+        );
     }
 
     #[test]
     fn rasterize_letter_has_coverage() {
         let mut r = GlyphRasterizer::new();
-        let gid = r.glyph_id(FaceStyle::Regular, 'M');
+        let gid = r.glyph_id(FontFamily::Grid, FaceStyle::Regular, 'M');
         let g = r
-            .rasterize(FaceStyle::Regular, gid, PX)
+            .rasterize(FontFamily::Grid, FaceStyle::Regular, gid, PX)
             .expect("M rasterizes");
         assert!(!g.is_empty(), "'M' has drawable pixels");
         assert_eq!(
@@ -207,9 +208,9 @@ mod tests {
     #[test]
     fn space_rasterizes_empty() {
         let mut r = GlyphRasterizer::new();
-        let gid = r.glyph_id(FaceStyle::Regular, ' ');
+        let gid = r.glyph_id(FontFamily::Grid, FaceStyle::Regular, ' ');
         let g = r
-            .rasterize(FaceStyle::Regular, gid, PX)
+            .rasterize(FontFamily::Grid, FaceStyle::Regular, gid, PX)
             .expect("space scales");
         assert!(
             g.is_empty(),
@@ -220,10 +221,10 @@ mod tests {
     #[test]
     fn cell_metrics_are_positive_and_scale() {
         let r = GlyphRasterizer::new();
-        let m = r.cell_metrics(PX);
+        let m = r.cell_metrics(FontFamily::Grid, PX);
         assert!(m.advance > 0.0 && m.ascent > 0.0 && m.descent > 0.0 && m.line > 0.0);
         // Doubling px doubles the metrics (linear scale).
-        let m2 = r.cell_metrics(PX * 2.0);
+        let m2 = r.cell_metrics(FontFamily::Grid, PX * 2.0);
         assert!((m2.ascent - m.ascent * 2.0).abs() < 0.01);
     }
 
@@ -231,10 +232,41 @@ mod tests {
     fn bold_and_regular_share_glyph_coverage_shape() {
         // Bold 'M' should still rasterize to a non-empty image (a distinct face).
         let mut r = GlyphRasterizer::new();
-        let gid = r.glyph_id(FaceStyle::Bold, 'M');
+        let gid = r.glyph_id(FontFamily::Grid, FaceStyle::Bold, 'M');
         let g = r
-            .rasterize(FaceStyle::Bold, gid, PX)
+            .rasterize(FontFamily::Grid, FaceStyle::Bold, gid, PX)
             .expect("bold M rasterizes");
         assert!(!g.is_empty());
+    }
+
+    #[test]
+    fn prose_and_ui_resolve_their_families_and_fall_back_for_italics() {
+        // Duo (Prose) and Quattro (UI) load and rasterize, and their synthetic
+        // Italic/BoldItalic collapse to the upright weight (Regular/Bold) rather than
+        // failing - the documented T-4.3 fallback (only Regular+Bold are vendored).
+        let mut r = GlyphRasterizer::new();
+        for family in [FontFamily::Prose, FontFamily::Ui] {
+            // The upright 'm' inks in both proportional families.
+            let gid = r.glyph_id(family, FaceStyle::Regular, 'm');
+            assert_ne!(gid, 0, "{family:?} Regular must map 'm'");
+            assert!(
+                !r.rasterize(family, FaceStyle::Regular, gid, PX)
+                    .expect("rasterizes")
+                    .is_empty(),
+                "{family:?} 'm' has ink"
+            );
+            // Italic -> Regular bytes, BoldItalic -> Bold bytes: same glyph id as the
+            // upright weight it falls back to (the cmap of the resolved face).
+            assert_eq!(
+                r.glyph_id(family, FaceStyle::Italic, 'm'),
+                r.glyph_id(family, FaceStyle::Regular, 'm'),
+                "{family:?} Italic falls back to Regular"
+            );
+            assert_eq!(
+                r.glyph_id(family, FaceStyle::BoldItalic, 'm'),
+                r.glyph_id(family, FaceStyle::Bold, 'm'),
+                "{family:?} BoldItalic falls back to Bold"
+            );
+        }
     }
 }

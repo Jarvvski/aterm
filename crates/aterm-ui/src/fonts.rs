@@ -26,6 +26,38 @@ pub const UI_REGULAR: &[u8] =
     include_bytes!("../../../assets/fonts/iMWritingQuatNerdFont-Regular.ttf");
 pub const UI_BOLD: &[u8] = include_bytes!("../../../assets/fonts/iMWritingQuatNerdFont-Bold.ttf");
 
+/// The bundled TTF bytes for a `(family, face)` - the single source of truth the
+/// rasterizer ([`crate::glyph`]) and the prose shaper ([`crate::prose`]) both route
+/// through, so the register split lives in one place.
+///
+/// The grid family ships all four faces. Prose (Duo) and UI (Quattro) ship only
+/// Regular + Bold, so a synthetic Italic / BoldItalic request collapses to the upright
+/// weight (Italic -> Regular, BoldItalic -> Bold) rather than tofu - real slanted prose
+/// is a later text-polish pass, not a T-4.3 requirement.
+#[must_use]
+pub(crate) fn face_bytes(
+    family: crate::text::FontFamily,
+    face: crate::text::FaceStyle,
+) -> &'static [u8] {
+    use crate::text::{FaceStyle, FontFamily};
+    match family {
+        FontFamily::Grid => match face {
+            FaceStyle::Regular => GRID_REGULAR,
+            FaceStyle::Bold => GRID_BOLD,
+            FaceStyle::Italic => GRID_ITALIC,
+            FaceStyle::BoldItalic => GRID_BOLD_ITALIC,
+        },
+        FontFamily::Prose => match face {
+            FaceStyle::Regular | FaceStyle::Italic => PROSE_REGULAR,
+            FaceStyle::Bold | FaceStyle::BoldItalic => PROSE_BOLD,
+        },
+        FontFamily::Ui => match face {
+            FaceStyle::Regular | FaceStyle::Italic => UI_REGULAR,
+            FaceStyle::Bold | FaceStyle::BoldItalic => UI_BOLD,
+        },
+    }
+}
+
 /// All bundled faces (grid + prose + UI), for callers that want to iterate them
 /// (e.g. a future `FontSystem`-backed proportional path for agent prose - T-3.6 /
 /// T-4.6). The grid renderer uses the typed `GRID_*` constants directly.

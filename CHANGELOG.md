@@ -13,6 +13,19 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Three-register fonts: Duo prose + Quattro chrome over one shared glyph atlas.** The
+  agent-prose register (iM Writing **Duo**, duospace) and the dense-chrome register (iM
+  Writing **Quattro**, four widths) now load and render through a real proportional text
+  path - full swash shaping (clusters, kerning, ligatures where the face carries them)
+  plus greedy word-wrap at the prose measure (`MEASURE_CH` = 72 `ch`, the advance of
+  '0'). The terminal grid stays iM Writing **Mono** and uncapped. The glyph atlas, glyph
+  cache, rasterizer, and glyph GPU pipeline were extracted into a shared `GlyphAtlas` so
+  the grid and prose front-ends share one atlas + one instanced draw pipeline (one
+  shaping engine, two layout front-ends) - the grid's 60fps fast path (zero-alloc
+  steady-state present, single glyph draw call, rasterize-once) is preserved unchanged.
+  Measured Duo/Quattro metrics are documented and the bundled set is confirmed
+  OFL-1.1-clean. Composing prose into the live timeline / agent cards is a follow-up
+  (T-4.6). (Ticket T-4.3.)
 - **Nerd Font icons align in the grid cell (per-codepoint constraint table).** PUA
   icon glyphs - Powerline symbols, Devicons, Font Awesome, Seti, Weather, Octicons,
   Codicons, Pomicons, and Material Design Icons (including the beyond-BMP `U+F0000+`

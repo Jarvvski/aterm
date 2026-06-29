@@ -2,7 +2,7 @@
 id: T-4.3
 epic: EPIC-4-design-system
 title: Bundle Duo/Quattro + three-register font wiring
-status: ready-for-agent
+status: done
 labels: [design, text, fonts]
 depends_on: [T-1.6]
 ---

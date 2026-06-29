@@ -285,18 +285,44 @@ impl FaceStyle {
     }
 }
 
+/// The font family (role) a glyph belongs to - the second axis (besides `face`) of
+/// the atlas cache key. The SAME glyph id means different outlines across families
+/// (Grid Mono vs Prose Duo vs UI Quattro), so without this the three registers would
+/// collide in the atlas. Mirrors [`aterm_tokens::FontRole`]; the token layer owns the
+/// family NAMES, this owns the render-side routing to the bundled face bytes
+/// ([`crate::glyph::GlyphRasterizer`]).
+///
+/// Deliberately has NO `Default`: every [`GlyphKey`] construction must name a family,
+/// so a forgotten field is a compile error rather than a silent `Grid` mis-key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FontFamily {
+    /// Constant-advance terminal grid - `iM Writing Mono NFM`, all four faces.
+    Grid,
+    /// Duospace agent prose - `iM Writing Duo` (Regular + Bold only; Italic falls
+    /// back to Regular, BoldItalic to Bold).
+    Prose,
+    /// Near-proportional dense chrome - `iM Writing Quattro` (Regular + Bold only,
+    /// same italic fallback as Prose).
+    Ui,
+}
+
 /// Atlas cache key. NOTE: there is NO subpixel-offset field. On a constant-advance
 /// grid every glyph lands on an integer cell origin, so there is exactly ONE
-/// subpixel variant per (glyph, face, size) - far fewer than the ~16 a proportional
-/// layout (e.g. GPUI) needs. `px` is the integer pixel size (after the scale
-/// factor) so a Retina vs non-Retina run keys distinct rasterizations.
+/// subpixel variant per (glyph, family, face, size) - far fewer than the ~16 a
+/// proportional layout (e.g. GPUI) needs. The proportional prose path also snaps its
+/// pen to integer pixels (T-4.3), so the single-variant assumption holds there too.
+/// `px` is the integer pixel size (after the scale factor) so a Retina vs non-Retina
+/// run keys distinct rasterizations.
 ///
+/// `family` keeps the three registers (Grid/Prose/Ui) disjoint in one shared atlas;
 /// `sprite` namespaces the procedurally-drawn sprite face (`crate::sprite`,
 /// box-drawing / blocks / braille / Powerline): a sprite keys on its CODEPOINT in
 /// `glyph_id`, which could otherwise collide with a font glyph-id of the same
 /// numeric value, so the flag keeps the two caches disjoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
+    /// The font register (Grid/Prose/Ui) this glyph was rasterized from.
+    pub family: FontFamily,
     pub glyph_id: u16,
     pub face: FaceStyle,
     pub px: u32,
@@ -728,6 +754,7 @@ mod tests {
     fn glyph_cache_rasterizes_each_glyph_once() {
         let mut cache = GlyphCache::new(256, 256);
         let key = GlyphKey {
+            family: FontFamily::Grid,
             glyph_id: 42,
             face: FaceStyle::Regular,
             px: 17,
@@ -759,6 +786,7 @@ mod tests {
     fn glyph_cache_get_returns_hit_without_dimensions() {
         let mut cache = GlyphCache::new(64, 64);
         let key = GlyphKey {
+            family: FontFamily::Grid,
             glyph_id: 7,
             face: FaceStyle::Regular,
             px: 13,
@@ -776,6 +804,7 @@ mod tests {
         // resolve to distinct atlas entries (the `sprite` discriminant, T-4.5).
         let mut cache = GlyphCache::new(64, 64);
         let font = GlyphKey {
+            family: FontFamily::Grid,
             glyph_id: 0x2500,
             face: FaceStyle::Regular,
             px: 13,
@@ -789,6 +818,40 @@ mod tests {
         let rs = cache.get_or_insert(sprite, |_| {}, 5, 9).unwrap();
         assert_ne!(rf, rs, "the sprite flag keys a distinct atlas rect");
         assert_eq!(cache.rasterizations(), 2);
+    }
+
+    #[test]
+    fn glyph_key_family_disjoints_the_three_registers() {
+        // The same glyph id + face + px in different families MUST key distinct atlas
+        // entries (Grid Mono, Prose Duo, and UI Quattro render that id as different
+        // outlines), or the shared atlas would alias one register's glyph onto another.
+        let mut cache = GlyphCache::new(64, 64);
+        let grid = GlyphKey {
+            family: FontFamily::Grid,
+            glyph_id: 42,
+            face: FaceStyle::Regular,
+            px: 14,
+            sprite: false,
+        };
+        let prose = GlyphKey {
+            family: FontFamily::Prose,
+            ..grid
+        };
+        let ui = GlyphKey {
+            family: FontFamily::Ui,
+            ..grid
+        };
+        let rg = cache.get_or_insert(grid, |_| {}, 6, 10).unwrap();
+        let rp = cache.get_or_insert(prose, |_| {}, 6, 10).unwrap();
+        let ru = cache.get_or_insert(ui, |_| {}, 6, 10).unwrap();
+        assert_ne!(rg, rp, "Grid and Prose key distinct atlas rects");
+        assert_ne!(rp, ru, "Prose and UI key distinct atlas rects");
+        assert_ne!(rg, ru, "Grid and UI key distinct atlas rects");
+        assert_eq!(
+            cache.rasterizations(),
+            3,
+            "three families = three rasterizations"
+        );
     }
 
     #[test]

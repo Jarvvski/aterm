@@ -14,6 +14,13 @@
 mod alloc_probe;
 
 pub mod app;
+// The shared glyph atlas + glyph pipeline seam (T-4.3). The module is private. The
+// `GlyphAtlas` TYPE is re-exported below ONLY so the pub `ProseRenderer` can name it in
+// its signatures (like the pub `GridRenderer`); its methods and constructor are all
+// crate-internal, so externally it is an un-constructable opaque shell - the prose
+// render path is driven only from within the crate until the atlas hoists up to the
+// live `GpuRenderer` (T-4.6).
+mod atlas;
 pub mod constraint;
 pub mod fonts;
 pub mod glyph;
@@ -22,6 +29,7 @@ pub mod grid_render;
 pub mod indicator;
 pub mod present;
 pub mod profiling;
+pub mod prose;
 pub mod recorder;
 pub mod renderer;
 pub mod sprite;
@@ -31,20 +39,22 @@ pub mod widgets;
 pub mod window;
 
 pub use app::{run, run_with, AtermApp, HeadlessCallbacks, RenderConfig, UiCallbacks};
+pub use atlas::GlyphAtlas;
 pub use constraint::{Align, Constraint, Placed, Sizing};
 pub use glyph::{CellMetrics, GlyphRasterizer, RasterGlyph};
 pub use gpu::GpuRenderer;
 pub use grid_render::{FrameSize, GridRenderer};
 pub use indicator::IntegrationIndicator;
 pub use present::{DisplayLink, FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
+pub use prose::{measure_px, PositionedGlyph, ProseLayout, ProseRenderer, ProseShaper, MEASURE_CH};
 pub use recorder::{
     FrameRecorder, FrameSample, FrameStats, FrameTiming, Refresh, DEFAULT_CAPACITY,
     DEFAULT_TOLERANCE_MS,
 };
 pub use renderer::{Frame, RenderError, Renderer};
 pub use text::{
-    build_grid_cells, classify_run, is_ascii_fast, resolve_color, AtlasRect, FaceStyle, GlyphCache,
-    GlyphKey, GridCell, RunLayout, ShelfAllocator,
+    build_grid_cells, classify_run, is_ascii_fast, resolve_color, AtlasRect, FaceStyle, FontFamily,
+    GlyphCache, GlyphKey, GridCell, RunLayout, ShelfAllocator,
 };
 pub use timeline::{
     layout as timeline_layout, visible_block_count, GutterMarker, Scroll, TimelineLayout,

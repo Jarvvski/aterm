@@ -99,7 +99,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 |---|---|---|---|
 | T-4.1 | aterm-tokens: semantic tokens + spacing/type scale | done | - |
 | T-4.2 | aterm-tokens: two ANSI-16 palettes + theme switching | done | T-4.1 |
-| T-4.3 | Bundle Duo/Quattro + three-register font wiring | ready-for-agent | T-1.6 |
+| T-4.3 | Bundle Duo/Quattro + three-register font wiring | done | T-1.6 |
 | T-4.4 | Nerd Font per-codepoint constraint table | done | T-1.6 |
 | T-4.5 | Sprite face for box-drawing/Powerline/braille | done | T-1.6 |
 | T-4.6 | Component specs: block, prompt, agent card, chip, risk badge | ready-for-agent | T-4.1, T-2.7 |

@@ -31,7 +31,6 @@
 //! Colors are linearized ([`Rgba::to_linear_f32`]) because the surface is an sRGB
 //! format and the shader output is encoded to sRGB on store, matching the clear.
 
-use std::collections::HashSet;
 use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
@@ -39,14 +38,9 @@ use bytemuck::{Pod, Zeroable};
 use aterm_core::Snapshot;
 use aterm_tokens::{type_scale, Theme};
 
-use crate::glyph::{GlyphRasterizer, RasterGlyph};
-use crate::text::{build_grid_cells, FaceStyle, GlyphCache, GlyphKey, GridCell};
+use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer};
+use crate::text::{build_grid_cells, FaceStyle, FontFamily, GlyphKey, GridCell};
 use crate::window::cell_px;
-
-/// Atlas dimensions (px). 1024² of R8 = 1 MiB, enough for the full ASCII set across
-/// all four faces at Retina sizes many times over. Growth/eviction when it fills is
-/// a follow-up (today a full atlas logs once and drops further new glyphs).
-const ATLAS_DIM: u32 = 1024;
 
 /// Left/top inset of the grid from the surface origin, in LOGICAL px (scaled by the
 /// DPI factor at use). Matches the interim glyphon path's `(8, 8)` offset.
@@ -62,26 +56,6 @@ struct BgInstance {
     color: [f32; 4],
 }
 
-/// A textured glyph-quad instance.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GlyphInstance {
-    /// `[x, y, w, h]` in physical px (the glyph bitmap's placed box).
-    rect: [f32; 4],
-    /// `[u0, v0, u1, v1]` normalized atlas coordinates.
-    uv: [f32; 4],
-    /// Linear RGBA foreground (multiplied by the atlas coverage).
-    color: [f32; 4],
-}
-
-/// Viewport uniform: the surface size in physical px (padded to 16 bytes).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct Viewport {
-    size: [f32; 2],
-    _pad: [f32; 2],
-}
-
 /// The surface geometry for a frame: physical-pixel size + the DPI scale factor.
 /// Bundled so [`GridRenderer::prepare`] stays a tidy call.
 #[derive(Debug, Clone, Copy)]
@@ -91,75 +65,25 @@ pub struct FrameSize {
     pub scale: f32,
 }
 
-/// A growable GPU instance buffer + its CPU capacity in instances.
-struct InstanceBuffer {
-    buf: wgpu::Buffer,
-    cap: usize,
-}
-
-impl InstanceBuffer {
-    fn new(device: &wgpu::Device, label: &str, stride: usize, cap: usize) -> Self {
-        let buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: (stride * cap.max(1)) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        Self {
-            buf,
-            cap: cap.max(1),
-        }
-    }
-
-    /// Ensure room for `count` instances, recreating (growing) the buffer if needed.
-    /// Returns `true` if the buffer was reallocated (the steady state returns
-    /// `false` - no allocation).
-    fn ensure(&mut self, device: &wgpu::Device, label: &str, stride: usize, count: usize) -> bool {
-        if count <= self.cap {
-            return false;
-        }
-        let cap = count.next_power_of_two();
-        self.buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: (stride * cap) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.cap = cap;
-        true
-    }
-}
-
-/// The instanced grid renderer: owns the glyph atlas, the two pipelines, the reused
-/// instance buffers, and the glyph cache + rasterizer. Constructed once from the
+/// The instanced grid renderer: the GRID front-end over the shared [`GlyphAtlas`]. It
+/// owns the bg (solid-quad) pipeline, the grid layout + the reused instance buffers,
+/// and the `(version, viewport, px, theme)` rebuild gate; the glyph atlas/cache/
+/// rasterizer/pipeline are the shared engine it borrows. Constructed once from the
 /// device; `prepare` (per frame, but early-outs when unchanged) builds instances and
-/// `draw` records the two instanced draws into a render pass the caller owns.
+/// `draw` records the bg + the single glyph instanced draw into a caller-owned pass.
 pub struct GridRenderer {
-    // Atlas.
-    atlas: wgpu::Texture,
-    cache: GlyphCache,
-    rasterizer: GlyphRasterizer,
-    /// Glyph placement `(left, top)` per key, paralleling `cache` (the cache stores
-    /// only the atlas rect; placement positions the quad). NOTE: this, the
-    /// `GlyphCache`, and the atlas texture are never cleared today - they grow with
-    /// the set of distinct `(glyph, face, px)` seen, so a DPI/font-size change leaves
-    /// the prior size's glyphs resident. Bounded by the atlas (a full atlas then
-    /// drops new glyphs); eviction + atlas growth is a follow-up (see the `ATLAS_DIM`
-    /// note).
-    placements: std::collections::HashMap<GlyphKey, (i32, i32)>,
-    /// Keys that emit no glyph instance and must not be re-rasterized on every
-    /// rebuild: inkless glyphs (space / `.notdef` with no outline) AND glyphs that
-    /// could not be placed because the atlas is full (the give-up memo).
-    skip_glyphs: HashSet<GlyphKey>,
+    /// The shared glyph engine (atlas texture, cache, rasterizer, glyph pipeline, the
+    /// shared viewport uniform). Owned here for v1; when the prose front-end goes live
+    /// in the timeline (T-4.6) this hoists up to the `GpuRenderer` so both front-ends
+    /// share one atlas.
+    atlas: GlyphAtlas,
 
-    // Pipelines + bindings.
+    /// Background / underline solid-quad pipeline (grid-only; built against
+    /// `atlas.viewport_layout()` so it shares the group(0) viewport).
     bg_pipeline: wgpu::RenderPipeline,
-    glyph_pipeline: wgpu::RenderPipeline,
-    viewport_buf: wgpu::Buffer,
-    viewport_bind: wgpu::BindGroup,
-    atlas_bind: wgpu::BindGroup,
 
-    // Reused CPU + GPU instance storage.
+    // Reused CPU + GPU instance storage (grid-owned: the rebuild gate reuses these
+    // across frames, so nothing else may write them - see the early-out in `prepare`).
     grid_cells: Vec<GridCell>,
     bg_instances: Vec<BgInstance>,
     glyph_instances: Vec<GlyphInstance>,
@@ -173,116 +97,25 @@ pub struct GridRenderer {
     /// Glyph-layer draw calls issued by the last [`Self::draw`] (the T-1.6 AC c
     /// counter: exactly 1 when the grid has any inked cell, else 0).
     last_glyph_draw_calls: u32,
-    atlas_full_logged: bool,
 }
 
 impl GridRenderer {
-    /// Build the pipeline against `format` (the surface's sRGB format).
+    /// Build the grid front-end (its bg pipeline + the shared [`GlyphAtlas`]) against
+    /// `format` (the surface's sRGB format).
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let atlas = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-glyph-atlas"),
-            size: wgpu::Extent3d {
-                width: ATLAS_DIM,
-                height: ATLAS_DIM,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
-        // Nearest, NOT Linear: glyph quads are snapped to integer pixel origins (see
-        // `prepare`) and packed edge-to-edge in the atlas with no gutter, so a 1:1
-        // texel mapping is exact. Linear would interpolate the boundary texels of one
-        // glyph against its atlas NEIGHBOR (a different glyph) and soften the hinted
-        // bitmap; Nearest at integer positions is the conventional crisp choice for a
-        // constant-advance grid (08-text-glyph-rendering.md).
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("aterm-atlas-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
+        let atlas = GlyphAtlas::new(device, format);
 
-        let viewport_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aterm-viewport"),
-            size: size_of::<Viewport>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // group(0): viewport uniform (shared by both pipelines).
-        let viewport_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("aterm-viewport-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let viewport_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("aterm-viewport-bind"),
-            layout: &viewport_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: viewport_buf.as_entire_binding(),
-            }],
-        });
-
-        // group(1): atlas texture + sampler (glyph pipeline only).
-        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("aterm-atlas-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let atlas_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("aterm-atlas-bind"),
-            layout: &atlas_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
+        // The bg pipeline (solid cell-background + underline quads) shares the WGSL
+        // and the group(0) viewport uniform with the glyph pipeline, but is grid-only
+        // and opaque (REPLACE). Build it against the ATLAS's viewport layout so the
+        // shared `atlas.viewport_bind()` validates against both pipelines.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("aterm-grid-shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            label: Some("aterm-bg-shader"),
+            source: wgpu::ShaderSource::Wgsl(crate::atlas::SHADER.into()),
         });
-
-        // Background pipeline: group(0) only, opaque.
         let bg_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("aterm-bg-pl"),
-            bind_group_layouts: &[Some(&viewport_layout)],
+            bind_group_layouts: &[Some(atlas.viewport_layout())],
             immediate_size: 0,
         });
         let bg_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
@@ -316,54 +149,9 @@ impl GridRenderer {
             cache: None,
         });
 
-        // Glyph pipeline: group(0) + group(1), alpha-blended.
-        let glyph_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("aterm-glyph-pl"),
-            bind_group_layouts: &[Some(&viewport_layout), Some(&atlas_layout)],
-            immediate_size: 0,
-        });
-        let glyph_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
-        let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("aterm-glyph-pipeline"),
-            layout: Some(&glyph_pl_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_glyph"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: size_of::<GlyphInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &glyph_attrs,
-                }],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_glyph"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
         Self {
             atlas,
-            cache: GlyphCache::new(ATLAS_DIM, ATLAS_DIM),
-            rasterizer: GlyphRasterizer::new(),
-            placements: std::collections::HashMap::new(),
-            skip_glyphs: HashSet::new(),
             bg_pipeline,
-            glyph_pipeline,
-            viewport_buf,
-            viewport_bind,
-            atlas_bind,
             grid_cells: Vec::new(),
             bg_instances: Vec::new(),
             glyph_instances: Vec::new(),
@@ -376,7 +164,6 @@ impl GridRenderer {
             ),
             built: None,
             last_glyph_draw_calls: 0,
-            atlas_full_logged: false,
         }
     }
 
@@ -391,7 +178,7 @@ impl GridRenderer {
     /// frames once warm - a repeated glyph is never re-rasterized).
     #[must_use]
     pub fn rasterizations(&self) -> u64 {
-        self.cache.rasterizations()
+        self.atlas.rasterizations()
     }
 
     /// Build the frame's instances from `snap`, reusing the prior build when the
@@ -437,7 +224,7 @@ impl GridRenderer {
         let cw_i = cw.round().max(1.0) as u32;
         let ch_i = ch.round().max(1.0) as u32;
         let inset = INSET_LOGICAL * scale;
-        let metrics = self.rasterizer.cell_metrics(px);
+        let metrics = self.atlas.cell_metrics(FontFamily::Grid, px);
         // Center the font's line box in the cell box, then baseline = ascent below
         // the box top.
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
@@ -480,23 +267,25 @@ impl GridRenderer {
                 FaceStyle::from_flags(cell.bold, cell.italic)
             };
             let gkey = GlyphKey {
+                family: FontFamily::Grid,
                 glyph_id: if sprite {
                     cell.ch as u32 as u16 // sprite codepoints are all in the BMP
                 } else {
-                    self.rasterizer.glyph_id(face, cell.ch)
+                    self.atlas.glyph_id(FontFamily::Grid, face, cell.ch)
                 },
                 face,
                 px: px_key,
                 sprite,
             };
-            if self.skip_glyphs.contains(&gkey) {
-                continue;
-            }
-            let slot = match self.cache.get(&gkey) {
-                Some(rect) => Some((rect, self.placements[&gkey])),
-                None if sprite => crate::sprite::render(cell.ch, cw_i, ch_i)
-                    .and_then(|g| self.place_glyph(queue, gkey, &g)),
-                None => self.rasterize_into_atlas(queue, gkey, face, gkey.glyph_id, px),
+            // Acquire the glyph from the shared atlas (a cache hit, or rasterize +
+            // upload once on a miss). The atlas owns the skip-memo and the once-only
+            // guarantee; a sprite codepoint is drawn procedurally into the cell box,
+            // everything else from the font's cmap glyph.
+            let slot = if sprite {
+                self.atlas.acquire_sprite(queue, gkey, cell.ch, cw_i, ch_i)
+            } else {
+                self.atlas
+                    .acquire_font(queue, gkey, FontFamily::Grid, face, gkey.glyph_id, px)
             };
             let Some((rect, (left, top))) = slot else {
                 continue;
@@ -530,7 +319,7 @@ impl GridRenderer {
                     rect.h as f32,
                 )
             };
-            let inv = 1.0 / ATLAS_DIM as f32;
+            let inv = 1.0 / self.atlas.atlas_dim() as f32;
             self.glyph_instances.push(GlyphInstance {
                 rect: [gx, gy, gw, gh],
                 uv: [
@@ -553,7 +342,7 @@ impl GridRenderer {
                 self.bg_instances.len(),
             );
             queue.write_buffer(
-                &self.bg_buf.buf,
+                self.bg_buf.buf(),
                 0,
                 bytemuck::cast_slice(&self.bg_instances),
             );
@@ -566,130 +355,39 @@ impl GridRenderer {
                 self.glyph_instances.len(),
             );
             queue.write_buffer(
-                &self.glyph_buf.buf,
+                self.glyph_buf.buf(),
                 0,
                 bytemuck::cast_slice(&self.glyph_instances),
             );
         }
-        queue.write_buffer(
-            &self.viewport_buf,
-            0,
-            bytemuck::bytes_of(&Viewport {
-                size: [viewport_w as f32, viewport_h as f32],
-                _pad: [0.0, 0.0],
-            }),
-        );
+        // Write the shared viewport uniform (idempotent; a no-op when the surface size
+        // is unchanged). On the CHANGED path only - the early-out above returns before
+        // this, so the zero-alloc steady-state present is untouched.
+        self.atlas.set_viewport(queue, viewport_w, viewport_h);
 
         self.built = Some(key);
         !self.glyph_instances.is_empty() || !self.bg_instances.is_empty()
     }
 
-    /// Rasterize a glyph on a cache miss, upload it into the atlas, and record its
-    /// placement. Inkless glyphs AND glyphs the (full) atlas cannot place are added to
-    /// `skip_glyphs` so they are never re-rasterized on a later rebuild. Returns the
-    /// atlas rect + placement, or `None` if it emits no glyph instance.
-    fn rasterize_into_atlas(
-        &mut self,
-        queue: &wgpu::Queue,
-        gkey: GlyphKey,
-        face: FaceStyle,
-        gid: u16,
-        px: f32,
-    ) -> Option<(crate::text::AtlasRect, (i32, i32))> {
-        let g = self.rasterizer.rasterize(face, gid, px)?;
-        self.place_glyph(queue, gkey, &g)
-    }
-
-    /// Upload an already-rasterized glyph - font OR procedural sprite - into the
-    /// atlas and record its placement. Inkless glyphs AND glyphs the (full) atlas
-    /// cannot place are memoized in `skip_glyphs` so they are never re-rasterized on
-    /// a later rebuild. Returns the atlas rect + placement, or `None` if it emits no
-    /// glyph instance.
-    fn place_glyph(
-        &mut self,
-        queue: &wgpu::Queue,
-        gkey: GlyphKey,
-        g: &RasterGlyph,
-    ) -> Option<(crate::text::AtlasRect, (i32, i32))> {
-        if g.is_empty() {
-            self.skip_glyphs.insert(gkey);
-            return None;
-        }
-        let atlas = &self.atlas;
-        let rect = self.cache.get_or_insert(
-            gkey,
-            |rect| upload_glyph(queue, atlas, rect, &g.coverage),
-            g.width,
-            g.height,
-        );
-        let Some(rect) = rect else {
-            // Atlas full: memoize the give-up so this glyph is not re-rasterized every
-            // rebuild (it cannot be placed until eviction/growth lands).
-            self.skip_glyphs.insert(gkey);
-            if !self.atlas_full_logged {
-                log::warn!("glyph atlas full; new glyphs will not render (growth is a follow-up)");
-                self.atlas_full_logged = true;
-            }
-            return None;
-        };
-        self.placements.insert(gkey, (g.left, g.top));
-        Some((rect, (g.left, g.top)))
-    }
-
     /// Record the grid draws into `pass` (which the caller has begun with the canvas
-    /// clear). Background first (opaque), then the single glyph draw (alpha-blended).
+    /// clear). Background first (opaque), then the single glyph draw (alpha-blended)
+    /// through the shared atlas. The glyph layer is EXACTLY ONE instanced draw call
+    /// (T-1.6 AC c); the counter stays here because the atlas cannot know its caller.
     pub fn draw(&mut self, pass: &mut wgpu::RenderPass<'_>) {
         if !self.bg_instances.is_empty() {
             pass.set_pipeline(&self.bg_pipeline);
-            pass.set_bind_group(0, &self.viewport_bind, &[]);
-            pass.set_vertex_buffer(0, self.bg_buf.buf.slice(..));
+            pass.set_bind_group(0, self.atlas.viewport_bind(), &[]);
+            pass.set_vertex_buffer(0, self.bg_buf.buf().slice(..));
             pass.draw(0..6, 0..self.bg_instances.len() as u32);
         }
         if self.glyph_instances.is_empty() {
             self.last_glyph_draw_calls = 0;
         } else {
-            pass.set_pipeline(&self.glyph_pipeline);
-            pass.set_bind_group(0, &self.viewport_bind, &[]);
-            pass.set_bind_group(1, &self.atlas_bind, &[]);
-            pass.set_vertex_buffer(0, self.glyph_buf.buf.slice(..));
-            pass.draw(0..6, 0..self.glyph_instances.len() as u32);
+            self.atlas
+                .draw_glyphs(pass, &self.glyph_buf, self.glyph_instances.len());
             self.last_glyph_draw_calls = 1;
         }
     }
-}
-
-/// Upload one glyph's coverage bytes into the atlas at `rect`. `write_texture` has no
-/// 256-byte row-alignment requirement (that constraint is only for buffer copies),
-/// so the tight `bytes_per_row = rect.w` upload is valid.
-fn upload_glyph(
-    queue: &wgpu::Queue,
-    atlas: &wgpu::Texture,
-    rect: crate::text::AtlasRect,
-    coverage: &[u8],
-) {
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: atlas,
-            mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: rect.x,
-                y: rect.y,
-                z: 0,
-            },
-            aspect: wgpu::TextureAspect::All,
-        },
-        coverage,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(rect.w),
-            rows_per_image: Some(rect.h),
-        },
-        wgpu::Extent3d {
-            width: rect.w,
-            height: rect.h,
-            depth_or_array_layers: 1,
-        },
-    );
 }
 
 /// A stable hash over every theme color the build reads (canvas, primary + muted
@@ -710,74 +408,6 @@ fn theme_signature(theme: &Theme) -> u64 {
     }
     h
 }
-
-const SHADER: &str = r#"
-struct Viewport { size: vec2<f32>, _pad: vec2<f32> };
-@group(0) @binding(0) var<uniform> viewport: Viewport;
-
-fn corner(vi: u32) -> vec2<f32> {
-    var c = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
-    );
-    return c[vi];
-}
-
-fn to_clip(px: vec2<f32>) -> vec4<f32> {
-    let ndc = vec2<f32>(px.x / viewport.size.x * 2.0 - 1.0,
-                        1.0 - px.y / viewport.size.y * 2.0);
-    return vec4<f32>(ndc, 0.0, 1.0);
-}
-
-// --- Background / solid quads ---
-struct BgIn { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32> };
-struct BgOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
-
-@vertex
-fn vs_bg(@builtin(vertex_index) vi: u32, inst: BgIn) -> BgOut {
-    var out: BgOut;
-    let c = corner(vi);
-    out.pos = to_clip(inst.rect.xy + c * inst.rect.zw);
-    out.color = inst.color;
-    return out;
-}
-
-@fragment
-fn fs_solid(in: BgOut) -> @location(0) vec4<f32> {
-    return in.color;
-}
-
-// --- Glyph quads ---
-struct GIn {
-    @location(0) rect: vec4<f32>,
-    @location(1) uv: vec4<f32>,
-    @location(2) color: vec4<f32>,
-};
-struct GOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
-};
-
-@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
-@group(1) @binding(1) var atlas_samp: sampler;
-
-@vertex
-fn vs_glyph(@builtin(vertex_index) vi: u32, inst: GIn) -> GOut {
-    var out: GOut;
-    let c = corner(vi);
-    out.pos = to_clip(inst.rect.xy + c * inst.rect.zw);
-    out.uv = mix(inst.uv.xy, inst.uv.zw, c);
-    out.color = inst.color;
-    return out;
-}
-
-@fragment
-fn fs_glyph(in: GOut) -> @location(0) vec4<f32> {
-    let a = textureSample(atlas_tex, atlas_samp, in.uv).r;
-    return vec4<f32>(in.color.rgb, in.color.a * a);
-}
-"#;
 
 // The instanced pipeline draws to a real GPU, so its correctness is verified by
 // rendering to an offscreen texture and reading the pixels back. These tests need a
