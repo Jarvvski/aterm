@@ -2,7 +2,7 @@
 id: T-4.4
 epic: EPIC-4-design-system
 title: Nerd Font per-codepoint constraint table
-status: ready-for-agent
+status: done
 labels: [text, fonts, render]
 depends_on: [T-1.6]
 ---

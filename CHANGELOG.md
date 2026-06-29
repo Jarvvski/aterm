@@ -13,6 +13,16 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Nerd Font icons align in the grid cell (per-codepoint constraint table).** PUA
+  icon glyphs - Powerline symbols, Devicons, Font Awesome, Seti, Weather, Octicons,
+  Codicons, Pomicons, and Material Design Icons (including the beyond-BMP `U+F0000+`
+  range) - are now scaled and centered to fit the terminal cell instead of rendering
+  small, squished, or off-cell at the font's native size, and the Powerline-extra
+  separators stretch edge-to-edge so they tile seamlessly. Each codepoint is matched
+  to a fit-and-center or stretch-to-fill directive grounded in the bundled face's
+  actual charset; box-drawing, blocks, braille, and the Powerline triangles stay with
+  the procedural sprite face. Ordinary text placement is unchanged and the
+  steady-state frame build stays allocation-free. (Ticket T-4.4.)
 - **Procedural sprite face for box-drawing, blocks, braille, and Powerline.** Box
   lines/corners/junctions (`U+2500..` light + heavy), block elements + quadrants +
   shades (`U+2580..259F`), the full braille dot matrix (`U+2800..28FF`), and the

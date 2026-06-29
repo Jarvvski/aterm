@@ -504,19 +504,35 @@ impl GridRenderer {
             // Snap the glyph quad to integer pixels so the hinted bitmap maps 1:1 to
             // texels under the Nearest sampler (crisp, no inter-glyph bleed). The cell
             // origin is fractional (cw is ~7.8px), so without this the quad would
-            // straddle pixel boundaries. A sprite fills the cell box, so it is placed
-            // at the cell origin (its left/top are 0); a font glyph is baseline-relative.
-            let (gx, gy) = if sprite {
-                (cell_x.round(), cell_y.round())
+            // straddle pixel boundaries.
+            //
+            // Three placements:
+            //  - a sprite fills the cell box, placed at the cell origin (left/top 0);
+            //  - a Nerd Font icon (PUA) is scaled/centered/stretched into the cell per
+            //    its constraint (T-4.4), replacing the font's often small/off-cell
+            //    native placement;
+            //  - an ordinary font glyph is baseline-relative at its natural size.
+            let (gx, gy, gw, gh) = if sprite {
+                (cell_x.round(), cell_y.round(), rect.w as f32, rect.h as f32)
+            } else if let Some(con) = crate::constraint::lookup(cell.ch) {
+                let p = con.place(rect.w as f32, rect.h as f32, cw_cell, ch);
+                (
+                    (cell_x + p.x).round(),
+                    (cell_y + p.y).round(),
+                    p.w.round().max(1.0),
+                    p.h.round().max(1.0),
+                )
             } else {
                 (
                     (cell_x + left as f32).round(),
                     (cell_y + baseline_off - top as f32).round(),
+                    rect.w as f32,
+                    rect.h as f32,
                 )
             };
             let inv = 1.0 / ATLAS_DIM as f32;
             self.glyph_instances.push(GlyphInstance {
-                rect: [gx, gy, rect.w as f32, rect.h as f32],
+                rect: [gx, gy, gw, gh],
                 uv: [
                     rect.x as f32 * inv,
                     rect.y as f32 * inv,
@@ -1232,6 +1248,46 @@ mod gpu_tests {
         assert!(
             !rb.any_chan(cx - 1, cy0, cx + 2, cy1, 0, 20),
             "the blank cell's center stays clear (no atlas-neighbor bleed)"
+        );
+    }
+
+    #[test]
+    fn nerd_font_icons_are_constrained_into_the_cell() {
+        // T-4.4: a Nerd Font PUA icon is scaled + centered into the cell by the
+        // constraint table (not left at the font's small/off-cell native placement),
+        // and a Material Design icon in the SMP PUA (beyond the BMP) resolves and
+        // rasterizes WITHOUT panic - the ticket's headline edge case. This test
+        // presupposes the bundled face covers U+F015 and U+F0001 (it does); the
+        // font-free `constraint::tests` cover the no-panic AC independently of the font.
+        let Some((device, queue, format)) = device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = target_size(4, 1);
+        let white = CellColor::Rgb(255, 255, 255);
+        let canvas_bg = CellColor::Named(257); // theme canvas -> skipped, stays black clear
+        let (x0, y0, x1, y1) = cell_box(0, 0, false);
+
+        // BMP icon (Font Awesome "home", U+F015): inks the cell's central box,
+        // proving the constraint scaled + centered it.
+        let mut grid = GridRenderer::new(&device, format);
+        let snap = one_cell(4, '\u{F015}', white, canvas_bg, false);
+        let rb = render(&device, &queue, &mut grid, &snap, w, h);
+        let (bx0, bx1) = (x0 + (x1 - x0) / 4, x1 - (x1 - x0) / 4);
+        let (by0, by1) = (y0 + (y1 - y0) / 4, y1 - (y1 - y0) / 4);
+        assert!(
+            rb.any_chan(bx0, by0, bx1, by1, 0, 40),
+            "a PUA icon is scaled + centered into the cell (inks the centre box)"
+        );
+
+        // SMP icon (Material Design, U+F0001, beyond the BMP): must render without
+        // panic and reach the atlas (some ink in the cell).
+        let mut grid2 = GridRenderer::new(&device, format);
+        let snap2 = one_cell(4, '\u{F0001}', white, canvas_bg, false);
+        let rb2 = render(&device, &queue, &mut grid2, &snap2, w, h);
+        assert!(
+            rb2.any_chan(x0, y0, x1, y1, 0, 30),
+            "a beyond-BMP MDI icon resolves, rasterizes, and inks the cell (no panic)"
         );
     }
 }
