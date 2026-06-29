@@ -2,7 +2,7 @@
 id: T-5.2
 epic: EPIC-5-agent-loop-safety
 title: AnthropicProvider (Messages API, SSE, adaptive thinking)
-status: ready-for-agent
+status: done
 labels: [agent, llm, anthropic]
 depends_on: [T-5.1]
 ---
@@ -38,3 +38,61 @@ Implement the thin typed Anthropic Messages-API client behind `LlmProvider`: HTT
 
 - OpenAI (T-5.3), the turn loop (T-5.8), tool execution (T-5.9).
 - API-key custody (T-8.3) - the client takes a key from a provided source.
+
+# Notes
+
+**Landed 2026-06-29.** Real Messages-API client in `aterm-agent::provider::anthropic`
+(`provider.rs` declares `pub mod anthropic`; the OpenAI stub stays in `provider.rs`
+for T-5.3). All five ACs met with headless tests; no on-hardware/visual residual,
+so genuinely `done`. No real network in any test - the pure SSE pieces are driven
+from byte fixtures and the HTTP path from a loopback `std::net` mock server (never
+`api.anthropic.com`).
+
+Surface:
+
+- `build_body` serializes a neutral `TurnRequest` into the wire JSON: `model`,
+  required `max_tokens`, `stream:true`, `messages`, `thinking:{type:"adaptive",
+  display:"summarized"}`, `output_config:{effort}`, optional top-level `system`,
+  and (only when tools are present) `tools` with `strict:true` as a SIBLING of
+  name/description/input_schema plus `tool_choice:{type:"auto"}`. `budget_tokens`
+  is NEVER emitted (a guard test asserts the whole serialized body lacks it).
+- SSE decode is split into pure, testable pieces: `SseDecoder` (a byte-buffering
+  event framer) and `StreamState` (the SSE-event -> `ProviderEvent` reducer that
+  also reconstructs the assistant `content` array for resume). The neutral
+  `ProviderEvent` sequence from T-5.1 is preserved exactly; the shared
+  `AgentEventMapper` is unchanged.
+- `pause_turn` is resumed by RE-SENDING with the accumulated assistant content
+  appended as an assistant message (NOT a synthetic "continue" user message),
+  bounded by `max_resumes`; the paused hop's `MessageDelta`/`MessageStop` and the
+  resumed hop's duplicate `MessageStart` are suppressed so the consumer sees ONE
+  continuous turn.
+- HTTP errors map to `ProviderError`: 401/403 -> `Auth`, other non-2xx -> `Http`,
+  SSE JSON parse failure -> `Decode`. `Debug` for the provider redacts the key.
+
+Decisions / divergences (additive extensions to T-5.1's neutral surface, same
+pattern as T-5.4's `ToolSpec.strict` - not a relitigation):
+
+1. `Message.content` `String` -> `Vec<ContentBlock>`, with a new `ContentBlock`
+   enum (`Text`/`ToolUse`/`ToolResult`) and `Message::{user,assistant,system,
+   assistant_blocks,tool_results}` constructors. The thin string content could not
+   carry the `tool_use`/`tool_result` blocks (keyed by id) that AC #2 requires.
+   Low-churn: `Message` was only ever constructed as `messages: vec![]`.
+2. Added `TurnRequest.max_tokens: u32` (the Messages API requires `max_tokens`;
+   OpenAI will map it to `max_output_tokens`) and `Effort::as_str()`.
+3. The Anthropic client owns PRIVATE wire mapping (`build_body`/`wire_message`/
+   `wire_block`); the neutral `TurnRequest`/`Message`/`ContentBlock` stay
+   provider-agnostic so T-5.3 reuses them.
+
+Adversarial review (3 lenses, find -> verify): 9 raw findings, 2 distinct
+confirmed and fixed before landing - (a) per-chunk `from_utf8_lossy` corrupted a
+multibyte codepoint split across a `reqwest::chunk()` boundary (incl. tool-input
+JSON); fixed by buffering RAW BYTES and decoding only complete blank-line-delimited
+event blocks (regression test splits a chunk mid-codepoint). (b) token usage reset
+each pause/resume hop; fixed by folding `output_tokens` across hops while keeping
+the first hop's input/cache count (a resume re-sends context, so summing input
+would double-count) - asserted in the pause test.
+
+15 anthropic-module tests (141 in `aterm-agent`, 414 workspace-wide; clippy `-D
+warnings` clean). No version bump / CHANGELOG: internal plumbing, providers not yet
+wired into the running app (turn loop is T-5.8, app wiring T-5.9+), no user-visible
+behavior. Unblocks T-5.8 (turn loop) and T-6.1 (MCP connector).

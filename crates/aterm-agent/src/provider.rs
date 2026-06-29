@@ -13,10 +13,11 @@
 //!    streamed input JSON and emits one complete [`AgentEvent::ToolProposed`]
 //!    per call.
 //!
-//! The real HTTP clients are T-5.2/T-5.3; here [`AnthropicProvider`] and
-//! [`OpenAiProvider`] are compiling stubs that return `NotImplemented` and make
-//! NO network calls, plus a scriptable [`MockProvider`] the turn loop and tests
-//! drive.
+//! [`AnthropicProvider`] (the default) is the real Messages-API client - it
+//! lives in [`anthropic`] (T-5.2); [`OpenAiProvider`] is still a compiling stub
+//! that returns `NotImplemented` and makes NO network calls (the real Responses
+//! client is T-5.3). A scriptable [`MockProvider`] drives the turn loop and tests
+//! with no network.
 //!
 //! Divergences from the Kotlin prototype (deliberate, per aterm's locked
 //! decisions): the prototype models a SINGLE tool (`propose_command` ->
@@ -28,11 +29,128 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-/// One message in a conversation, provider-neutral.
+pub mod anthropic;
+
+pub use anthropic::AnthropicProvider;
+
+/// One message in a conversation, provider-neutral. Content is a list of typed
+/// [`ContentBlock`]s so an agentic history can carry assistant `tool_use` blocks
+/// and the matching user `tool_result` blocks (each block keyed by id), not just
+/// plain text. A provider client maps these onto its own wire shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
-    pub content: String,
+    pub content: Vec<ContentBlock>,
+}
+
+impl Message {
+    /// A plain-text user message.
+    #[must_use]
+    pub fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
+    /// A plain-text assistant message.
+    #[must_use]
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
+    /// An inline operator/system message (the non-spoofable operator channel).
+    #[must_use]
+    pub fn system(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
+    /// An assistant message made of arbitrary content blocks (e.g. text plus the
+    /// `tool_use` blocks it emitted).
+    #[must_use]
+    pub fn assistant_blocks(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content,
+        }
+    }
+
+    /// One user message carrying ALL of a round's tool results. The turn loop
+    /// builds exactly one of these per tool-use round (the provider maps it to a
+    /// single `user` message with every `tool_result` block - the shape the
+    /// Messages API requires).
+    #[must_use]
+    pub fn tool_results(results: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: results,
+        }
+    }
+}
+
+/// A typed piece of a [`Message`]'s content, provider-neutral. Mirrors the small
+/// set of Anthropic content-block types the agent loop produces and consumes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    /// Assistant or user prose.
+    Text { text: String },
+    /// A tool call the assistant emitted (echoed back verbatim when continuing a
+    /// turn so the model sees its own prior action).
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// The result of executing a tool, keyed to its `tool_use` by id. A failed
+    /// tool sets `is_error` rather than being dropped.
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+impl ContentBlock {
+    /// A text block.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        ContentBlock::Text { text: text.into() }
+    }
+
+    /// A tool-use block.
+    #[must_use]
+    pub fn tool_use(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+        }
+    }
+
+    /// A tool-result block.
+    #[must_use]
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +198,20 @@ pub enum Effort {
     High,
     Xhigh,
     Max,
+}
+
+impl Effort {
+    /// The wire token for this effort level (Anthropic `output_config.effort`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
 }
 
 /// Token accounting for one turn, provider-neutral. Fields default to `0` when a
@@ -313,6 +445,9 @@ pub struct TurnRequest {
     pub tools: Vec<ToolSpec>,
     /// Adaptive-thinking effort knob (the provider maps it to its own param).
     pub effort: Effort,
+    /// Hard cap on output tokens for this turn. The Anthropic Messages API
+    /// REQUIRES `max_tokens`; OpenAI maps it to `max_output_tokens`.
+    pub max_tokens: u32,
 }
 
 /// Errors a provider can return. Never panics for "not implemented".
@@ -388,53 +523,6 @@ impl LlmProvider for MockProvider {
             }
         }
         Ok(())
-    }
-}
-
-/// Anthropic provider. STUB - returns `NotImplemented`, makes no network calls.
-/// The real Messages-API client is T-5.2.
-#[derive(Debug, Clone)]
-pub struct AnthropicProvider {
-    /// API key (held but unused until T-5.2).
-    _api_key: String,
-    client: reqwest::Client,
-}
-
-impl AnthropicProvider {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            _api_key: api_key.into(),
-            client: reqwest::Client::new(),
-        }
-    }
-
-    /// Borrow the configured HTTP client (kept so the type is wired for T-5.2).
-    #[must_use]
-    pub fn http(&self) -> &reqwest::Client {
-        &self.client
-    }
-}
-
-impl LlmProvider for AnthropicProvider {
-    fn name(&self) -> &'static str {
-        "anthropic"
-    }
-
-    fn default_model(&self) -> &'static str {
-        "claude-opus-4-8"
-    }
-
-    async fn stream_turn(
-        &self,
-        _request: TurnRequest,
-        _sink: mpsc::Sender<ProviderEvent>,
-    ) -> Result<(), ProviderError> {
-        // TODO(T-5.2): POST /v1/messages with stream=true, translate SSE
-        // (`content_block_delta` thinking/text, `tool_use` blocks, `message_delta`
-        // stop_reason/usage) into ProviderEvent, and loop on `tool_use`.
-        Err(ProviderError::NotImplemented(
-            "AnthropicProvider::stream_turn - Messages API client is T-5.2",
-        ))
     }
 }
 
@@ -806,6 +894,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             effort: Effort::Medium,
+            max_tokens: 1024,
         };
         let handle = tokio::spawn(async move { provider.stream_turn(req, tx).await });
         let mut got = Vec::new();
@@ -814,23 +903,6 @@ mod tests {
         }
         handle.await.unwrap().unwrap();
         assert_eq!(got, script);
-    }
-
-    #[tokio::test]
-    async fn anthropic_stub_returns_not_implemented() {
-        let p = AnthropicProvider::new("sk-test");
-        assert_eq!(p.name(), "anthropic");
-        assert_eq!(p.default_model(), "claude-opus-4-8");
-        let (tx, _rx) = mpsc::channel(4);
-        let req = TurnRequest {
-            model: p.default_model().to_string(),
-            system: None,
-            messages: vec![],
-            tools: vec![],
-            effort: Effort::High,
-        };
-        let err = p.stream_turn(req, tx).await.unwrap_err();
-        assert!(matches!(err, ProviderError::NotImplemented(_)));
     }
 
     #[tokio::test]
@@ -843,7 +915,36 @@ mod tests {
             messages: vec![],
             tools: vec![],
             effort: Effort::Low,
+            max_tokens: 1024,
         };
         assert!(p.stream_turn(req, tx).await.is_err());
+    }
+
+    #[test]
+    fn effort_levels_map_to_wire_tokens() {
+        assert_eq!(Effort::Low.as_str(), "low");
+        assert_eq!(Effort::Medium.as_str(), "medium");
+        assert_eq!(Effort::High.as_str(), "high");
+        assert_eq!(Effort::Xhigh.as_str(), "xhigh");
+        assert_eq!(Effort::Max.as_str(), "max");
+    }
+
+    #[test]
+    fn message_constructors_build_typed_content_blocks() {
+        assert_eq!(
+            Message::user("hi").content,
+            vec![ContentBlock::Text { text: "hi".into() }]
+        );
+        let results =
+            Message::tool_results(vec![ContentBlock::tool_result("toolu_1", "ok", false)]);
+        assert_eq!(results.role, Role::Tool);
+        assert_eq!(
+            results.content,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".into(),
+                content: "ok".into(),
+                is_error: false,
+            }]
+        );
     }
 }

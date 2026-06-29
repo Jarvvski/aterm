@@ -117,22 +117,43 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{AnthropicProvider, Effort};
+    use crate::provider::{Effort, MockProvider};
 
-    fn req(p: &AnthropicProvider) -> TurnRequest {
+    fn req() -> TurnRequest {
         TurnRequest {
-            model: p.default_model().to_string(),
+            model: "claude-opus-4-8".to_string(),
             system: None,
             messages: vec![],
             tools: vec![],
             effort: Effort::Medium,
+            max_tokens: 1024,
+        }
+    }
+
+    /// A provider that fails WITHOUT any network I/O, so the turn loop's
+    /// error-forwarding path is exercised offline.
+    struct FailProvider;
+
+    impl LlmProvider for FailProvider {
+        fn name(&self) -> &'static str {
+            "fail"
+        }
+        fn default_model(&self) -> &'static str {
+            "fail-model"
+        }
+        async fn stream_turn(
+            &self,
+            _request: TurnRequest,
+            _sink: mpsc::Sender<ProviderEvent>,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::Http("boom".into()))
         }
     }
 
     #[test]
     fn dangerous_command_needs_confirm_regardless_of_model_claim() {
         let secrets = Secrets::new();
-        let provider = AnthropicProvider::new("sk-test");
+        let provider = MockProvider::new(vec![]);
         let turn = AgentTurn::new(&provider, &secrets);
         // Even if a model claimed this was "safe", the deterministic gate wins.
         // `rm -rf ~` is shell-active (the `~`) AND a recursive-force removal.
@@ -147,7 +168,7 @@ mod tests {
     #[test]
     fn safe_command_auto_runs() {
         let secrets = Secrets::new();
-        let provider = AnthropicProvider::new("sk-test");
+        let provider = MockProvider::new(vec![]);
         let turn = AgentTurn::new(&provider, &secrets);
         assert_eq!(
             turn.disposition_for_command("ls -la"),
@@ -163,7 +184,7 @@ mod tests {
         let mut secrets = Secrets::new();
         secrets.add_sensitive_path("vault-keys");
         secrets.add_value("sk-live-DRIFT-CANARY-0987654321");
-        let provider = AnthropicProvider::new("sk-test");
+        let provider = MockProvider::new(vec![]);
         let turn = AgentTurn::new(&provider, &secrets);
 
         // Gate side: `cat vault-keys` would be Safe (cat is inert, no shell-active
@@ -191,20 +212,20 @@ mod tests {
     fn observation_is_sanitized() {
         let mut secrets = Secrets::new();
         secrets.add_value("sk-secret-value-xyz");
-        let provider = AnthropicProvider::new("sk-test");
+        let provider = MockProvider::new(vec![]);
         let turn = AgentTurn::new(&provider, &secrets);
         let clean = turn.sanitize_observation("token=sk-secret-value-xyz done", None);
         assert!(!clean.contains("sk-secret-value-xyz"));
     }
 
     #[tokio::test]
-    async fn stub_provider_completes_without_panic() {
+    async fn provider_error_is_surfaced_without_panic() {
         let secrets = Secrets::new();
-        let provider = AnthropicProvider::new("sk-test");
+        let provider = FailProvider;
         let turn = AgentTurn::new(&provider, &secrets);
         let (etx, mut erx) = mpsc::channel(16);
-        let result = turn.run(req(&provider), etx).await;
-        // Stub provider → NotImplemented error surfaced, no panic.
+        let result = turn.run(req(), etx).await;
+        // Provider error surfaced as an event + returned, no panic.
         assert!(result.is_err());
         // An error event was emitted.
         let mut saw_error = false;

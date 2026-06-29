@@ -108,7 +108,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | id | title | status | depends_on |
 |---|---|---|---|
 | T-5.1 | LlmProvider trait + provider-neutral event model | done | - |
-| T-5.2 | AnthropicProvider (Messages API, SSE, adaptive thinking) | ready-for-agent | T-5.1 |
+| T-5.2 | AnthropicProvider (Messages API, SSE, adaptive thinking) | done | T-5.1 |
 | T-5.3 | OpenAiProvider (Responses API) | ready-for-agent | T-5.1 |
 | T-5.4 | Typed tool definitions (run_command/read_file/edit_file/...) | done | T-5.1 |
 | T-5.5 | Deterministic risk gate (zsh-aware argv parse) | done | - |
