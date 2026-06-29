@@ -3,9 +3,10 @@
 //! Depends on `aterm-core`. The SAFETY SPINE is implemented for real and tested
 //! hard ([`command`], [`risk`], [`secrets`], [`sanitizer`], [`policy`],
 //! [`sandbox`]); the typed custom tool set + registry + dispatch seam live in
-//! [`tools`]; the LLM provider clients are compiling stubs that return errors and
-//! make no network calls ([`provider`]), and the turn loop is a plan→act→observe
-//! skeleton over them ([`turn`]).
+//! [`tools`]; the Anthropic provider is the real Messages-API client and the
+//! OpenAI provider is a compiling stub ([`provider`]); and the shared,
+//! provider-neutral agentic turn loop drives either provider plan->act->observe,
+//! gating every tool call through the safety spine ([`turn`]).
 //!
 //! Design invariant: NEVER trust a model's self-reported risk. Every command a
 //! model proposes is re-classified locally by [`risk::DefaultRiskClassifier`]
@@ -39,4 +40,6 @@ pub use tools::{
     EditFile, Glob, Grep, ListDir, ReadFile, RunCommand, ToolDispatch, ToolError, ToolInput,
     ToolKind, ToolOutcome, ToolRegistry, WriteFile,
 };
-pub use turn::{AgentTurn, ConfirmDecision, ToolDisposition};
+pub use turn::{
+    AgentTurn, CancelToken, ConfirmDecision, ConfirmHandler, ToolDisposition, TurnOutcome,
+};

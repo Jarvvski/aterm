@@ -26,6 +26,8 @@
 //! Thinking deltas are modeled here (the prototype dropped them) because the
 //! T-5.1 acceptance criteria require the timeline to render thinking.
 
+use std::sync::{Arc, Mutex};
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -324,6 +326,15 @@ pub enum AgentEvent {
     /// A tool finished; carries the (already-sanitized) result text. Emitted by
     /// the turn loop, not the mapper.
     ToolResult { id: String, output: String },
+    /// A tool call the model emitted whose streamed input JSON was malformed (e.g.
+    /// a truncated stream). Carries the originating `tool_use` id so the turn loop
+    /// can feed an `is_error` tool_result back keyed to it - the call is surfaced
+    /// and recoverable, never silently dropped.
+    ToolProposalFailed {
+        id: String,
+        name: String,
+        error: String,
+    },
     /// Final token usage for the turn.
     Usage(Usage),
     /// The turn ended; carries the neutral stop reason so the turn loop can
@@ -412,8 +423,9 @@ impl AgentEventMapper {
 }
 
 /// Parse a finished tool's buffered JSON into a [`AgentEvent::ToolProposed`].
-/// A blank buffer means a no-argument tool (`{}`); a malformed buffer surfaces
-/// as an [`AgentEvent::Error`] rather than silently dropping the call.
+/// A blank buffer means a no-argument tool (`{}`); a malformed buffer surfaces as
+/// an [`AgentEvent::ToolProposalFailed`] (carrying the call's id so the turn loop
+/// can feed an `is_error` tool_result back) rather than silently dropping the call.
 fn flush_tool(t: OpenTool) -> Vec<AgentEvent> {
     let trimmed = t.json.trim();
     let input: serde_json::Value = if trimmed.is_empty() {
@@ -422,10 +434,11 @@ fn flush_tool(t: OpenTool) -> Vec<AgentEvent> {
         match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                return vec![AgentEvent::Error(format!(
-                    "tool `{}` (id {}): malformed input JSON: {e}",
-                    t.name, t.id
-                ))];
+                return vec![AgentEvent::ToolProposalFailed {
+                    id: t.id,
+                    name: t.name,
+                    error: format!("malformed input JSON: {e}"),
+                }];
             }
         }
     };
@@ -482,23 +495,61 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<(), ProviderError>;
 }
 
-/// A provider that replays a scripted [`ProviderEvent`] sequence with no
-/// network. The turn loop's tests (and T-5.8) drive the shared loop with this.
+/// A provider that replays scripted [`ProviderEvent`] sequences with no network -
+/// one script per round. The turn loop (T-5.8) calls [`stream_turn`](LlmProvider::stream_turn)
+/// once per provider round, so a multi-round agentic loop is driven by
+/// [`MockProvider::scripted`] with one script per round; it also records every
+/// [`TurnRequest`] it receives so a test can assert the follow-up request shape
+/// (the `tool_result` round-trip).
 #[derive(Debug, Clone)]
 pub struct MockProvider {
     name: &'static str,
     model: &'static str,
-    script: Vec<ProviderEvent>,
+    scripts: Vec<Vec<ProviderEvent>>,
+    /// Which script the NEXT `stream_turn` call replays (shared so a `Clone`
+    /// observes the same progress). Interior-mutable because `stream_turn` is
+    /// `&self`.
+    cursor: Arc<Mutex<usize>>,
+    /// Every request received, in call order.
+    requests: Arc<Mutex<Vec<TurnRequest>>>,
 }
 
 impl MockProvider {
+    /// Replay a SINGLE round's script (back-compat). For a multi-round agentic
+    /// loop use [`MockProvider::scripted`].
     #[must_use]
     pub fn new(script: Vec<ProviderEvent>) -> Self {
+        Self::scripted(vec![script])
+    }
+
+    /// Replay one script per round, in order. When the loop asks for more rounds
+    /// than were scripted, the extra calls send NOTHING (the channel just closes),
+    /// which the turn loop reads as an empty `end_turn` round - so a mis-scripted
+    /// test terminates instead of looping forever.
+    #[must_use]
+    pub fn scripted(scripts: Vec<Vec<ProviderEvent>>) -> Self {
         Self {
             name: "mock",
             model: "mock-model",
-            script,
+            scripts,
+            cursor: Arc::new(Mutex::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Override the reported provider name + model (to prove the shared loop is
+    /// provider-neutral - the same loop driving two distinct identities).
+    #[must_use]
+    pub fn with_identity(mut self, name: &'static str, model: &'static str) -> Self {
+        self.name = name;
+        self.model = model;
+        self
+    }
+
+    /// The [`TurnRequest`]s this mock has received, in call order.
+    #[must_use]
+    pub fn requests(&self) -> Vec<TurnRequest> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -513,13 +564,24 @@ impl LlmProvider for MockProvider {
 
     async fn stream_turn(
         &self,
-        _request: TurnRequest,
+        request: TurnRequest,
         sink: mpsc::Sender<ProviderEvent>,
     ) -> Result<(), ProviderError> {
-        for event in &self.script {
-            // Stop early if the receiver was dropped (turn aborted/cancelled).
-            if sink.send(event.clone()).await.is_err() {
-                break;
+        self.requests.lock().unwrap().push(request);
+        let idx = {
+            let mut cursor = self.cursor.lock().unwrap();
+            let i = *cursor;
+            *cursor += 1;
+            i
+        };
+        // An exhausted script (idx out of range) sends nothing; the loop reads the
+        // closed channel as an empty `end_turn` round.
+        if let Some(script) = self.scripts.get(idx) {
+            for event in script {
+                // Stop early if the receiver was dropped (turn aborted/cancelled).
+                if sink.send(event.clone()).await.is_err() {
+                    break;
+                }
             }
         }
         Ok(())
@@ -775,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tool_json_surfaces_error_not_silent_drop() {
+    fn malformed_tool_json_surfaces_a_failed_proposal_keyed_to_the_id() {
         let mut m = AgentEventMapper::new();
         let out = drive(
             &mut m,
@@ -791,8 +853,16 @@ mod tests {
                 ProviderEvent::MessageStop,
             ],
         );
+        // Not a successful proposal, and not silently dropped: it surfaces as a
+        // failed proposal that still carries the id (so the turn loop can feed an
+        // is_error tool_result back) - never a bare Error.
         assert!(proposed(&out).is_empty());
-        assert!(out.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+        assert!(out.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolProposalFailed { id, name, .. }
+                if id == "toolu_bad" && name == "edit_file"
+        )));
+        assert!(!out.iter().any(|e| matches!(e, AgentEvent::Error(_))));
     }
 
     #[test]
