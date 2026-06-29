@@ -290,11 +290,18 @@ impl FaceStyle {
 /// subpixel variant per (glyph, face, size) - far fewer than the ~16 a proportional
 /// layout (e.g. GPUI) needs. `px` is the integer pixel size (after the scale
 /// factor) so a Retina vs non-Retina run keys distinct rasterizations.
+///
+/// `sprite` namespaces the procedurally-drawn sprite face (`crate::sprite`,
+/// box-drawing / blocks / braille / Powerline): a sprite keys on its CODEPOINT in
+/// `glyph_id`, which could otherwise collide with a font glyph-id of the same
+/// numeric value, so the flag keeps the two caches disjoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
     pub glyph_id: u16,
     pub face: FaceStyle,
     pub px: u32,
+    /// True when `glyph_id` is a sprite codepoint, not a font glyph index.
+    pub sprite: bool,
 }
 
 /// Maps a [`GlyphKey`] to its reserved [`AtlasRect`], rasterizing each unique glyph
@@ -724,6 +731,7 @@ mod tests {
             glyph_id: 42,
             face: FaceStyle::Regular,
             px: 17,
+            sprite: false,
         };
         let mut raster_calls = 0;
         let r1 = cache
@@ -754,11 +762,33 @@ mod tests {
             glyph_id: 7,
             face: FaceStyle::Regular,
             px: 13,
+            sprite: false,
         };
         assert_eq!(cache.get(&key), None, "miss before insert");
         let rect = cache.get_or_insert(key, |_| {}, 5, 9).unwrap();
         // `get` returns the same rect a fresh `get_or_insert` would, with no (w, h).
         assert_eq!(cache.get(&key), Some(rect));
+    }
+
+    #[test]
+    fn sprite_and_font_keys_with_the_same_id_do_not_collide() {
+        // A sprite codepoint and a font glyph that happen to share a numeric id MUST
+        // resolve to distinct atlas entries (the `sprite` discriminant, T-4.5).
+        let mut cache = GlyphCache::new(64, 64);
+        let font = GlyphKey {
+            glyph_id: 0x2500,
+            face: FaceStyle::Regular,
+            px: 13,
+            sprite: false,
+        };
+        let sprite = GlyphKey {
+            sprite: true,
+            ..font
+        };
+        let rf = cache.get_or_insert(font, |_| {}, 5, 9).unwrap();
+        let rs = cache.get_or_insert(sprite, |_| {}, 5, 9).unwrap();
+        assert_ne!(rf, rs, "the sprite flag keys a distinct atlas rect");
+        assert_eq!(cache.rasterizations(), 2);
     }
 
     #[test]

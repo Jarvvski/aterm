@@ -23,6 +23,7 @@ pub mod present;
 pub mod profiling;
 pub mod recorder;
 pub mod renderer;
+pub mod sprite;
 pub mod text;
 pub mod timeline;
 pub mod widgets;

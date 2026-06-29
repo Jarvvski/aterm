@@ -2,7 +2,7 @@
 id: T-4.5
 epic: EPIC-4-design-system
 title: Sprite face for box-drawing/Powerline/braille
-status: ready-for-agent
+status: done
 labels: [text, fonts, render]
 depends_on: [T-1.6]
 ---
@@ -33,3 +33,62 @@ Draw box-drawing, block elements, Powerline separators, braille, and "Symbols fo
 
 - Nerd Font PUA icon constraints (T-4.4) - those use the font, scaled.
 - Color glyphs.
+
+# Notes
+
+**Landed 2026-06-29.** New pure module `aterm-ui::sprite` draws the sprite ranges into
+an 8-bit alpha coverage bitmap sized to the cell, returning the SAME
+`crate::glyph::RasterGlyph` swash produces, so the existing atlas + `GlyphCache` +
+instanced pipeline consume a sprite exactly like a font glyph (drawn once, cached,
+never re-rasterized - AC4). `is_sprite(ch)` / `render(ch, w, h)` are the surface.
+
+Coverage (drawn):
+
+- **Box-drawing** via a uniform 4-arm model (`box_arms(ch) -> [up,down,left,right]`
+  weights; `draw_box` draws each arm as a band from edge to centre, opposite arms
+  union at the centre). Straight lines, all corners (light/heavy/mixed-corner), the
+  pure-weight T/cross junctions, and the half-lines (light + heavy + the mixed
+  collinear half-lines). A horizontal/vertical line inks BOTH edge rows/cols, so
+  adjacent cells abut with no gap (AC1, the seamless property, asserted headlessly).
+- **Block elements** `U+2580..259F`: half/eighth blocks, quadrants, and the three
+  shades. All vertical/horizontal divisions snap to ONE shared rounded-1/8 gridline
+  set, so complementary glyphs (▀/▄, the quadrants) tile with no seam even at odd
+  cell heights (the default 1x height is 17, odd - this was a review fix).
+- **Braille** `U+2800..28FF`: the full 256-pattern 2x4 dot matrix (algorithmic from
+  the dot-mask) - AC3 (btop/spinner). Blank braille `U+2800` returns an empty glyph
+  the pipeline skips (review fix).
+- **Powerline** `U+E0B0..E0B3`: the filled/outline left/right triangles, procedural
+  and therefore font-independent and pixel-identical (AC2).
+
+Deliberate scope cut (deferred to the FONT path, `classify` returns `None`, no
+regression): the mixed light/heavy box junctions, the double-line set
+(`U+2550..256C`), arcs (`U+256D..2570`), diagonals (`U+2571..2573`), and dashes.
+These render via the normal glyph path exactly as before. The straight-line set
+covers tables / tmux borders (AC1); the deferred set is rarer and its per-arm weights
+/ corner-radius math were judged not worth the table-error risk for this unit.
+
+Integration: a sprite is keyed in the atlas by its CODEPOINT in `GlyphKey.glyph_id`
+plus a NEW `sprite: bool` discriminant (so it can't collide with a font glyph-id of
+the same numeric value); `place_glyph` (refactored out of `rasterize_into_atlas`) is
+shared by the font and sprite paths. A sprite is placed at the cell-box origin
+(`round(cell_x), round(cell_y)`), not baseline-relative.
+
+AC coverage: (1) seamless box tiling - the per-sprite edge-coverage property is proven
+headlessly; the sub-pixel cumulative-tiling drift across a long row at fractional cell
+widths is the on-hardware residual (consolidated to EPIC-7, per the INDEX convention).
+(2) Powerline font-independent + (3) braille correct + (4) atlas-cached - all proven by
+unit tests PLUS a GPU render-to-texture test (`sprite_glyphs_render_through_the_atlas_
+pipeline`) that composites a full-block and a line on real Metal.
+
+Adversarial review (4 lenses: box-table, block/braille/Powerline, integration,
+geometry/AC; find -> default-refute verify; 7 findings, 2 confirmed, both LOW, both
+fixed): (1) blank braille emitted a cached transparent quad instead of being skipped -
+`render` now returns a truly-empty glyph when nothing inks; (2) the half-block midline
+disagreed with the quadrant/eighth midline by 1px at odd heights - all block divisions
+now share one rounded-1/8 gridline set (regression test
+`half_blocks_and_quadrants_share_one_midline_at_odd_height`). The box-arm weight table
+and the braille bit-to-dot mapping were both verified correct against the Unicode
+names/numbering (5 findings refuted).
+
+aterm-ui: 99 tests (17 sprite + 1 atlas-collision + 1 GPU); full workspace green;
+clippy `-D warnings` clean. CHANGELOG entry under `## Unreleased`; no version bump.

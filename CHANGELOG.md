@@ -13,6 +13,16 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Procedural sprite face for box-drawing, blocks, braille, and Powerline.** Box
+  lines/corners/junctions (`U+2500..` light + heavy), block elements + quadrants +
+  shades (`U+2580..259F`), the full braille dot matrix (`U+2800..28FF`), and the
+  Powerline separators (`U+E0B0..E0B3`) are now DRAWN directly into the glyph atlas
+  rather than taken from the font outline. They are pixel-perfect and seamless
+  regardless of which font is active: box lines tile edge-to-edge with no inter-cell
+  gaps, Powerline triangles are font-independent, and braille/block art (e.g. btop
+  graphs) renders crisply. Each sprite is rasterized once and cached like any glyph.
+  The rarer variants (mixed light/heavy junctions, double-line, arcs, diagonals,
+  dashes) still come from the font, unchanged. (Ticket T-4.5.)
 - **Theme-tuned ANSI palettes + runtime theme switching.** Terminal output now
   resolves its ANSI colors through the active theme's 16-color palette (the warm
   "paper" light set and the dark set), with the full xterm 256-color space (the

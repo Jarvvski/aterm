@@ -39,7 +39,7 @@ use bytemuck::{Pod, Zeroable};
 use aterm_core::Snapshot;
 use aterm_tokens::{type_scale, Theme};
 
-use crate::glyph::GlyphRasterizer;
+use crate::glyph::{GlyphRasterizer, RasterGlyph};
 use crate::text::{build_grid_cells, FaceStyle, GlyphCache, GlyphKey, GridCell};
 use crate::window::cell_px;
 
@@ -432,6 +432,10 @@ impl GridRenderer {
         }
 
         let (cw, ch) = cell_px(scale);
+        // Integer cell extent for procedural sprite glyphs (box-drawing / blocks /
+        // braille / Powerline), which fill the cell box rather than a font outline.
+        let cw_i = cw.round().max(1.0) as u32;
+        let ch_i = ch.round().max(1.0) as u32;
         let inset = INSET_LOGICAL * scale;
         let metrics = self.rasterizer.cell_metrics(px);
         // Center the font's line box in the cell box, then baseline = ascent below
@@ -466,20 +470,33 @@ impl GridRenderer {
                 });
             }
 
-            // Glyph quad.
-            let face = FaceStyle::from_flags(cell.bold, cell.italic);
-            let gid = self.rasterizer.glyph_id(face, cell.ch);
+            // Glyph quad. A sprite codepoint (box-drawing / blocks / braille /
+            // Powerline) is drawn procedurally into the cell box and bypasses the
+            // font; everything else is a font glyph keyed by its cmap glyph id.
+            let sprite = crate::sprite::is_sprite(cell.ch);
+            let face = if sprite {
+                FaceStyle::Regular
+            } else {
+                FaceStyle::from_flags(cell.bold, cell.italic)
+            };
             let gkey = GlyphKey {
-                glyph_id: gid,
+                glyph_id: if sprite {
+                    cell.ch as u32 as u16 // sprite codepoints are all in the BMP
+                } else {
+                    self.rasterizer.glyph_id(face, cell.ch)
+                },
                 face,
                 px: px_key,
+                sprite,
             };
             if self.skip_glyphs.contains(&gkey) {
                 continue;
             }
             let slot = match self.cache.get(&gkey) {
                 Some(rect) => Some((rect, self.placements[&gkey])),
-                None => self.rasterize_into_atlas(queue, gkey, face, gid, px),
+                None if sprite => crate::sprite::render(cell.ch, cw_i, ch_i)
+                    .and_then(|g| self.place_glyph(queue, gkey, &g)),
+                None => self.rasterize_into_atlas(queue, gkey, face, gkey.glyph_id, px),
             };
             let Some((rect, (left, top))) = slot else {
                 continue;
@@ -487,9 +504,16 @@ impl GridRenderer {
             // Snap the glyph quad to integer pixels so the hinted bitmap maps 1:1 to
             // texels under the Nearest sampler (crisp, no inter-glyph bleed). The cell
             // origin is fractional (cw is ~7.8px), so without this the quad would
-            // straddle pixel boundaries.
-            let gx = (cell_x + left as f32).round();
-            let gy = (cell_y + baseline_off - top as f32).round();
+            // straddle pixel boundaries. A sprite fills the cell box, so it is placed
+            // at the cell origin (its left/top are 0); a font glyph is baseline-relative.
+            let (gx, gy) = if sprite {
+                (cell_x.round(), cell_y.round())
+            } else {
+                (
+                    (cell_x + left as f32).round(),
+                    (cell_y + baseline_off - top as f32).round(),
+                )
+            };
             let inv = 1.0 / ATLAS_DIM as f32;
             self.glyph_instances.push(GlyphInstance {
                 rect: [gx, gy, rect.w as f32, rect.h as f32],
@@ -557,6 +581,20 @@ impl GridRenderer {
         px: f32,
     ) -> Option<(crate::text::AtlasRect, (i32, i32))> {
         let g = self.rasterizer.rasterize(face, gid, px)?;
+        self.place_glyph(queue, gkey, &g)
+    }
+
+    /// Upload an already-rasterized glyph - font OR procedural sprite - into the
+    /// atlas and record its placement. Inkless glyphs AND glyphs the (full) atlas
+    /// cannot place are memoized in `skip_glyphs` so they are never re-rasterized on
+    /// a later rebuild. Returns the atlas rect + placement, or `None` if it emits no
+    /// glyph instance.
+    fn place_glyph(
+        &mut self,
+        queue: &wgpu::Queue,
+        gkey: GlyphKey,
+        g: &RasterGlyph,
+    ) -> Option<(crate::text::AtlasRect, (i32, i32))> {
         if g.is_empty() {
             self.skip_glyphs.insert(gkey);
             return None;
@@ -959,6 +997,58 @@ mod gpu_tests {
                 && !rb.any_chan(bx0, by0, bx1, by1, 1, 20)
                 && !rb.any_chan(bx0, by0, bx1, by1, 2, 20),
             "a blank cell stays the clear color (canvas-skip + empty-glyph-skip)"
+        );
+    }
+
+    #[test]
+    fn sprite_glyphs_render_through_the_atlas_pipeline() {
+        // T-4.5: box-drawing / block / Powerline sprites reach the atlas and
+        // composite end-to-end, just like a font glyph - verified on real GPU.
+        let Some((device, queue, format)) = device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut grid = GridRenderer::new(&device, format);
+        let (w, h) = target_size(4, 1);
+
+        // █ FULL BLOCK, white fg on canvas bg: the cell centre inks white (all
+        // channels high) - proves a sprite is drawn, cached, and composited.
+        let snap = one_cell(
+            4,
+            '\u{2588}',
+            CellColor::Rgb(255, 255, 255),
+            CellColor::Named(257),
+            false,
+        );
+        let rb = render(&device, &queue, &mut grid, &snap, w, h);
+        let (x0, y0, x1, y1) = cell_box(0, 0, false);
+        let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+        assert!(
+            rb.any_chan(cx, cy, cx + 1, cy + 1, 0, 150)
+                && rb.any_chan(cx, cy, cx + 1, cy + 1, 1, 150)
+                && rb.any_chan(cx, cy, cx + 1, cy + 1, 2, 150),
+            "full-block sprite fills the cell centre white"
+        );
+
+        // ─ LIGHT HORIZONTAL: a thin band at the vertical centre, NOT a full fill -
+        // distinguishes the sprite from a block and proves it is the procedural line.
+        let mut grid2 = GridRenderer::new(&device, format);
+        let snap2 = one_cell(
+            4,
+            '\u{2500}',
+            CellColor::Rgb(255, 255, 255),
+            CellColor::Named(257),
+            false,
+        );
+        let rb2 = render(&device, &queue, &mut grid2, &snap2, w, h);
+        // A few rows around the vertical centre catch the thin (1px at 1x) band.
+        assert!(
+            rb2.any_chan(x0, cy.saturating_sub(2), x1, cy + 3, 0, 150),
+            "the line inks the cell's vertical centre"
+        );
+        assert!(
+            !rb2.any_chan(x0, y0, x1, y0 + 2, 0, 80),
+            "the top of the cell stays blank (a thin line, not a fill)"
         );
     }
 
