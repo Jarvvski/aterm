@@ -115,12 +115,63 @@ pub struct RenderConfig {
     pub display_link: bool,
 }
 
+/// The minimum WCAG contrast every ANSI foreground should clear against the
+/// canvas on a light-background ("paper") theme. 3:1 is the WCAG large-text / UI
+/// threshold - the right bar for decorative monospace output (a full 4.5:1
+/// body-text bar would over-darken the brights and invert the bright>normal
+/// ordering). The dark theme is exempt (its dim slots are intentional); see
+/// [`effective_theme`].
+const LIGHT_ANSI_MIN_CONTRAST: f32 = 3.0;
+
+/// Resolve a [`ThemeKind`] to the concrete [`Theme`] the renderer draws, applying
+/// the light-"paper" ANSI legibility remap.
+///
+/// On a light-background theme the saturated bright ANSI colors (bright cyan /
+/// yellow especially) wash out against the paper canvas; per `design-system.md`
+/// §3 this is corrected at *render* time (never by editing the token values), so
+/// the palette is passed through
+/// [`AnsiPalette::with_fg_legibility`](aterm_tokens::AnsiPalette::with_fg_legibility)
+/// against the canvas. A dark-background theme is returned unchanged - its
+/// near-canvas slots (dim / comment gray) are deliberate and must not be lifted.
+#[must_use]
+pub fn effective_theme(kind: ThemeKind) -> Theme {
+    let mut theme = *Theme::for_kind(kind);
+    // Gate on a light background (luminance > 0.5): only there do the brights wash
+    // out, and there no slot is a deliberate light-gray-on-light, so lifting every
+    // failing entry to the floor is safe.
+    if theme.colors.bg_canvas.relative_luminance() > 0.5 {
+        theme.ansi = theme
+            .ansi
+            .with_fg_legibility(theme.colors.bg_canvas, LIGHT_ANSI_MIN_CONTRAST);
+    }
+    theme
+}
+
+/// Map winit's window theme onto our [`ThemeKind`] (the follow-OS-appearance path).
+fn theme_kind_from_winit(t: winit::window::Theme) -> ThemeKind {
+    match t {
+        winit::window::Theme::Light => ThemeKind::Light,
+        winit::window::Theme::Dark => ThemeKind::Dark,
+    }
+}
+
 /// The application: owns the window, renderer, theme, host callbacks, and the
 /// keep-warm present scheduler.
 pub struct AtermApp<C: UiCallbacks> {
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
+    /// The rendered theme for this frame: [`effective_theme`] of `theme_kind` (so
+    /// the light legibility remap is already baked in).
     theme: Theme,
+    /// The active theme variant. `theme` is its rendered form.
+    theme_kind: ThemeKind,
+    /// Follow the OS appearance: when `true`, `Window::theme()` at launch and later
+    /// `WindowEvent::ThemeChanged` events drive the active theme. Opt-in via
+    /// [`AtermApp::with_follow_system`]; default `false` so the configured theme
+    /// wins (matching the app's "light paper" config default). The follow-system
+    /// *default* is owner open-question #1 (follow-OS vs paper), still unconfirmed -
+    /// this exposes the capability without changing the shipped default.
+    follow_system: bool,
     callbacks: C,
     title: String,
     scheduler: PresentScheduler,
@@ -143,7 +194,9 @@ impl<C: UiCallbacks> AtermApp<C> {
         Self {
             window: None,
             renderer: None,
-            theme: *Theme::for_kind(theme_kind),
+            theme: effective_theme(theme_kind),
+            theme_kind,
+            follow_system: false,
             callbacks,
             title: "aterm".to_string(),
             scheduler: PresentScheduler::default(),
@@ -160,6 +213,55 @@ impl<C: UiCallbacks> AtermApp<C> {
     pub fn with_render_config(mut self, config: RenderConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Follow the OS appearance: when enabled, the active theme tracks
+    /// `Window::theme()` at launch and `WindowEvent::ThemeChanged` thereafter.
+    /// Default off (the configured theme wins). The follow-system *default* is
+    /// owner open-question #1 and unconfirmed; this builder exposes the capability
+    /// without changing the shipped "light paper" default.
+    #[must_use]
+    pub fn with_follow_system(mut self, follow: bool) -> Self {
+        self.follow_system = follow;
+        self
+    }
+
+    /// The active theme variant (light / dark).
+    #[must_use]
+    pub fn theme_kind(&self) -> ThemeKind {
+        self.theme_kind
+    }
+
+    /// Switch the active theme at runtime - an explicit override, so it stops
+    /// following the OS appearance. Grid colors re-resolve against the new theme on
+    /// the next frame with NO grid reallocation: the published snapshot is
+    /// unchanged, and the renderer's rebuild gate (keyed partly on the theme) simply
+    /// re-resolves each cell into its existing instance buffers. Repaints promptly.
+    pub fn set_theme(&mut self, kind: ThemeKind) {
+        self.follow_system = false;
+        self.apply_theme_kind(kind);
+    }
+
+    /// Toggle light↔dark at runtime (an explicit override; see [`Self::set_theme`]).
+    pub fn toggle_theme(&mut self) {
+        self.set_theme(self.theme_kind.toggle());
+    }
+
+    /// Set the active variant + its rendered ([`effective_theme`]) form, then re-arm
+    /// keep-warm and repaint if the window is up. A no-op when the variant is
+    /// unchanged. Does NOT touch `follow_system`, so it serves both the explicit
+    /// switch and the follow-OS path.
+    fn apply_theme_kind(&mut self, kind: ThemeKind) {
+        if self.theme_kind == kind {
+            return;
+        }
+        self.theme_kind = kind;
+        self.theme = effective_theme(kind);
+        // A theme change is activity: re-arm keep-warm and repaint promptly.
+        self.scheduler.note_activity(Instant::now());
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
     }
 
     /// Install a Tier-2 [`FrameRecorder`] (ticket T-7.1). Each presented frame is
@@ -290,6 +392,16 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
         }
         self.callbacks.on_ready(window.clone());
 
+        // Follow the OS appearance at launch if asked (later changes arrive as
+        // `WindowEvent::ThemeChanged`). When off, the configured theme stays.
+        // `apply_theme_kind`'s repaint is a no-op here (the window field is set
+        // below); the end-of-`resumed` `request_redraw` paints the chosen theme.
+        if self.follow_system {
+            if let Some(t) = window.theme() {
+                self.apply_theme_kind(theme_kind_from_winit(t));
+            }
+        }
+
         // Opt-in: install the self-bridged CADisplayLink vsync clock. Each tick
         // turns into a redraw request (the scheduler decides whether it draws). If
         // creation fails (non-macOS, headless, OS decline) we silently keep the
@@ -317,6 +429,14 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ThemeChanged(t) => {
+                // The OS appearance changed: follow it live (re-resolves grid colors
+                // with no realloc, repaints) when in follow-system mode; otherwise
+                // the configured/overridden theme stands.
+                if self.follow_system {
+                    self.apply_theme_kind(theme_kind_from_winit(t));
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(size.width, size.height);
@@ -429,4 +549,74 @@ pub fn run_with<C: UiCallbacks>(
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = AtermApp::new(theme_kind, callbacks).with_render_config(config);
     event_loop.run_app(&mut app)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aterm_tokens::contrast_ratio;
+
+    #[test]
+    fn effective_theme_makes_light_paper_brights_legible() {
+        // AC (T-4.2): the riskiest combo (bright cyan/yellow on light paper) is
+        // legible in the rendered theme - the renderer remap, not a token edit.
+        let light = effective_theme(ThemeKind::Light);
+        let bg = light.colors.bg_canvas;
+        for c in [light.ansi.bright_cyan, light.ansi.bright_yellow] {
+            assert!(
+                contrast_ratio(c, bg) >= LIGHT_ANSI_MIN_CONTRAST,
+                "light bright {c:?} must clear {LIGHT_ANSI_MIN_CONTRAST}:1 on paper, got {:.2}",
+                contrast_ratio(c, bg)
+            );
+        }
+        // Every rendered light ANSI fg clears the floor against the canvas.
+        for i in 0u8..=15 {
+            assert!(contrast_ratio(light.ansi.by_index(i), bg) >= LIGHT_ANSI_MIN_CONTRAST);
+        }
+    }
+
+    #[test]
+    fn effective_theme_leaves_dark_palette_untouched() {
+        // The dark theme's dim slots (bright-black/comment gray near the canvas) are
+        // intentional; the legibility remap must skip a dark background entirely.
+        let dark = effective_theme(ThemeKind::Dark);
+        let raw = *Theme::for_kind(ThemeKind::Dark);
+        for i in 0u8..=15 {
+            assert_eq!(dark.ansi.by_index(i), raw.ansi.by_index(i));
+        }
+    }
+
+    #[test]
+    fn winit_theme_maps_to_kind() {
+        assert_eq!(
+            theme_kind_from_winit(winit::window::Theme::Light),
+            ThemeKind::Light
+        );
+        assert_eq!(
+            theme_kind_from_winit(winit::window::Theme::Dark),
+            ThemeKind::Dark
+        );
+    }
+
+    #[test]
+    fn set_and_toggle_theme_switch_kind_and_stop_following_os() {
+        // The runtime switch state machine, exercised headlessly (no window/GPU).
+        let mut app = AtermApp::new(ThemeKind::Light, HeadlessCallbacks).with_follow_system(true);
+        assert_eq!(app.theme_kind(), ThemeKind::Light);
+
+        app.set_theme(ThemeKind::Dark);
+        assert_eq!(app.theme_kind(), ThemeKind::Dark);
+        assert_eq!(
+            app.theme.colors.bg_canvas,
+            Theme::for_kind(ThemeKind::Dark).colors.bg_canvas,
+            "the rendered theme switched to dark"
+        );
+        assert!(
+            !app.follow_system,
+            "an explicit set_theme is an override and stops following the OS"
+        );
+
+        app.toggle_theme();
+        assert_eq!(app.theme_kind(), ThemeKind::Light);
+    }
 }

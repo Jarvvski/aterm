@@ -13,6 +13,17 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Theme-tuned ANSI palettes + runtime theme switching.** Terminal output now
+  resolves its ANSI colors through the active theme's 16-color palette (the warm
+  "paper" light set and the dark set), with the full xterm 256-color space (the
+  6×6×6 cube and 24-step grayscale ramp) resolved in one place. The theme can switch
+  at runtime - via an explicit toggle or by following the macOS appearance
+  (`WindowEvent::ThemeChanged`, opt-in) - and grid colors re-resolve live against the
+  new palette with no grid reallocation. On the light "paper" background the
+  saturated bright ANSI colors (bright cyan/yellow especially) are remapped at render
+  time to stay legible (a minimum 3:1 contrast against the canvas); this is a
+  renderer adjustment only - the design-token palette values are unchanged. The dark
+  theme is left as-is (its dim colors are intentional). (Ticket T-4.2.)
 - **GPU instanced grid renderer (the typing-lag cure).** The terminal grid now draws
   through a custom wgpu instanced atlas pipeline instead of the interim glyphon
   whole-buffer reshape. Each unique glyph is rasterized once (swash) into a shared

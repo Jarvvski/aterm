@@ -59,36 +59,12 @@ pub fn resolve_color(color: CellColor, theme: &Theme, is_fg: bool) -> Rgba {
 }
 
 /// Resolve an xterm 256-color palette index: 0..=15 themed ANSI, 16..=231 the
-/// 6x6x6 color cube, 232..=255 the 24-step grayscale ramp (the standard xterm
-/// formulas).
+/// 6x6x6 color cube, 232..=255 the 24-step grayscale ramp. The full 256-color
+/// resolution lives in the leaf token crate ([`aterm_tokens::AnsiPalette::indexed`])
+/// so the themed-low-16 + standard-cube/grayscale logic has one home and is
+/// unit-tested there; this is the render-side entry point.
 fn resolve_indexed(i: u8, theme: &Theme) -> Rgba {
-    match i {
-        0..=15 => theme.ansi.by_index(i),
-        16..=231 => {
-            let v = i - 16;
-            let r = v / 36;
-            let g = (v / 6) % 6;
-            let b = v % 6;
-            // Channel level: 0 stays 0, otherwise 55 + 40*step (xterm cube).
-            let level = |c: u8| if c == 0 { 0 } else { 55 + c * 40 };
-            Rgba {
-                r: level(r),
-                g: level(g),
-                b: level(b),
-                a: 255,
-            }
-        }
-        232..=255 => {
-            // Grayscale ramp: 8, 18, 28, ... 238.
-            let level = 8 + (i - 232) * 10;
-            Rgba {
-                r: level,
-                g: level,
-                b: level,
-                a: 255,
-            }
-        }
-    }
+    theme.ansi.indexed(i)
 }
 
 /// Resolve a semantic/named color. ANSI 0..=15 theme directly; the dim-ANSI range
@@ -482,9 +458,12 @@ mod tests {
     }
 
     #[test]
-    fn indexed_low_matches_ansi() {
-        let t = theme();
-        assert_eq!(resolve_indexed(7, &t), t.ansi.by_index(7));
+    fn indexed_low_resolves_the_themed_palette() {
+        // Ground-truth anchor (NOT `by_index`, which would be tautological): the
+        // render-side entry resolves a low ANSI index to the dark palette hex.
+        let t = theme(); // dark
+        assert_eq!(resolve_indexed(2, &t), Rgba::hex(0x5FD7A7)); // dark green
+        assert_eq!(resolve_indexed(7, &t), Rgba::hex(0xE6E5E1)); // dark white
     }
 
     #[test]
@@ -620,6 +599,74 @@ mod tests {
             "stable dims must reuse the buffer (no realloc)"
         );
         assert_eq!(out.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn theme_switch_reuses_buffer_and_re_resolves_colors() {
+        // AC (T-4.2): switching theme at runtime updates grid colors live with no
+        // grid realloc. The snapshot is unchanged; only the per-cell colors are
+        // re-resolved against the new theme, into the SAME buffer.
+        let light = *Theme::for_kind(ThemeKind::Light);
+        let dark = *Theme::for_kind(ThemeKind::Dark);
+        let mut snap = Snapshot::empty(4, 10);
+        snap.cells[0].c = 'g';
+        snap.cells[0].fg = CellColor::Named(2); // ANSI green
+        let mut out = Vec::new();
+        build_grid_cells(&snap, &light, &mut out); // warm the buffer
+        let cap = out.capacity();
+        let ptr = out.as_ptr();
+        let light_green = out[0].fg;
+
+        build_grid_cells(&snap, &dark, &mut out); // switch theme, same buffer
+        assert_eq!(
+            out.capacity(),
+            cap,
+            "theme switch must not realloc the buffer"
+        );
+        assert_eq!(
+            out.as_ptr(),
+            ptr,
+            "theme switch must reuse the same allocation"
+        );
+        assert_eq!(
+            out[0].fg, dark.ansi.green,
+            "cell re-resolves to the dark palette"
+        );
+        assert_ne!(
+            out[0].fg, light_green,
+            "the two themes resolve ANSI green differently"
+        );
+    }
+
+    #[test]
+    fn ansi_output_resolves_through_the_active_theme_palette() {
+        // AC (T-4.2): real ANSI output (git-diff red/green, ls dir-blue/symlink-cyan)
+        // resolves to the active theme's palette, and the two themes differ. A
+        // headless stand-in for the on-hardware eyeball (the visual residual is the
+        // EPIC-7 / on-hardware check, per the INDEX convention).
+        let light = *Theme::for_kind(ThemeKind::Light);
+        let dark = *Theme::for_kind(ThemeKind::Dark);
+        // (CellColor fg, light expected, dark expected)
+        let cases = [
+            (CellColor::Named(1), light.ansi.red, dark.ansi.red), // git diff -
+            (CellColor::Named(2), light.ansi.green, dark.ansi.green), // git diff +
+            (CellColor::Named(4), light.ansi.blue, dark.ansi.blue), // ls directory
+            (CellColor::Named(6), light.ansi.cyan, dark.ansi.cyan), // ls symlink
+            (
+                CellColor::Indexed(11),
+                light.ansi.bright_yellow,
+                dark.ansi.bright_yellow,
+            ),
+        ];
+        for (color, want_light, want_dark) in cases {
+            assert_eq!(resolve_color(color, &light, true), want_light);
+            assert_eq!(resolve_color(color, &dark, true), want_dark);
+            assert_ne!(
+                resolve_color(color, &light, true),
+                resolve_color(color, &dark, true),
+                "{color:?} should resolve to a different color per theme"
+            );
+        }
     }
 
     #[test]

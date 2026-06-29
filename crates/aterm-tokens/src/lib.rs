@@ -107,6 +107,83 @@ pub fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+/// Per-channel sRGB interpolation `a + (b - a)*t` (`t` clamped to `0.0..=1.0`),
+/// alpha taken from `a`. A blunt value pull, not perceptual color science - just
+/// enough to nudge a color toward black/white for [`legible_against`].
+fn lerp_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Rgba {
+        r: mix(a.r, b.r),
+        g: mix(a.g, b.g),
+        b: mix(a.b, b.b),
+        a: a.a,
+    }
+}
+
+/// Pull `fg` toward black or white just far enough to reach `min_ratio` WCAG
+/// contrast against `bg`, and return it (unchanged if it already clears the
+/// floor).
+///
+/// The pull is toward whichever of black/white can reach the higher contrast
+/// against `bg` (black on a light bg, white on a dark bg), found by a binary
+/// search on the sRGB blend so the hue is broadly preserved while the value is
+/// moved the minimal amount. If even the full endpoint cannot reach `min_ratio`
+/// (impossible for a normal bg, since black-or-white maximizes contrast) the
+/// endpoint is returned as the best effort.
+///
+/// This is the pure primitive behind the light-"paper" ANSI legibility remap.
+/// Per `design-system.md` §3 that remap is a **renderer** concern, never a token
+/// edit - the shipped palette values stay verbatim; a caller (the renderer/app)
+/// decides whether and where to apply this. `min_ratio <= 1.0` makes it a no-op.
+#[must_use]
+pub fn legible_against(fg: Rgba, bg: Rgba, min_ratio: f32) -> Rgba {
+    if contrast_ratio(fg, bg) >= min_ratio {
+        return fg;
+    }
+    let black = Rgba {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: fg.a,
+    };
+    let white = Rgba {
+        r: 0xFF,
+        g: 0xFF,
+        b: 0xFF,
+        a: fg.a,
+    };
+    // The endpoint that maximizes achievable contrast against `bg`.
+    let target = if contrast_ratio(black, bg) >= contrast_ratio(white, bg) {
+        black
+    } else {
+        white
+    };
+    // Best effort if even the full endpoint cannot reach the floor.
+    if contrast_ratio(target, bg) < min_ratio {
+        return target;
+    }
+    // Smallest blend toward `target` that meets the floor. Binary search is valid
+    // because the predicate "contrast(blend, bg) >= floor" is single-threshold
+    // (false then true) in t: blending toward the max-contrast endpoint only lifts
+    // contrast past the crossover, and the sub-floor precondition (predicate false
+    // at t=0) plus the endpoint-meets-floor guard above (predicate true at t=1)
+    // bracket that threshold. Raw contrast can dip once near a luminance crossover,
+    // but entirely inside the still-sub-floor region, so the boolean stays monotone.
+    // 16 iterations → ~1/65536 of the blend factor, well under a u8 step.
+    let mut lo = 0.0f32; // fg
+    let mut hi = 1.0f32; // target
+    for _ in 0..16 {
+        let mid = (lo + hi) * 0.5;
+        if contrast_ratio(lerp_rgba(fg, target, mid), bg) >= min_ratio {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    lerp_rgba(fg, target, hi)
+}
+
 /// The two themes that ship day one. Both are drawn from one hue family so ANSI
 /// output and chrome never clash (see design-system.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,6 +192,17 @@ pub enum ThemeKind {
     Light,
     /// Dark.
     Dark,
+}
+
+impl ThemeKind {
+    /// The other theme - the target of a runtime light↔dark toggle.
+    #[must_use]
+    pub const fn toggle(self) -> ThemeKind {
+        match self {
+            ThemeKind::Light => ThemeKind::Dark,
+            ThemeKind::Dark => ThemeKind::Light,
+        }
+    }
 }
 
 /// Semantic color roles. Field names mirror `[color.*]` in tokens.toml.
@@ -162,7 +250,9 @@ pub struct AnsiPalette {
 }
 
 impl AnsiPalette {
-    /// Index into the palette by ANSI color index 0..=15. Out-of-range → black.
+    /// Index into the 16-color palette by ANSI color index 0..=15.
+    /// Out-of-range (16..=255) → black; callers wanting full 256-color
+    /// resolution should use [`AnsiPalette::indexed`].
     pub const fn by_index(&self, idx: u8) -> Rgba {
         match idx {
             0 => self.black,
@@ -183,6 +273,93 @@ impl AnsiPalette {
             15 => self.bright_white,
             _ => self.black,
         }
+    }
+
+    /// Resolve a full 256-color ANSI index to an `Rgba`.
+    ///
+    /// - `0..=15` resolve through THIS theme's 16-color palette ([`by_index`]),
+    ///   so the low colors belong to the theme's hue family.
+    /// - `16..=231` are the standard xterm 6×6×6 color cube (theme-independent):
+    ///   each channel takes one of `{0, 95, 135, 175, 215, 255}`.
+    /// - `232..=255` are the standard 24-step grayscale ramp (`8 + n*10`),
+    ///   theme-independent.
+    ///
+    /// The 216-cube and grayscale ramp are fixed by the xterm specification, not
+    /// by taste, so they are computed rather than themed - matching every other
+    /// terminal. Only the first 16 entries carry the theme.
+    ///
+    /// [`by_index`]: AnsiPalette::by_index
+    pub const fn indexed(&self, idx: u8) -> Rgba {
+        match idx {
+            0..=15 => self.by_index(idx),
+            16..=231 => {
+                // 6×6×6 cube. n in 0..=215; component level 0 → 0, else 55+40*level.
+                let n = idx - 16;
+                let r = n / 36;
+                let g = (n / 6) % 6;
+                let b = n % 6;
+                Rgba {
+                    r: cube_level(r),
+                    g: cube_level(g),
+                    b: cube_level(b),
+                    a: 0xFF,
+                }
+            }
+            232..=255 => {
+                // 24-step grayscale ramp: 8, 18, 28, ... 238.
+                let v = 8 + (idx - 232) * 10;
+                Rgba {
+                    r: v,
+                    g: v,
+                    b: v,
+                    a: 0xFF,
+                }
+            }
+        }
+    }
+
+    /// Return a copy of this 16-color palette with every entry pulled (via
+    /// [`legible_against`]) to clear `min_ratio` contrast against `bg`; entries
+    /// already clearing the floor are unchanged.
+    ///
+    /// This is the light-"paper" legibility remap: on a light background the
+    /// saturated bright ANSI colors (bright cyan/yellow especially) wash out, so
+    /// the renderer applies this against `bg_canvas` to keep terminal output
+    /// readable. **Intended for light-background themes only** - a dark theme's
+    /// intentionally-dim slots (e.g. bright-black/comment gray sit near the dark
+    /// canvas on purpose) would be wrongly lifted, so the caller gates on a light
+    /// background before applying.
+    #[must_use]
+    pub fn with_fg_legibility(&self, bg: Rgba, min_ratio: f32) -> AnsiPalette {
+        let f = |c: Rgba| legible_against(c, bg, min_ratio);
+        AnsiPalette {
+            black: f(self.black),
+            red: f(self.red),
+            green: f(self.green),
+            yellow: f(self.yellow),
+            blue: f(self.blue),
+            magenta: f(self.magenta),
+            cyan: f(self.cyan),
+            white: f(self.white),
+            bright_black: f(self.bright_black),
+            bright_red: f(self.bright_red),
+            bright_green: f(self.bright_green),
+            bright_yellow: f(self.bright_yellow),
+            bright_blue: f(self.bright_blue),
+            bright_magenta: f(self.bright_magenta),
+            bright_cyan: f(self.bright_cyan),
+            bright_white: f(self.bright_white),
+        }
+    }
+}
+
+/// One channel of the xterm 6×6×6 color cube: level 0 → 0, levels 1..=5 →
+/// `55 + 40*level` (i.e. 95, 135, 175, 215, 255).
+const fn cube_level(level: u8) -> u8 {
+    if level == 0 {
+        0
+    } else {
+        55 + level * 40
     }
 }
 
@@ -508,5 +685,130 @@ mod tests {
                 theme.kind
             );
         }
+    }
+
+    #[test]
+    fn theme_kind_toggles() {
+        assert_eq!(ThemeKind::Light.toggle(), ThemeKind::Dark);
+        assert_eq!(ThemeKind::Dark.toggle(), ThemeKind::Light);
+        assert_eq!(ThemeKind::Light.toggle().toggle(), ThemeKind::Light);
+    }
+
+    #[test]
+    fn indexed_low_16_resolve_the_themed_palette() {
+        // Anchor the low-16 path through the public `indexed` entry to ground-truth
+        // dossier hex (NOT to `by_index`, which would be tautological), so a
+        // mis-wired theme slot is actually caught.
+        assert_eq!(LIGHT.ansi.indexed(2), Rgba::hex(0x10A778)); // light green
+        assert_eq!(LIGHT.ansi.indexed(12), Rgba::hex(0x1A93E8)); // light bright_blue
+        assert_eq!(DARK.ansi.indexed(1), Rgba::hex(0xE85A95)); // dark red
+        assert_eq!(DARK.ansi.indexed(11), Rgba::hex(0xF3E430)); // dark bright_yellow
+                                                                // Contract: 0..=15 delegate to the 16-color accessor (not the cube formula).
+        for i in 0u8..=15 {
+            assert_eq!(DARK.ansi.indexed(i), DARK.ansi.by_index(i));
+        }
+    }
+
+    #[test]
+    fn indexed_cube_and_grayscale_match_xterm() {
+        let p = DARK.ansi;
+        // Cube corners (theme-independent): 16 = (0,0,0), 231 = (5,5,5),
+        // 196 = (5,0,0) pure cube red.
+        assert_eq!(p.indexed(16), Rgba::hex(0x000000));
+        assert_eq!(p.indexed(231), Rgba::hex(0xFFFFFF));
+        assert_eq!(p.indexed(196), Rgba::hex(0xFF0000));
+        // A mid cube cell 16+1*36+2*6+3 = 67 = (1,2,3) -> (95,135,175).
+        assert_eq!(p.indexed(67), Rgba::hex(0x5F87AF));
+        // Grayscale ramp endpoints: 232 -> 8, 255 -> 238.
+        assert_eq!(p.indexed(232), Rgba::hex(0x080808));
+        assert_eq!(p.indexed(255), Rgba::hex(0xEEEEEE));
+        // Cube + grayscale are theme-independent: light resolves them identically.
+        assert_eq!(LIGHT.ansi.indexed(196), DARK.ansi.indexed(196));
+        assert_eq!(LIGHT.ansi.indexed(244), DARK.ansi.indexed(244));
+    }
+
+    #[test]
+    fn legible_against_is_a_noop_above_floor() {
+        // fg.primary on canvas is ~13:1; asking for a 3:1 floor changes nothing.
+        let fg = LIGHT.colors.fg_primary;
+        let bg = LIGHT.colors.bg_canvas;
+        assert!(contrast_ratio(fg, bg) >= 3.0);
+        assert_eq!(legible_against(fg, bg, 3.0), fg);
+        // A floor at/below 1.0 is always a no-op (every pair is >= 1:1).
+        assert_eq!(
+            legible_against(LIGHT.ansi.bright_cyan, bg, 1.0),
+            LIGHT.ansi.bright_cyan
+        );
+    }
+
+    #[test]
+    fn legible_against_raises_a_sub_floor_pair_and_picks_the_right_direction() {
+        // On a LIGHT bg the pull is toward black (darker fg) and clears the floor.
+        let light_bg = LIGHT.colors.bg_canvas;
+        let cyan = LIGHT.ansi.bright_cyan;
+        assert!(
+            contrast_ratio(cyan, light_bg) < 3.0,
+            "precondition: the risk is real"
+        );
+        let fixed = legible_against(cyan, light_bg, 3.0);
+        assert!(
+            contrast_ratio(fixed, light_bg) >= 3.0,
+            "remapped bright cyan must clear 3:1 on light paper (got {:.2})",
+            contrast_ratio(fixed, light_bg)
+        );
+        // Endpoint selection (toward black on a light bg) pinned per-channel, so it
+        // is verified independent of the contrast math: every channel is pulled DOWN.
+        assert!(
+            fixed.r <= cyan.r && fixed.g <= cyan.g && fixed.b <= cyan.b,
+            "toward-black pull lowers every channel ({fixed:?} vs {cyan:?})"
+        );
+        // On a DARK bg a too-dim color is pulled toward white (lighter).
+        let dark_bg = DARK.colors.bg_canvas;
+        let dim = Rgba::hex(0x303030); // barely above the dark canvas
+        assert!(contrast_ratio(dim, dark_bg) < 3.0);
+        let lit = legible_against(dim, dark_bg, 3.0);
+        assert!(contrast_ratio(lit, dark_bg) >= 3.0);
+        // Endpoint selection (toward white on a dark bg) pinned per-channel: every
+        // channel is pulled UP.
+        assert!(
+            lit.r >= dim.r && lit.g >= dim.g && lit.b >= dim.b,
+            "toward-white pull raises every channel ({lit:?} vs {dim:?})"
+        );
+    }
+
+    #[test]
+    fn light_paper_bright_cyan_yellow_are_legible_after_the_remap() {
+        // AC (the riskiest combo): bright cyan + bright yellow on light "paper".
+        // The verbatim dossier values fail a 3:1 legibility floor; the renderer's
+        // legibility remap (with_fg_legibility against bg_canvas) brings them up.
+        let bg = LIGHT.colors.bg_canvas;
+        let base = LIGHT.ansi;
+        assert!(
+            contrast_ratio(base.bright_cyan, bg) < 3.0
+                && contrast_ratio(base.bright_yellow, bg) < 3.0,
+            "precondition: the raw light brights are sub-3:1 (cyan {:.2}, yellow {:.2})",
+            contrast_ratio(base.bright_cyan, bg),
+            contrast_ratio(base.bright_yellow, bg),
+        );
+        let remapped = base.with_fg_legibility(bg, 3.0);
+        for (name, c) in [
+            ("bright_cyan", remapped.bright_cyan),
+            ("bright_yellow", remapped.bright_yellow),
+        ] {
+            assert!(
+                contrast_ratio(c, bg) >= 3.0,
+                "{name} must be legible (>=3:1) on light paper after remap, got {:.2}",
+                contrast_ratio(c, bg)
+            );
+        }
+        // Every entry of the remapped light palette clears the floor, and an
+        // already-legible entry (the dark `black` slot) is untouched.
+        for i in 0u8..=15 {
+            assert!(contrast_ratio(remapped.by_index(i), bg) >= 3.0);
+        }
+        assert_eq!(
+            remapped.black, base.black,
+            "an already-legible slot is unchanged"
+        );
     }
 }

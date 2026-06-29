@@ -1149,6 +1149,7 @@ mod gpu_tests {
 #[cfg(test)]
 mod sig_tests {
     use super::theme_signature;
+    use crate::app::effective_theme;
     use aterm_tokens::{Theme, ThemeKind};
 
     #[test]
@@ -1164,6 +1165,28 @@ mod sig_tests {
             theme_signature(&dark),
             theme_signature(&light),
             "a theme change must change the rebuild-gate signature (else the renderer keeps stale colors)"
+        );
+    }
+
+    #[test]
+    fn theme_signature_pins_the_effective_palette_the_renderer_draws() {
+        // The theme that actually reaches prepare() is `effective_theme(kind)` (the
+        // LIGHT palette AFTER the legibility remap), not the raw `Theme::for_kind`.
+        // Pin the runtime-relevant pairs so a future palette edit cannot silently
+        // collide the rebuild-gate signatures and keep stale colors on screen.
+        let eff_light = effective_theme(ThemeKind::Light);
+        let eff_dark = effective_theme(ThemeKind::Dark);
+        assert_ne!(
+            theme_signature(&eff_light),
+            theme_signature(&eff_dark),
+            "a light↔dark switch (effective palettes) must invalidate the rebuild gate"
+        );
+        // The remap must be visible in the signature: the effective light palette
+        // differs from the raw light palette, so applying it forces a rebuild.
+        assert_ne!(
+            theme_signature(&eff_light),
+            theme_signature(Theme::for_kind(ThemeKind::Light)),
+            "the light legibility remap must change the signature (else its effect is invisible to the gate)"
         );
     }
 }
