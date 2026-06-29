@@ -23,8 +23,9 @@ pub mod turn;
 pub use command::ShellCommand;
 pub use policy::{Approval, ApprovalPolicy};
 pub use provider::{
-    AgentEvent, AnthropicProvider, Effort, LlmProvider, Message, OpenAiProvider, ProviderDelta,
-    ProviderError, Role, StopReason, ToolCall, ToolSpec, TurnRequest,
+    AgentEvent, AgentEventMapper, AnthropicProvider, Effort, LlmProvider, Message, MockProvider,
+    OpenAiProvider, ProviderError, ProviderEvent, Role, StopReason, ToolCall, ToolSpec,
+    TurnRequest, Usage,
 };
 pub use risk::{gloss_for, DefaultRiskClassifier, RemoteContext, Risk, RiskAssessment, RiskReason};
 pub use sandbox::{

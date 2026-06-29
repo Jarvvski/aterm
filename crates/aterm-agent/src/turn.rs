@@ -1,11 +1,11 @@
 //! The agentic turn-loop skeleton, structured for plan → act → observe.
 //!
 //! `AgentTurn` orchestrates one user request: it asks the provider for a turn,
-//! consumes [`ProviderDelta`]s, and when the model proposes a tool call it runs
-//! it through the SAFETY SPINE (risk gate → approval policy → sandbox →
-//! output sanitizer) before feeding the observation back. The provider calls are
-//! stubs (EPIC-5), so the loop here is exercised by the unit test with a fake
-//! provider rather than a live model.
+//! folds the [`ProviderEvent`] stream through the shared [`AgentEventMapper`],
+//! and when the model proposes a tool call it runs it through the SAFETY SPINE
+//! (risk gate → approval policy → sandbox → output sanitizer) before feeding the
+//! observation back. The provider clients are stubs (T-5.2/T-5.3), so the loop
+//! here is exercised by unit tests with a stub/mock provider, not a live model.
 //!
 //! The safety spine is NOT optional and NOT model-controlled: every tool call is
 //! re-classified locally regardless of any risk the model self-reports.
@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::policy::{Approval, ApprovalPolicy};
 use crate::provider::{
-    AgentEvent, LlmProvider, ProviderDelta, ProviderError, StopReason, ToolCall, TurnRequest,
+    AgentEvent, AgentEventMapper, LlmProvider, ProviderError, ProviderEvent, ToolCall, TurnRequest,
 };
 use crate::sanitizer::OutputSanitizer;
 use crate::secrets::Secrets;
@@ -70,56 +70,41 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
         OutputSanitizer::new(self.secrets).sanitize(raw, max_len)
     }
 
-    /// Run one turn: stream provider deltas, translate them into [`AgentEvent`]s
-    /// on `events`, and surface proposed tool calls (gated) to the caller via the
+    /// Run one turn: stream the provider's [`ProviderEvent`]s through the shared
+    /// [`AgentEventMapper`], forward the resulting [`AgentEvent`]s on `events`,
+    /// and surface the proposed (parsed) tool calls to the caller via the
     /// returned vec. Tool EXECUTION itself is the app layer's job; this loop owns
     /// the plan→act→observe structure and the gating, not process spawning.
     ///
     /// Because the providers are stubs, a real provider call returns
     /// `NotImplemented`; the loop forwards that as an `AgentEvent::Error` and
-    /// completes cleanly (no panic).
+    /// surfaces the error to the caller (no panic). Looping on `tool_use` (ACT →
+    /// re-issue with observations) is T-5.8.
     pub async fn run(
         &self,
         request: TurnRequest,
         events: mpsc::Sender<AgentEvent>,
     ) -> Result<Vec<ToolCall>, ProviderError> {
-        let (dtx, mut drx) = mpsc::channel::<ProviderDelta>(64);
-
-        // Spawn the provider stream. With stub providers this resolves quickly to
-        // an error, which we report rather than panic on.
+        // NOTE(T-5.8): stub providers send nothing then return, so awaiting the
+        // stream before draining is safe here. A real streaming provider must be
+        // spawned and drained concurrently to avoid filling this bounded channel.
+        let (dtx, mut drx) = mpsc::channel::<ProviderEvent>(64);
         let provider_result = self.provider.stream_turn(request, dtx).await;
 
+        let mut mapper = AgentEventMapper::new();
         let mut proposed: Vec<ToolCall> = Vec::new();
 
-        // Drain whatever the provider produced (stubs produce nothing).
-        while let Ok(delta) = drx.try_recv() {
-            match delta {
-                ProviderDelta::Thinking(t) => {
-                    let _ = events.send(AgentEvent::Thinking(t)).await;
+        while let Ok(event) = drx.try_recv() {
+            for agent_event in mapper.accept(event) {
+                if let AgentEvent::ToolProposed(call) = &agent_event {
+                    proposed.push(call.clone());
                 }
-                ProviderDelta::Text(t) => {
-                    let _ = events.send(AgentEvent::Assistant(t)).await;
-                }
-                ProviderDelta::ToolCall(call) => {
-                    let _ = events.send(AgentEvent::ToolProposed(call.clone())).await;
-                    proposed.push(call);
-                }
-                ProviderDelta::Stop {
-                    reason: StopReason::ToolUse,
-                } => {
-                    // ACT phase: the app executes approved tools and re-enters
-                    // run() with the observations appended (loop on tool_use).
-                    // TODO(ticket EPIC-5): re-issue the turn with tool results.
-                }
-                ProviderDelta::Stop { .. } => {}
+                let _ = events.send(agent_event).await;
             }
         }
 
         match provider_result {
-            Ok(()) => {
-                let _ = events.send(AgentEvent::TurnComplete).await;
-                Ok(proposed)
-            }
+            Ok(()) => Ok(proposed),
             Err(e) => {
                 let _ = events.send(AgentEvent::Error(e.to_string())).await;
                 // Surface the not-implemented stub as an error, not a panic.
