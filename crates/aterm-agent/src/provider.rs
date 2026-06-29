@@ -45,13 +45,20 @@ pub enum Role {
     Tool,
 }
 
-/// A tool the model may call (provider-neutral schema).
+/// A tool the model may call (provider-neutral schema). Built by the
+/// [`crate::tools`] registry for the custom typed tools and advertised to a
+/// provider (T-5.2/T-5.3), which maps it onto that provider's wire shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     /// JSON Schema for the tool's input.
     pub input_schema: serde_json::Value,
+    /// Constrain the model's `tool_use.input` to validate exactly against
+    /// `input_schema`. On the Anthropic Messages wire this is a sibling of
+    /// name/description/input_schema (NOT on `tool_choice`); every custom typed
+    /// tool sets it `true`. A provider client maps it into its own dialect.
+    pub strict: bool,
 }
 
 /// A fully-assembled tool call the model emitted: a stable id, the tool name,
