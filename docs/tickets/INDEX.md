@@ -32,7 +32,7 @@ Body sections, always in this order:
 
 ### Status
 
-`status` is one of the six canonical triage labels in [`../agents/triage-labels.md`](../agents/triage-labels.md) - `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `done`, `wontfix` - describing *who acts next*. Most open tickets are `ready-for-agent`; T-8.4 is `needs-info`; the landed EPIC-1/EPIC-2 foundation (all of EPIC-1 - T-1.1-T-1.9 - plus T-2.2-T-2.7), plus the EPIC-3 pure-core units T-3.1 (the unified-input reducer) and T-3.7 (the shared history ring + per-mode lenses), and the EPIC-5 safety unit T-5.6 (the single Secrets source + OutputSanitizer), is `done` (acceptance criteria met; any on-hardware/visual residual is consolidated into its proper future ticket - EPIC-4/T-4.6, EPIC-7, T-8.1 - never parked on a human). With T-1.8 the renderer draws via the wgpu instanced glyph-atlas pipeline (the typing-lag cure), not the interim glyphon path. **Ordering/blocking is expressed by `depends_on`, not a status** - a ticket whose upstream tickets have not landed still reads `ready-for-agent`; an agent simply works the dependency-satisfied tickets first.
+`status` is one of the six canonical triage labels in [`../agents/triage-labels.md`](../agents/triage-labels.md) - `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `done`, `wontfix` - describing *who acts next*. Most open tickets are `ready-for-agent`; T-8.4 is `needs-info`; the landed EPIC-1/EPIC-2 foundation (all of EPIC-1 - T-1.1-T-1.9 - plus T-2.2-T-2.7), the full EPIC-4 design-system pass (T-4.1-T-4.6: tokens, themes, the three-register fonts, the Nerd-Font + sprite faces, and the on-screen block-timeline component drawing), plus the EPIC-3 pure-core units T-3.1 (the unified-input reducer) and T-3.7 (the shared history ring + per-mode lenses), and the EPIC-5 safety unit T-5.6 (the single Secrets source + OutputSanitizer), is `done` (acceptance criteria met; any on-hardware/visual residual is consolidated into its proper future ticket - EPIC-3/T-3.6 (the input box + live prompt echo), EPIC-5/T-5.10 (agent-card data), EPIC-7, T-8.1 - never parked on a human). With T-1.8 the renderer draws via the wgpu instanced glyph-atlas pipeline (the typing-lag cure), not the interim glyphon path. **Ordering/blocking is expressed by `depends_on`, not a status** - a ticket whose upstream tickets have not landed still reads `ready-for-agent`; an agent simply works the dependency-satisfied tickets first.
 
 ## Conventions all tickets share
 
@@ -102,7 +102,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-4.3 | Bundle Duo/Quattro + three-register font wiring | done | T-1.6 |
 | T-4.4 | Nerd Font per-codepoint constraint table | done | T-1.6 |
 | T-4.5 | Sprite face for box-drawing/Powerline/braille | done | T-1.6 |
-| T-4.6 | Component specs: block, prompt, agent card, chip, risk badge | ready-for-agent | T-4.1, T-2.7 |
+| T-4.6 | Component specs: block, prompt, agent card, chip, risk badge | done | T-4.1, T-2.7 |
 
 ### EPIC-5 - Agent loop + safety
 | id | title | status | depends_on |

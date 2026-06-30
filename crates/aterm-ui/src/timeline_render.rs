@@ -18,19 +18,23 @@
 //! rect pipeline; the whole front-end is one rect draw + one glyph draw.
 //!
 //! ## Scope (T-4.6)
-//! This draws the COMMAND-block timeline (Mono). The agent-card Duo prose body + Quattro
-//! chrome chips also compose through this same atlas (proven by [`crate::prose`] +
-//! [`crate::components`]) but are driven by the agent-step data model (T-5.10), so they
-//! wire in once that lands. The running (tail) block's LIVE output is composed by
-//! [`crate::gpu`] from the grid `Snapshot` (its captured `output` is empty until it
-//! finishes); this front-end draws the finished history.
+//! This draws the COMMAND-block timeline (Mono) for BOTH finished and running blocks:
+//! the running block carries its LIVE output in the block model (the engine's
+//! incremental capture streams it in - `aterm-core` `live_capture`), so a streaming
+//! command renders here, not from the grid `Snapshot`. The agent-card Duo prose body and
+//! Quattro chrome chips also compose through this same atlas (proven by `crate::prose`
+//! and `crate::components`) but are driven by the agent-step data model (T-5.10), so they
+//! wire in once that lands.
 //!
 //! ## Damage gating
-//! Like the grid, [`Self::prepare`] keys a full instance rebuild on a cheap signature
-//! over the visible blocks + scroll + viewport + px + theme, and early-outs (reusing the
-//! prior instance buffers, ZERO allocation) when nothing drawn changed. The per-frame
-//! [`crate::timeline::layout`] call itself allocates, so the live caller ([`crate::gpu`])
-//! must gate THAT on a blocks-changed signal to keep the steady-state present alloc-free.
+//! Like the grid, [`Self::prepare`] keys a full instance rebuild on a cheap signature -
+//! over the visible blocks + their drawn CELL CONTENT + scroll + viewport + px + theme -
+//! and early-outs (reusing the prior instance buffers, ZERO allocation) when nothing
+//! drawn changed. Folding the visible cells (not just `output.len()`) is what catches a
+//! running command's in-place `\r` redraw (a progress bar / spinner) where the row count
+//! is unchanged but the content is not. The per-frame [`crate::timeline::layout`] call
+//! itself allocates, so the live caller ([`crate::gpu`]) gates THAT on a snapshot-version
+//! signal to keep the steady-state (idle) present allocation-free.
 
 use std::mem::size_of;
 
@@ -426,6 +430,29 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
         s = fold_color(s, theme.ansi.by_index(i));
     }
 
+    /// Fold one snapshot cell's drawn facts (glyph + colors + attribute flags).
+    fn fold_cell(h: u64, c: &aterm_core::SnapshotCell) -> u64 {
+        let color = |x: aterm_core::CellColor| -> u64 {
+            match x {
+                aterm_core::CellColor::Named(n) => (1 << 33) | u64::from(n),
+                aterm_core::CellColor::Indexed(i) => (2 << 33) | u64::from(i),
+                aterm_core::CellColor::Rgb(r, g, b) => {
+                    (3 << 33) | (u64::from(r) << 16) | (u64::from(g) << 8) | u64::from(b)
+                }
+            }
+        };
+        let flags = u64::from(c.bold)
+            | u64::from(c.italic) << 1
+            | u64::from(c.underline) << 2
+            | u64::from(c.inverse) << 3
+            | u64::from(c.wide) << 4
+            | u64::from(c.wide_spacer) << 5;
+        let mut h = fold_u64(h, c.c as u64);
+        h = fold_u64(h, color(c.fg));
+        h = fold_u64(h, color(c.bg));
+        fold_u64(h, flags)
+    }
+
     s = fold_u64(s, layout.visible.len() as u64);
     for vb in &layout.visible {
         s = fold_u64(s, vb.index as u64);
@@ -434,10 +461,36 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
         s = fold_u64(s, vb.display_height);
         s = fold_u64(s, vb.rows.len() as u64);
         s = fold_u64(s, gutter_code(vb.gutter));
-        s = fold_u64(s, vb.block.command.len() as u64);
         s = fold_u64(s, vb.block.output.len() as u64);
         s = fold_u64(s, vb.block.exit_code.map_or(u64::MAX, |c| c as i64 as u64));
         s = fold_u64(s, vb.block.is_running() as u64);
+        // Fold the DRAWN CONTENT of each visible row - bounded by the visible rows
+        // (~viewport), so it stays cheap - so an in-place redraw (a running command's
+        // `\r` progress bar / spinner: row count unchanged, content changed) and a
+        // tail-shift both invalidate the gate. Without this the running block would
+        // freeze at its first captured value (the review's MAJOR-1 bug).
+        for row in &vb.rows {
+            match row {
+                TimelineRow::Command => {
+                    s = fold_u64(s, vb.block.command.len() as u64);
+                    for ch in vb.block.command.chars() {
+                        s = fold_u64(s, ch as u64);
+                    }
+                }
+                TimelineRow::Output(i) => match vb.block.output.get(*i) {
+                    Some(r) => {
+                        s = fold_u64(s, r.cells.len() as u64);
+                        for cell in &r.cells {
+                            s = fold_cell(s, cell);
+                        }
+                    }
+                    None => s = fold_u64(s, u64::MAX),
+                },
+                TimelineRow::CollapseAffordance { hidden } => {
+                    s = fold_u64(s, *hidden);
+                }
+            }
+        }
     }
     s
 }
@@ -447,6 +500,13 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
 /// `set_block_output` (exactly how the model thread populates a finished block).
 #[cfg(test)]
 fn block_with_output(out_rows: usize, exit: Option<i32>) -> aterm_core::BlockList {
+    block_with_output_char(out_rows, exit, 'X')
+}
+
+/// As [`block_with_output`] but with a chosen output glyph, so a test can vary the
+/// drawn CONTENT while holding the structure (row count / state) fixed.
+#[cfg(test)]
+fn block_with_output_char(out_rows: usize, exit: Option<i32>, ch: char) -> aterm_core::BlockList {
     use aterm_core::{BlockSegmenter, CellColor, Mark, PromptKind, RowSnapshot, SnapshotCell};
     let mut list = aterm_core::BlockList::new();
     let mut seg = BlockSegmenter::new();
@@ -460,7 +520,7 @@ fn block_with_output(out_rows: usize, exit: Option<i32>) -> aterm_core::BlockLis
     let rows: Vec<RowSnapshot> = (0..out_rows)
         .map(|_| {
             RowSnapshot::new(vec![SnapshotCell {
-                c: 'X',
+                c: ch,
                 fg: CellColor::Rgb(255, 255, 255),
                 bg: CellColor::Named(257), // canvas -> bg quad skipped
                 ..Default::default()
@@ -480,6 +540,24 @@ mod sig_tests {
 
     fn dark() -> Theme {
         *Theme::for_kind(ThemeKind::Dark)
+    }
+
+    #[test]
+    fn in_place_content_change_invalidates_the_gate() {
+        // MAJOR-1 regression guard: a running command's in-place `\r` redraw changes the
+        // drawn CELL CONTENT while the row count / block state stay the same. The damage
+        // gate must fold the visible content, else the timeline freezes at the first
+        // value. Two blocks identical in structure but differing only in their output
+        // glyph must produce DIFFERENT signatures.
+        let a = block_with_output_char(2, Some(0), 'A');
+        let b = block_with_output_char(2, Some(0), 'B');
+        let la = layout(&a, false, Scroll::default(), 20);
+        let lb = layout(&b, false, Scroll::default(), 20);
+        assert_ne!(
+            signature(&la, 800, 600, 13, &dark()),
+            signature(&lb, 800, 600, 13, &dark()),
+            "same structure, different drawn content must invalidate the damage gate"
+        );
     }
 
     #[test]

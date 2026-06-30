@@ -13,6 +13,31 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The block timeline is now drawn on screen (iA component styling).** The renderer no
+  longer falls back to the raw VT grid in normal use: it composes the Warp-style block
+  timeline from the published block model - a left-gutter status marker (running =
+  pulsing accent dot, exit-0 = success tick, exit≠0 = danger dot + code, heuristic =
+  caution half-dot), the re-rendered command line, the captured output rows, hairline
+  separators, and a "... +N lines" collapse affordance - all styled to the iA spec from
+  `aterm-tokens` with no hardcoded colors, in both themes. A new token-driven component
+  layer reifies the five component specs (command block, prompt routing chip, agent
+  card, status chip, risk-gate badge) as pure, theme-aware style descriptors; the
+  risk-gate badge always pairs a text label with its color across all three states
+  (Allowed / Needs-approval / Blocked) for color-blind safety, and motion is capped to
+  the three allowed animations (block insert, cross-fade, focus dim), each ≤ 220ms. The
+  raw grid is now drawn only for full-screen (alt-screen) apps. The shared `GlyphAtlas`
+  and its rect + glyph pipelines were hoisted up so the grid, prose, and timeline
+  front-ends all draw through one atlas; the grid's 60fps invariants (single glyph draw
+  call, rasterize-once, zero-alloc steady-state present) are preserved, and the timeline
+  path is damage-gated so an idle present allocates nothing. (Ticket T-4.6.)
+- **A running command streams its live output into its block.** The engine now captures
+  the in-flight command's output incrementally and publishes it into the running block
+  each tick, so the timeline shows a command's output as it streams (not only after it
+  finishes); the active/running block shows its full output uncollapsed (tail-visible,
+  like a live terminal), while finished blocks collapse long output to keep scrollback
+  tidy. (Ticket T-4.6.) Composing the agent-card Duo prose body + Quattro chrome chips
+  and the live unified-input prompt into the timeline follows their data/widget tickets
+  (T-5.10, T-3.6); the on-hardware iA visual review is the owner-watched acceptance step.
 - **Three-register fonts: Duo prose + Quattro chrome over one shared glyph atlas.** The
   agent-prose register (iM Writing **Duo**, duospace) and the dense-chrome register (iM
   Writing **Quattro**, four widths) now load and render through a real proportional text

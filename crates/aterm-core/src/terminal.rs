@@ -65,6 +65,14 @@ const CAPTURE_VIEWPORT_ROWS: usize = 24;
 /// in the replay (rare; the streaming / packed-storage capture is the follow-up).
 const CAPTURE_SCROLLBACK: usize = 50_000;
 
+/// Scrollback for the INCREMENTAL live-capture terminal ([`Terminal::new_capture`],
+/// ticket T-4.6). Deliberately a small TAIL window, NOT [`CAPTURE_SCROLLBACK`]: the
+/// running block streams to the bottom-pinned timeline, so only the latest output is
+/// shown live, and snapshotting it each publish must stay O(tail) rather than O(total
+/// output) to hold the 60fps floor under a flood (`yes`, `tail -f`, a verbose build).
+/// The authoritative FULL output is still captured at `D` by replaying the byte buffer.
+const LIVE_CAPTURE_SCROLLBACK: usize = 512;
+
 /// Color of a cell as resolved by the VT engine, in a renderer-neutral form.
 ///
 /// We deliberately keep alacritty's `Color` semantics (named / indexed / true
@@ -486,10 +494,12 @@ impl Terminal {
     /// output (ticket T-4.6): the engine feeds it the command's clean bytes as they
     /// arrive and snapshots it each publish via [`Self::live_output_rows`], so the
     /// running block carries its live output without re-replaying the whole buffer every
-    /// tick. Same width + generous scrollback as the one-shot [`Self::capture_output_rows`].
+    /// tick. Bounded to a [`LIVE_CAPTURE_SCROLLBACK`] TAIL window (NOT the full
+    /// [`CAPTURE_SCROLLBACK`]) so the per-publish snapshot stays O(tail) under a flood -
+    /// the running block shows the latest output; the FULL output is captured at `D`.
     #[must_use]
     pub fn new_capture(cols: usize) -> Self {
-        Terminal::with_scrollback(CAPTURE_VIEWPORT_ROWS, cols.max(1), CAPTURE_SCROLLBACK)
+        Terminal::with_scrollback(CAPTURE_VIEWPORT_ROWS, cols.max(1), LIVE_CAPTURE_SCROLLBACK)
     }
 
     /// Snapshot this (incremental capture) terminal's current output rows - the live
@@ -871,6 +881,35 @@ mod tests {
                 .iter()
                 .any(|r| row_text(r).contains("second line")),
             "the second line is captured live alongside the first"
+        );
+    }
+
+    #[test]
+    fn new_capture_bounds_live_rows_to_a_tail_window_under_a_flood() {
+        // T-4.6 perf: the live-capture terminal retains only a bounded TAIL, so
+        // snapshotting it each publish stays O(tail) even when a running command floods.
+        // Feed far more lines than the tail window and assert the captured rows stay
+        // bounded AND show the LATEST output (the tail), not the head.
+        let text = |r: &RowSnapshot| r.cells.iter().map(|c| c.c).collect::<String>();
+        let mut t = Terminal::new_capture(20);
+        let flood = (0..5_000).fold(String::new(), |mut s, i| {
+            s.push_str(&format!("line{i}\r\n"));
+            s
+        });
+        t.feed(flood.as_bytes());
+        let rows = t.live_output_rows();
+        assert!(
+            rows.len() <= LIVE_CAPTURE_SCROLLBACK + CAPTURE_VIEWPORT_ROWS,
+            "live rows stay bounded to the tail window under a flood (got {})",
+            rows.len()
+        );
+        assert!(
+            rows.iter().any(|r| text(r).contains("line4999")),
+            "the latest line is retained (the tail, not the head)"
+        );
+        assert!(
+            !rows.iter().any(|r| text(r) == "line0"),
+            "the oldest line has scrolled out of the bounded tail"
         );
     }
 }

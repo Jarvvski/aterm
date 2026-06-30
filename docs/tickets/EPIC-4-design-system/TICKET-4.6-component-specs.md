@@ -2,7 +2,7 @@
 id: T-4.6
 epic: EPIC-4-design-system
 title: Component specs - block, prompt, agent card, chip, risk badge
-status: ready-for-agent
+status: done
 labels: [ui, design]
 depends_on: [T-4.1, T-2.7]
 ---
@@ -49,3 +49,33 @@ this ticket: the component styling AND the live-active-region composition (drawi
 finished blocks from captured output while the running command shows its live output,
 without duplicating scrollback) - the renderer currently draws the raw grid as a
 non-regressing stand-in. Scroll input is EPIC-3 (T-3.x).
+
+**Done 2026-06-30.** Landed across five commits:
+- `aterm-ui/src/components.rs` - the pure, token-driven, both-themes-tested component
+  style layer (command block, prompt routing chip, agent card, status chip, 3-state
+  risk-gate badge that always pairs a label with its color; the 3-animation motion
+  budget). No hardcoded colors. (AC1 style, AC2, AC3-chip, AC4-motion.)
+- The shared `GlyphAtlas` + rect/glyph pipelines were hoisted up to `GpuRenderer` (the
+  T-4.3 forward-note) so grid/prose/timeline share one atlas; the grid's 60fps
+  invariants are preserved.
+- `aterm-ui/src/timeline_render.rs` - the GPU timeline compositor (gutter marker,
+  command line, output rows via the shared `cell_render::emit_cell`, hairlines, collapse
+  affordance), damage-gated, GPU-tested in both themes.
+- The **live-active region** was solved at the data model rather than by snapshot-slicing
+  (the published `Snapshot` exposes no prompt-row anchor): `aterm-core` now streams the
+  running command's output into its block incrementally, and the running block shows its
+  full uncollapsed tail. `GpuRenderer` draws the **block timeline as the primary view**
+  (the raw grid only for alt-screen / no-engine), so the stand-in is replaced. (AC1 draw,
+  AC4 no-per-frame-alloc via the timeline idle gate + the grid steady-state.)
+
+**Consolidated forward (not regressions - dependency-gated):**
+- The agent-card Duo prose body + the Quattro chrome chips are STYLED + tested but not
+  yet DRAWN live (no agent-step data model) -> **T-5.10** (data) / **T-5.11** (approval
+  UX) wire them through the same atlas.
+- The unified-input prompt chip + the live pre-submit input echo are the input box's
+  domain -> **T-3.6**. Until then a command's typed text appears in the timeline once
+  submitted (its block's command line).
+- AC5 (on-hardware iA visual review on real `ls`/`vim`/`git diff` output, both themes) is
+  the **owner-watched** acceptance step, consistent with this crate's "GPU/window code is
+  owner-watched, not unit-tested" convention; the render path itself is offscreen
+  GPU-tested (gutter + output + hairline ink, both themes).
