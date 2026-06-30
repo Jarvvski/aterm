@@ -230,7 +230,7 @@ impl GpuRenderer {
         // Reserve the bottom input zone (ticket T-3.6) so the timeline lays out ABOVE it.
         // `zone_px` is the single source of the zone height shared with the input front-end.
         // The viewport uniform stays the FULL surface size; only the layout row budget
-        // shrinks, which keeps the timeline's last row (and bottom hairline) above the box.
+        // shrinks, which keeps the timeline's last row above the box.
         let (_, ch) = crate::window::cell_px(self.scale_factor);
         let input_zone = if draw_input {
             crate::input_widget::zone_px(
@@ -241,7 +241,19 @@ impl GpuRenderer {
             0.0
         };
         let effective_h = (self.config.height as f32 - input_zone).max(0.0);
-        let viewport_rows = (effective_h / ch).floor().max(0.0) as u64;
+        // The block timeline reserves top + bottom canvas breathing room (T-4.7,
+        // `space::S12` each), so fewer rows fit than the raw surface height. The grid
+        // fast-path keeps its own tight inset and does not consume this row budget.
+        // The split is asymmetric across two files BY DESIGN: this reserves BOTH bands
+        // (2x) in the row budget, while `timeline_render` applies only the TOP margin
+        // (`top_margin = S12`) as an explicit y-offset - the matching BOTTOM band is the
+        // unused tail of this shrunken budget (the last row's bottom lands at
+        // `top_margin + viewport_rows*ch <= effective_h - S12`). Keep the `2.0 *` here in
+        // step with that single top offset there, or the symmetric rhythm drifts.
+        let timeline_breathing = 2.0 * f32::from(aterm_tokens::space::S12) * self.scale_factor;
+        let viewport_rows = ((effective_h - timeline_breathing).max(0.0) / ch)
+            .floor()
+            .max(0.0) as u64;
 
         // Build instances BEFORE acquiring the surface texture. Each front-end's rebuild
         // is damage-gated and reuses its buffers with zero allocation when nothing
@@ -253,7 +265,7 @@ impl GpuRenderer {
                 // Pin to the bottom (the live-terminal default) until scroll input lands
                 // (EPIC-3); the latest blocks + the running command's tail stay on screen.
                 self.scroll
-                    .to_bottom(blocks.total_height_rows(), viewport_rows);
+                    .to_bottom(crate::timeline::total_display_rows(blocks), viewport_rows);
                 self.last_visible_blocks =
                     crate::timeline::visible_block_count(blocks, false, self.scroll, viewport_rows);
                 // Idle gate: `timeline::layout` allocates, so skip it (and the rebuild)

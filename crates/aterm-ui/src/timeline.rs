@@ -30,9 +30,88 @@
 
 use aterm_core::{Block, BlockList};
 
+/// The inter-block vertical rhythm, in whole *display* rows (ticket T-4.7): one blank
+/// line-box of whitespace between adjacent blocks, so the timeline reads like iA Writer
+/// rather than a dense terminal. This is the row-coordinate realization of the design's
+/// `aterm_tokens::space::S6` (~24px) "between blocks" token - the row coordinate's
+/// quantum is the grid line box (~17px logical), so the gap is one row; an exact-px
+/// vertical gap would require a pixel-precise scroll coordinate (the row-based SumTree /
+/// [`Scroll`] coordinate is whole-row), a deliberately deferred refactor.
+///
+/// The gap is baked into the gapped coordinate ([`total_display_rows`], [`gapped_top`])
+/// the layout reports, so the scroll extent, scroll-clamp, hit-testing, and on-screen
+/// placement ALL account for it - it is never added "only at paint time" (T-4.7 AC4).
+/// The renderer (`timeline_render`) draws these gap rows as empty whitespace with one
+/// muted hairline centered in each boundary gap.
+pub const GAP_ROWS: u64 = 1;
+
+/// The timeline's total scroll extent in *display* rows, INCLUDING the inter-block gaps
+/// ([`GAP_ROWS`] between each adjacent pair) - the gapped-coordinate analogue of
+/// [`BlockList::total_height_rows`] (which is the gap-less content total). A list of `n`
+/// blocks has `n - 1` interior boundaries, so `n.saturating_sub(1)` gaps. This is the
+/// extent the scroll position is clamped against (T-4.7 AC4); both [`layout`] and the
+/// live caller's scroll-to-bottom use it so they share one coordinate.
+#[must_use]
+pub fn total_display_rows(blocks: &BlockList) -> u64 {
+    let n = blocks.len() as u64;
+    blocks.total_height_rows() + n.saturating_sub(1) * GAP_ROWS
+}
+
+/// The gapped-coordinate display-row of block `i`'s top content edge: its gap-less
+/// content top ([`BlockList::block_top_row`], O(log n) via the SumTree) plus the `i`
+/// inter-block gaps that precede it. Strictly increasing in `i` (each block is >= 1
+/// content row plus a gap), so the viewport binary searches below are well-defined.
+#[must_use]
+fn gapped_top(blocks: &BlockList, i: usize) -> u64 {
+    blocks.block_top_row(i) + i as u64 * GAP_ROWS
+}
+
+/// Smallest block index whose gapped BOTTOM edge is strictly below `row` (i.e. the first
+/// block that still has a content row at or beyond `row`) - the first block intersecting
+/// a viewport whose top is `row`. O(log n) over the (monotonic) gapped bottoms; each
+/// probe is an O(log n) SumTree prefix, so O(log^2 n) - the same backbone as
+/// [`BlockList::blocks_in_viewport`], extended with the uniform gap term.
+#[must_use]
+fn first_block_intersecting(blocks: &BlockList, row: u64) -> usize {
+    let mut lo = 0usize;
+    let mut hi = blocks.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let g_bottom =
+            gapped_top(blocks, mid) + blocks.get(mid).map_or(0, Block::display_height_rows);
+        if g_bottom > row {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// Smallest block index whose gapped TOP edge is at or past `row` - the first block
+/// entirely below a viewport whose bottom (exclusive) is `row`. O(log^2 n) like
+/// [`first_block_intersecting`]; the half-open `[first_block_intersecting(top),
+/// first_block_at_or_below(bottom))` is exactly the set of blocks the layout draws.
+#[must_use]
+fn first_block_at_or_below(blocks: &BlockList, row: u64) -> usize {
+    let mut lo = 0usize;
+    let mut hi = blocks.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if gapped_top(blocks, mid) >= row {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
 /// Vertical scroll position of the timeline, in *display* rows from the very top
-/// (`0` = top of the oldest block). The renderer owns one of these; input bindings
-/// (wheel / keys) that mutate it are EPIC-3.
+/// (`0` = top of the oldest block). Display rows include the inter-block gaps
+/// ([`GAP_ROWS`]); clamp against [`total_display_rows`], not the gap-less content total.
+/// The renderer owns one of these; input bindings (wheel / keys) that mutate it are
+/// EPIC-3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Scroll {
     pub offset_rows: u64,
@@ -207,7 +286,11 @@ pub fn layout(
     scroll: Scroll,
     viewport_rows: u64,
 ) -> TimelineLayout<'_> {
-    let total_rows = blocks.total_height_rows();
+    // The scroll extent and every placement below are in the GAPPED display-row
+    // coordinate (content rows + the inter-block [`GAP_ROWS`]), so scroll, hit-testing,
+    // and on-screen placement share one coordinate that already accounts for the
+    // whitespace rhythm (T-4.7 AC4).
+    let total_rows = total_display_rows(blocks);
     let scroll = scroll.clamped(total_rows, viewport_rows);
 
     if alt_screen {
@@ -224,18 +307,23 @@ pub fn layout(
     if viewport_rows > 0 {
         let vp_top = scroll.offset_rows;
         let vp_bottom = vp_top.saturating_add(viewport_rows); // exclusive
-        for index in blocks.blocks_in_viewport(vp_top, viewport_rows) {
+                                                              // "Virtualize twice" in the gapped coordinate: the SumTree (via the gapped
+                                                              // binary searches) picks the blocks intersecting [vp_top, vp_bottom), then
+                                                              // `visible_rows` keeps only the on-screen rows of each.
+        let start = first_block_intersecting(blocks, vp_top);
+        let end = first_block_at_or_below(blocks, vp_bottom);
+        for index in start..end {
             let Some(block) = blocks.get(index) else {
-                continue;
+                break;
             };
-            let block_top = blocks.block_top_row(index);
-            let (rows, first_abs_row) = visible_rows(block, block_top, vp_top, vp_bottom);
+            let g_top = gapped_top(blocks, index);
+            let (rows, first_abs_row) = visible_rows(block, g_top, vp_top, vp_bottom);
             visible.push(VisibleBlock {
                 index,
                 block,
                 gutter: GutterMarker::for_block(block),
                 display_height: block.display_height_rows(),
-                top_in_viewport: block_top as i64 - vp_top as i64,
+                top_in_viewport: g_top as i64 - vp_top as i64,
                 first_row_in_viewport: first_abs_row as i64 - vp_top as i64,
                 rows,
             });
@@ -307,11 +395,14 @@ pub fn visible_block_count(
     if alt_screen || viewport_rows == 0 {
         return 0;
     }
-    let total = blocks.total_height_rows();
+    let total = total_display_rows(blocks);
     let scroll = scroll.clamped(total, viewport_rows);
-    blocks
-        .blocks_in_viewport(scroll.offset_rows, viewport_rows)
-        .len()
+    let vp_top = scroll.offset_rows;
+    let vp_bottom = vp_top.saturating_add(viewport_rows);
+    // Same gapped [start, end) span the full `layout` builds, computed without
+    // allocating the block list - O(log n) via the SumTree-backed binary searches.
+    first_block_at_or_below(blocks, vp_bottom)
+        .saturating_sub(first_block_intersecting(blocks, vp_top))
 }
 
 #[cfg(test)]
@@ -354,9 +445,16 @@ mod tests {
     #[test]
     fn virtualization_builds_only_on_screen_blocks() {
         // AC1: a 10k-block timeline builds geometry for only the ~viewport blocks on
-        // screen, never the whole list. The SumTree culls in O(log n).
+        // screen, never the whole list. The SumTree culls in O(log n) - now in the
+        // GAPPED coordinate (each 1-row block is followed by a 1-row gap, so a block
+        // occupies 2 gapped rows and ~viewport/2 blocks fit). T-4.7.
         let blocks = build_blocks(10_000);
-        assert_eq!(blocks.total_height_rows(), 10_000);
+        assert_eq!(blocks.total_height_rows(), 10_000, "gap-less content total");
+        assert_eq!(
+            total_display_rows(&blocks),
+            10_000 + 9_999 * GAP_ROWS,
+            "the scroll extent includes the 9,999 interior gaps"
+        );
         let viewport = 40u64;
         let l = layout(&blocks, false, Scroll { offset_rows: 5_000 }, viewport);
         assert_eq!(l.mode, TimelineMode::Timeline);
@@ -365,14 +463,67 @@ mod tests {
             "only on-screen blocks build geometry, got {}",
             l.visible_block_count()
         );
-        assert!(l.visible_block_count() >= viewport as usize - 1);
-        // The first visible block contains the top scroll row (each block is 1 row).
-        assert_eq!(l.visible.first().unwrap().index, 5_000);
-        // The cheap counter agrees with the full layout.
+        // gapped_top(i) = 2i; viewport [5000, 5040) -> blocks 2500..2520 (20 of them).
+        assert_eq!(l.visible_block_count(), 20);
+        assert_eq!(l.visible.first().unwrap().index, 2_500);
+        assert_eq!(l.visible.last().unwrap().index, 2_519);
+        // The cheap O(log n) counter agrees with the full layout.
         assert_eq!(
             visible_block_count(&blocks, false, Scroll { offset_rows: 5_000 }, viewport),
             l.visible_block_count()
         );
+    }
+
+    /// Brute-force reference: the blocks whose GAPPED span intersects `[vp_top,
+    /// vp_bottom)`, computed in O(n) directly from the height index + gap. The layout's
+    /// O(log n) binary searches must agree with this for any heights/scroll (the
+    /// gapped analogue of the core `height_index_matches_naive` test).
+    fn naive_visible(blocks: &BlockList, vp_top: u64, vp_bottom: u64) -> Vec<usize> {
+        (0..blocks.len())
+            .filter(|&i| {
+                let g_top = blocks.block_top_row(i) + i as u64 * GAP_ROWS;
+                let g_bottom = g_top + blocks.get(i).unwrap().display_height_rows();
+                g_top < vp_bottom && g_bottom > vp_top
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gapped_virtualization_matches_the_naive_reference() {
+        // Varied heights so the gap term is non-trivial against the content tops.
+        let mut blocks = build_blocks(30);
+        for i in (0..30).step_by(3) {
+            blocks.set_block_output(i, blank_rows(i % 7)); // 0..6 output rows
+        }
+        let total = total_display_rows(&blocks);
+        for viewport in [1u64, 3, 8, total + 5] {
+            for &scroll in &[0u64, 2, 7, total / 2, total.saturating_sub(1), total + 99] {
+                let l = layout(
+                    &blocks,
+                    false,
+                    Scroll {
+                        offset_rows: scroll,
+                    },
+                    viewport,
+                );
+                let vp_top = l.scroll.offset_rows; // clamped
+                let got: Vec<usize> = l.visible.iter().map(|b| b.index).collect();
+                let want = naive_visible(&blocks, vp_top, vp_top + viewport);
+                assert_eq!(got, want, "viewport={viewport} scroll={scroll}");
+                // The cheap counter tracks the full layout for every case.
+                assert_eq!(
+                    visible_block_count(
+                        &blocks,
+                        false,
+                        Scroll {
+                            offset_rows: scroll
+                        },
+                        viewport
+                    ),
+                    got.len()
+                );
+            }
+        }
     }
 
     #[test]
@@ -381,7 +532,9 @@ mod tests {
         // the SumTree.
         let blocks = build_blocks(1_000);
         let viewport = 30u64;
-        let total = blocks.total_height_rows();
+        // Scroll-to-bottom uses the GAPPED extent (the live caller does the same), so
+        // the bottom pins past the interior gaps to the genuine last block.
+        let total = total_display_rows(&blocks);
 
         let mut scroll = Scroll::default();
         scroll.to_bottom(total, viewport);
@@ -404,11 +557,12 @@ mod tests {
 
     #[test]
     fn scroll_clamps_within_bounds() {
-        let blocks = build_blocks(10); // total 10 display rows
+        let blocks = build_blocks(10); // 10 content rows + 9 interior gaps = 19 gapped
         let viewport = 4u64;
-        // Over-scroll clamps to max_offset = total - viewport = 6.
+        // Over-scroll clamps to max_offset = gapped_total - viewport = 19 - 4 = 15.
+        assert_eq!(total_display_rows(&blocks), 19);
         let l = layout(&blocks, false, Scroll { offset_rows: 9_999 }, viewport);
-        assert_eq!(l.scroll.offset_rows, 6);
+        assert_eq!(l.scroll.offset_rows, 15);
         assert_eq!(
             l.visible.last().unwrap().index,
             9,
@@ -480,12 +634,51 @@ mod tests {
     }
 
     #[test]
+    fn inter_block_gap_offsets_placement_not_just_paint() {
+        // AC4: the inter-block gap is in the layout coordinate, so a following block's
+        // placement (top_in_viewport) is shifted DOWN by GAP_ROWS - it is not added only
+        // at paint time. Two 1-content-row blocks, both on screen from the top.
+        let blocks = build_blocks(2);
+        let l = layout(&blocks, false, Scroll::default(), 10);
+        assert_eq!(l.visible.len(), 2);
+        let (a, b) = (&l.visible[0], &l.visible[1]);
+        assert_eq!(a.top_in_viewport, 0, "block 0 sits at the viewport top");
+        assert_eq!(
+            b.top_in_viewport,
+            a.top_in_viewport + a.display_height as i64 + GAP_ROWS as i64,
+            "block 1 is pushed down by block 0's height PLUS one gap row"
+        );
+        // The gap row (between the two) carries no block geometry: block 0 owns row 0,
+        // block 1 owns row 2, and row 1 is the empty whitespace boundary.
+        assert_eq!(b.top_in_viewport, 2);
+    }
+
+    #[test]
+    fn scroll_extent_accounts_for_every_interior_gap() {
+        // AC4: total_display_rows == content rows + (n-1) gaps, for collapsed blocks too.
+        let mut blocks = build_blocks(4);
+        blocks.set_block_output(1, blank_rows(5)); // block 1 -> 1 + 5 = 6 display rows
+        let content = blocks.total_height_rows();
+        assert_eq!(content, 1 + 6 + 1 + 1, "1 + (1+5) + 1 + 1 content rows");
+        assert_eq!(
+            total_display_rows(&blocks),
+            content + 3 * GAP_ROWS,
+            "4 blocks -> 3 interior gaps added to the scroll extent"
+        );
+        // A single block has no interior boundary -> no gap.
+        assert_eq!(total_display_rows(&build_blocks(1)), 1);
+        assert_eq!(total_display_rows(&BlockList::new()), 0);
+    }
+
+    #[test]
     fn alt_screen_switches_mode_and_preserves_scroll() {
         // AC3: a full-screen app switches to the alt-screen surface (no block
         // geometry) and the scroll is untouched, so exiting resumes the timeline.
         let blocks = build_blocks(100);
         let viewport = 20u64;
-        let scroll = Scroll { offset_rows: 50 }.clamped(blocks.total_height_rows(), viewport);
+        // Seed against the GAPPED extent - the same coordinate every live path and
+        // `layout` clamp against - so `alt.scroll == scroll` compares like with like.
+        let scroll = Scroll { offset_rows: 50 }.clamped(total_display_rows(&blocks), viewport);
 
         let alt = layout(&blocks, true, scroll, viewport);
         assert_eq!(alt.mode, TimelineMode::AltScreen);

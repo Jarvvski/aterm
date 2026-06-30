@@ -13,6 +13,16 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The block timeline now breathes like iA Writer instead of a dense terminal.** The
+  command/output blocks get a generous horizontal gutter and top/bottom canvas breathing
+  room (no longer flush to the window edge), a full blank line of whitespace between
+  adjacent blocks, and the command line + output are padded in from the gutter. Block
+  boundaries are marked by exactly one faint hairline, centered in the inter-block
+  whitespace - the previous doubled/edge lines are gone, and whitespace (not a heavy rule)
+  is the primary separation. The inter-block gap is part of the timeline's scroll geometry
+  (scroll extent, scroll position, and hit-testing all account for it), not a paint-time
+  cosmetic, so scrolling stays exact. The raw-VT grid fast-path keeps its own tight inset
+  and is unchanged. (Ticket T-4.7.)
 - **Agent-run commands are now confined by a mandatory OS sandbox.** Before a command the
   agent proposes can run, it is wrapped in a macOS Seatbelt profile (`sandbox-exec`) generated
   on the spot: it may write only inside the project/cwd (a write to `$HOME` or `/tmp` is

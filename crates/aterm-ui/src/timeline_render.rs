@@ -43,9 +43,9 @@ use aterm_tokens::{type_scale, Theme};
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
 use crate::components::{CommandBlockStyle, GutterStyle};
-use crate::grid_render::{FrameSize, INSET_LOGICAL};
+use crate::grid_render::FrameSize;
 use crate::text::{resolve_color, FontFamily, GridCell};
-use crate::timeline::{GutterMarker, TimelineLayout, TimelineMode, TimelineRow};
+use crate::timeline::{GutterMarker, TimelineLayout, TimelineMode, TimelineRow, GAP_ROWS};
 use crate::window::cell_px;
 use aterm_tokens::space;
 
@@ -138,7 +138,19 @@ impl TimelineRenderer {
         }
 
         let (cw, ch) = cell_px(scale);
-        let inset = INSET_LOGICAL * scale;
+        // iA whitespace rhythm (T-4.7): generous canvas margins + intra-block padding,
+        // every value from the shared `space` token scale - NOT the grid's tight 8px
+        // inset, which stays on `grid_render` for the raw-VT fast path. The timeline
+        // lays out below a top breathing band and inside a horizontal gutter on both
+        // edges; the inter-block gap (one [`GAP_ROWS`] row of whitespace) is already in
+        // the layout coordinate, so here it just renders as an empty band.
+        // Top breathing band. The matching BOTTOM `space::S12` band is NOT a second
+        // offset here - the caller (`gpu::prepare`) already shrank `viewport_rows` by
+        // 2*S12, so the last row's bottom lands one S12 above the surface foot. Both
+        // bands are one constant; edit them together (see gpu.rs viewport_rows).
+        let top_margin = f32::from(space::S12) * scale; // canvas breathing room (top)
+        let edge = f32::from(space::S8) * scale; // horizontal canvas gutter (both sides)
+        let pad = f32::from(space::S4) * scale; // intra-block content padding
         let metrics = atlas.cell_metrics(FontFamily::Grid, px);
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
         let cmd = CommandBlockStyle::resolve(theme);
@@ -156,42 +168,45 @@ impl TimelineRenderer {
             canvas,
         };
 
-        // Geometry shared across blocks (logical tokens scaled to physical px).
-        let gutter_w = f32::from(cmd.gutter_px) * scale;
-        let content_x = inset + gutter_w;
-        let content_w = (width as f32 - 2.0 * inset).max(0.0);
+        // Geometry shared across blocks (logical tokens scaled to physical px). The
+        // inner canvas spans [edge, width - edge]; the boundary hairline spans that full
+        // inner width, while command/output text starts after the status-marker band +
+        // one `space::S4` of intra-block padding so it never sits flush to the rule.
+        let gutter_w = f32::from(cmd.gutter_px) * scale; // status-marker band
+        let content_x = edge + gutter_w + pad;
+        let inner_w = (width as f32 - 2.0 * edge).max(0.0);
         let hairline_h = (f32::from(space::HAIRLINE_WIDTH) * scale).round().max(1.0);
         let hairline = cmd.hairline.to_linear_f32();
-        // The gutter marker is one Mono cell, centered horizontally in the gutter band.
-        let marker_x = inset + ((gutter_w - cw) * 0.5).max(0.0);
+        // The gutter marker is one Mono cell, centered horizontally in the marker band.
+        let marker_x = edge + ((gutter_w - cw) * 0.5).max(0.0);
 
-        let visible_len = layout.visible.len();
-        for (vi, vb) in layout.visible.iter().enumerate() {
+        for vb in &layout.visible {
             let gutter = GutterStyle::resolve(vb.gutter, theme);
 
-            // Top hairline separator (only when this block's top edge is on screen).
-            if vb.top_in_viewport >= 0 {
-                let hy = (inset + vb.top_in_viewport as f32 * ch).round();
+            // Exactly ONE muted hairline per interior boundary: centered in the
+            // leading-gap whitespace above every block except the first in the list
+            // (index 0 has no boundary above it). No top/bottom edge line and no doubled
+            // line - the inter-block whitespace is the primary separation, the hairline a
+            // faint accent (T-4.7). Drawn only when that gap band is on screen.
+            //
+            // The hairline is bound to the block BELOW the boundary, so a boundary whose
+            // gap is the LAST on-screen row while its lower block is one row off-screen
+            // would render no rule. Unreachable today: scroll is pinned-to-bottom
+            // (vp_bottom == total_display_rows, so the last row is always content, never a
+            // lone trailing gap; the topmost partial block is always in `visible`). When
+            // EPIC-3 free scroll lands, drive emission from the boundary above the first
+            // off-screen block too, and add a test at a scroll where gapped_top == vp_bottom.
+            if vb.index > 0 && vb.top_in_viewport >= GAP_ROWS as i64 {
+                let center_rel = vb.top_in_viewport as f32 - GAP_ROWS as f32 * 0.5;
+                let hy = (top_margin + center_rel * ch).round();
                 self.bg_instances.push(RectInstance {
-                    rect: [inset, hy, content_w, hairline_h],
+                    rect: [edge, hy, inner_w, hairline_h],
                     color: hairline,
                 });
             }
-            // Bottom hairline closing the LAST visible block (when its bottom is on
-            // screen); every other block's bottom is the next block's top hairline.
-            if vi + 1 == visible_len {
-                let bottom = vb.top_in_viewport + vb.display_height as i64;
-                if bottom >= 0 && (bottom as f32) * ch <= height as f32 {
-                    let hy = (inset + bottom as f32 * ch).round();
-                    self.bg_instances.push(RectInstance {
-                        rect: [inset, hy, content_w, hairline_h],
-                        color: hairline,
-                    });
-                }
-            }
 
             for (k, row) in vb.rows.iter().enumerate() {
-                let y = inset + (vb.first_row_in_viewport + k as i64) as f32 * ch;
+                let y = top_margin + (vb.first_row_in_viewport + k as i64) as f32 * ch;
                 match row {
                     TimelineRow::Command => {
                         // Gutter status marker (Mono glyph in the marker color).
@@ -776,53 +791,100 @@ mod gpu_tests {
         Readback { data, stride, w, h }
     }
 
+    /// Two finished failed blocks, each with `out_rows` captured 'X' output rows, via
+    /// the real segmenter + `set_block_output` - so the timeline has an interior
+    /// boundary to draw a hairline at (T-4.7).
+    fn two_finished_blocks(out_rows: usize) -> aterm_core::BlockList {
+        use aterm_core::{BlockSegmenter, CellColor, Mark, PromptKind, RowSnapshot, SnapshotCell};
+        let mut list = aterm_core::BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        for b in 0..2usize {
+            let base = b * 4;
+            seg.apply(&Mark::Prompt(PromptKind::PromptStart), base, &mut list);
+            seg.apply(&Mark::Prompt(PromptKind::OutputStart), base + 1, &mut list);
+            seg.apply(
+                &Mark::Prompt(PromptKind::CommandDone { exit_code: Some(1) }),
+                base + 3,
+                &mut list,
+            );
+        }
+        let rows: Vec<RowSnapshot> = (0..out_rows)
+            .map(|_| {
+                RowSnapshot::new(vec![SnapshotCell {
+                    c: 'X',
+                    fg: CellColor::Rgb(255, 255, 255),
+                    bg: CellColor::Named(257), // canvas -> bg quad skipped
+                    ..Default::default()
+                }])
+            })
+            .collect();
+        list.set_block_output(0, rows.clone());
+        list.set_block_output(1, rows);
+        list
+    }
+
     #[test]
-    fn finished_block_inks_gutter_marker_output_and_hairline_in_both_themes() {
+    fn timeline_inks_marker_output_and_one_muted_boundary_hairline_in_both_themes() {
         let Some((device, queue, format)) = device() else {
             eprintln!("no GPU adapter; skipping");
             return;
         };
         let (cw, ch) = cell_px(SCALE);
-        let inset = INSET_LOGICAL * SCALE;
-        let gutter_w = 16.0 * SCALE; // CommandBlockStyle.gutter_px (space.4)
-        let content_x = inset + gutter_w;
-        let (w, h) = (240u32, (inset + 6.0 * ch) as u32);
+        // The iA token geometry (T-4.7): top breathing S12, edge gutter S8, marker band
+        // S4, intra-block padding S4.
+        let top = f32::from(space::S12) * SCALE; // 48
+        let edge = f32::from(space::S8) * SCALE; // 32
+        let gutter_w = f32::from(space::S4) * SCALE; // CommandBlockStyle.gutter_px
+        let content_x = edge + gutter_w + f32::from(space::S4) * SCALE; // + intra pad = 64
+        let (w, h) = (240u32, (top + 9.0 * ch) as u32);
 
         for kind in [ThemeKind::Dark, ThemeKind::Light] {
             let theme = *Theme::for_kind(kind);
             let mut atlas = GlyphAtlas::new(&device, format);
             let mut tl = TimelineRenderer::new(&device);
-            // A failed block: gutter = a danger BLACK CIRCLE (a robust BMP glyph).
-            let blocks = block_with_output(2, Some(1));
-            let l = layout(&blocks, false, Scroll::default(), 8);
+            // Two failed blocks (gutter = a danger marker, a robust BMP glyph), each 1
+            // command + 2 output rows. Gapped layout: block 0 rows [0,3), gap row 3,
+            // block 1 rows [4,7). Viewport 10 shows all of it from the top.
+            let blocks = two_finished_blocks(2);
+            let l = layout(&blocks, false, Scroll::default(), 10);
             let rb = render(&device, &queue, &mut atlas, &mut tl, &l, &theme, w, h);
 
-            // The gutter marker inks on the command row (display row 0), in the gutter
-            // band [inset, content_x).
+            // Block 0's gutter marker inks on its command row (gapped row 0), in the
+            // marker band [edge, edge + gutter_w).
             assert!(
                 rb.any_ink(
-                    inset as u32,
-                    inset as u32,
-                    content_x as u32,
-                    (inset + ch) as u32,
+                    edge as u32,
+                    top as u32,
+                    (edge + gutter_w) as u32,
+                    (top + ch) as u32,
                     50
                 ),
-                "{kind:?}: the gutter status marker inks in the gutter on the command row"
+                "{kind:?}: the gutter status marker inks in the marker band on the command row"
             );
-            // The captured output 'X' inks on the first output row (display row 1) in the
-            // content column.
-            let oy0 = (inset + ch) as u32;
-            let oy1 = (inset + 2.0 * ch) as u32;
+            // Block 0's captured output 'X' inks on its first output row (gapped row 1)
+            // at the content column (which now starts after the S4 intra-block padding).
+            let oy0 = (top + ch) as u32;
+            let oy1 = (top + 2.0 * ch) as u32;
             assert!(
                 rb.any_ink(content_x as u32, oy0, (content_x + cw) as u32, oy1, 50),
-                "{kind:?}: the captured output cell inks in the content column"
+                "{kind:?}: the captured output cell inks in the padded content column"
             );
-            // The top hairline inks across the content width (sample a far-right x clear
-            // of any glyph, on the command-row top edge).
-            let hy = inset as u32;
+            // EXACTLY ONE muted hairline at the interior boundary: centered in the gap
+            // (gapped row 3), i.e. at top + 3.5*ch. Sample a mid-canvas x inside the
+            // inner width [edge, w-edge) and clear of the content glyphs.
+            let (hx0, hx1) = (w / 2, w / 2 + 18);
+            let hy = (top + 3.5 * ch) as u32;
             assert!(
-                rb.any_ink(w - 20, hy.saturating_sub(1), w - 4, hy + 2, 25),
-                "{kind:?}: the top hairline separator inks across the block width"
+                rb.any_ink(hx0, hy.saturating_sub(2), hx1, hy + 2, 18),
+                "{kind:?}: the boundary hairline inks across the inner canvas width"
+            );
+            // ...and NO edge line above the first block: the breathing band + block 0's
+            // top edge are clear of any rule (the old top+bottom double-draw is gone).
+            // Same x window, so a top edge line (which would span the full inner width)
+            // would be caught here.
+            assert!(
+                !rb.any_ink(hx0, 1, hx1, top as u32, 18),
+                "{kind:?}: no hairline renders above the first block (no top edge line)"
             );
         }
     }
