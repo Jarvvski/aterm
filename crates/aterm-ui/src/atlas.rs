@@ -11,14 +11,17 @@
 //!
 //! What lives here vs the front-end:
 //! - **Atlas**: the atlas texture + sampler, the [`GlyphCache`]/[`GlyphRasterizer`]/
-//!   placements/skip-memo (the rasterize-once guarantee), the glyph pipeline + atlas
-//!   bind, and the SHARED group(0) viewport uniform (both the grid's bg pipeline and
-//!   this glyph pipeline bind it, so it must be owned in one place with one layout).
+//!   placements/skip-memo (the rasterize-once guarantee), the SHARED group(0) viewport
+//!   uniform, and BOTH shared 2D pipelines that bind it - the textured glyph pipeline
+//!   ([`GlyphAtlas::draw_glyphs`]) and the solid-quad rect pipeline
+//!   ([`GlyphAtlas::draw_rects`], the grid's cell backgrounds + the timeline's flat
+//!   rectangles). Owning both here keeps the one viewport layout in one place.
 //!   Acquisition ([`GlyphAtlas::acquire_font`] / [`GlyphAtlas::acquire_sprite`]) returns
 //!   only the raw raster facts: an [`AtlasRect`] + the pen `(left, top)`.
 //! - **Front-end**: all quad GEOMETRY (the grid's sprite-fill / constraint / baseline
-//!   placement; prose's shaped pen positions), the per-front-end instance `Vec` + GPU
-//!   buffer, and the per-front-end rebuild gate + draw-call counter.
+//!   placement; prose's shaped pen positions; the timeline's block/chip/gutter layout),
+//!   the per-front-end instance `Vec`s + GPU buffers, and the per-front-end rebuild gate
+//!   + draw-call counter.
 //!
 //! Colors are linearized in the token layer; the atlas stores only 8-bit coverage and
 //! the per-instance color multiplies it in the shader (grayscale AA, no color in the
@@ -54,9 +57,25 @@ pub(crate) struct GlyphInstance {
     pub color: [f32; 4],
 }
 
+/// A solid-color quad instance: every flat rectangle the UI draws - the grid's cell
+/// backgrounds + underlines, and the timeline's block/card fills, hairline separators,
+/// gutter markers, and chip/badge fills. Both front-ends build these; the one shared
+/// rect pipeline ([`GlyphAtlas::draw_rects`]) consumes them. Physical-px rect + linear
+/// RGBA; alpha is honored (so a focus-dim / running-pulse overlay can be
+/// semi-transparent through the same pipeline), and an opaque color blends identically
+/// to a plain `REPLACE`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct RectInstance {
+    /// `[x, y, w, h]` in physical px (top-left origin).
+    pub rect: [f32; 4],
+    /// Linear RGBA.
+    pub color: [f32; 4],
+}
+
 /// Viewport uniform: the surface size in physical px (padded to 16 bytes). Shared by
-/// the grid's bg pipeline and this glyph pipeline via the one [`GlyphAtlas`] viewport
-/// bind group.
+/// the rect pipeline and the glyph pipeline via the one [`GlyphAtlas`] viewport bind
+/// group.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Viewport {
@@ -143,8 +162,10 @@ pub struct GlyphAtlas {
 
     // Pipeline + bindings.
     glyph_pipeline: wgpu::RenderPipeline,
+    /// The shared solid-quad pipeline (group(0) viewport only, alpha-blended). Both the
+    /// grid's cell backgrounds and the timeline's flat rectangles draw through it.
+    rect_pipeline: wgpu::RenderPipeline,
     viewport_buf: wgpu::Buffer,
-    viewport_layout: wgpu::BindGroupLayout,
     viewport_bind: wgpu::BindGroup,
     atlas_bind: wgpu::BindGroup,
     /// Dedup guard for [`Self::set_viewport`]: the `(w, h)` last written, so a frame
@@ -296,6 +317,48 @@ impl GlyphAtlas {
             cache: None,
         });
 
+        // Rect pipeline: the solid-quad layer shared by the grid (cell backgrounds +
+        // underlines) and the timeline (block/card fills, hairlines, gutter markers,
+        // chip/badge fills). group(0) viewport ONLY (no atlas), and the SAME WGSL +
+        // `vs_bg`/`fs_solid` entry points as before. Alpha-blended rather than REPLACE:
+        // an opaque fill (alpha == 1) blends identically to REPLACE, but this lets a
+        // focus-dim / running-pulse overlay be semi-transparent through one pipeline.
+        let rect_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("aterm-rect-pl"),
+            bind_group_layouts: &[Some(&viewport_layout)],
+            immediate_size: 0,
+        });
+        let rect_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+        let rect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("aterm-rect-pipeline"),
+            layout: Some(&rect_pl_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_bg"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<RectInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &rect_attrs,
+                }],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_solid"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             atlas,
             cache: GlyphCache::new(ATLAS_DIM, ATLAS_DIM),
@@ -304,8 +367,8 @@ impl GlyphAtlas {
             skip_glyphs: HashSet::new(),
             atlas_full_logged: false,
             glyph_pipeline,
+            rect_pipeline,
             viewport_buf,
-            viewport_layout,
             viewport_bind,
             atlas_bind,
             last_viewport: Cell::new((u32::MAX, u32::MAX)),
@@ -333,18 +396,6 @@ impl GlyphAtlas {
         self.last_viewport.set((w, h));
         #[cfg(test)]
         self.viewport_writes.set(self.viewport_writes.get() + 1);
-    }
-
-    /// The ONE group(0) bind group layout. A front-end with its own pipeline (the
-    /// grid's bg pipeline) MUST build it against this layout so [`Self::viewport_bind`]
-    /// validates across both pipelines.
-    pub(crate) fn viewport_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.viewport_layout
-    }
-
-    /// The shared group(0) bind group, for a front-end recording its own draw.
-    pub(crate) fn viewport_bind(&self) -> &wgpu::BindGroup {
-        &self.viewport_bind
     }
 
     /// The atlas dimension (px); front-ends normalize an [`AtlasRect`] to UV with
@@ -450,6 +501,23 @@ impl GlyphAtlas {
         Some((rect, (g.left, g.top)))
     }
 
+    /// Record a solid-quad draw into a caller-owned `pass`: the shared rect pipeline +
+    /// the group(0) viewport bind + the caller's instance buffer, then ONE instanced
+    /// draw of `count` quads. The grid's cell backgrounds/underlines and the timeline's
+    /// flat rectangles (block/card fills, hairlines, gutter markers, chips) all funnel
+    /// through here, so the whole solid layer of a front-end is one draw call.
+    pub(crate) fn draw_rects(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        buf: &InstanceBuffer,
+        count: usize,
+    ) {
+        pass.set_pipeline(&self.rect_pipeline);
+        pass.set_bind_group(0, &self.viewport_bind, &[]);
+        pass.set_vertex_buffer(0, buf.buf().slice(..));
+        pass.draw(0..6, 0..count as u32);
+    }
+
     /// Record the shared glyph draw into a caller-owned `pass`: set the glyph pipeline,
     /// group(0) viewport, group(1) atlas, and the caller's instance buffer, then issue
     /// EXACTLY ONE instanced draw of `count` quads. The caller (front-end) owns the
@@ -468,7 +536,10 @@ impl GlyphAtlas {
     }
 
     /// Distinct glyphs rasterized into the atlas so far (the no-re-raster counter;
-    /// stable across frames once warm).
+    /// stable across frames once warm). Test-only today (the front-ends' GPU tests
+    /// assert the rasterize-once invariant through it); ungate when a non-test caller
+    /// (a diagnostic / status line) needs it.
+    #[cfg(test)]
     pub(crate) fn rasterizations(&self) -> u64 {
         self.cache.rasterizations()
     }
@@ -515,10 +586,11 @@ fn upload_glyph(queue: &wgpu::Queue, atlas: &wgpu::Texture, rect: AtlasRect, cov
     );
 }
 
-/// The shared WGSL: the bg pipeline (in [`crate::grid_render`]) and this glyph pipeline
-/// both create a shader module from this source and select different entry points
-/// (`vs_bg`/`fs_solid` for solid quads, `vs_glyph`/`fs_glyph` for textured coverage).
-/// `pub(crate)` so the grid's bg pipeline references the same source.
+/// The shared WGSL. The atlas builds ONE shader module from this source and both its
+/// pipelines select different entry points: `vs_bg`/`fs_solid` (the rect pipeline,
+/// solid quads) and `vs_glyph`/`fs_glyph` (the glyph pipeline, textured coverage). Kept
+/// `pub(crate)` for any future front-end that wants to build its own pipeline against
+/// the same source + viewport layout.
 pub(crate) const SHADER: &str = r#"
 struct Viewport { size: vec2<f32>, _pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> viewport: Viewport;

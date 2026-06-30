@@ -33,28 +33,16 @@
 
 use std::mem::size_of;
 
-use bytemuck::{Pod, Zeroable};
-
 use aterm_core::Snapshot;
 use aterm_tokens::{type_scale, Theme};
 
-use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer};
+use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::text::{build_grid_cells, FaceStyle, FontFamily, GlyphKey, GridCell};
 use crate::window::cell_px;
 
 /// Left/top inset of the grid from the surface origin, in LOGICAL px (scaled by the
 /// DPI factor at use). Matches the interim glyphon path's `(8, 8)` offset.
 const INSET_LOGICAL: f32 = 8.0;
-
-/// A solid-color quad instance (background cells + underlines).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct BgInstance {
-    /// `[x, y, w, h]` in physical px (top-left origin).
-    rect: [f32; 4],
-    /// Linear RGBA.
-    color: [f32; 4],
-}
 
 /// The surface geometry for a frame: physical-pixel size + the DPI scale factor.
 /// Bundled so [`GridRenderer::prepare`] stays a tidy call.
@@ -66,26 +54,18 @@ pub struct FrameSize {
 }
 
 /// The instanced grid renderer: the GRID front-end over the shared [`GlyphAtlas`]. It
-/// owns the bg (solid-quad) pipeline, the grid layout + the reused instance buffers,
-/// and the `(version, viewport, px, theme)` rebuild gate; the glyph atlas/cache/
-/// rasterizer/pipeline are the shared engine it borrows. Constructed once from the
-/// device; `prepare` (per frame, but early-outs when unchanged) builds instances and
-/// `draw` records the bg + the single glyph instanced draw into a caller-owned pass.
+/// owns the grid layout + the reused instance buffers and the `(version, viewport, px,
+/// theme)` rebuild gate; the atlas (texture, cache, rasterizer, the rect + glyph
+/// pipelines, the shared viewport uniform) is the shared engine it BORROWS - now owned
+/// one level up by [`crate::gpu::GpuRenderer`] (the T-4.6 hoist) so the grid, the
+/// timeline, and prose all draw through one atlas. `prepare` (per frame, but early-outs
+/// when unchanged) builds instances and `draw` records the rect layer + the single
+/// glyph instanced draw into a caller-owned pass, both through the borrowed atlas.
 pub struct GridRenderer {
-    /// The shared glyph engine (atlas texture, cache, rasterizer, glyph pipeline, the
-    /// shared viewport uniform). Owned here for v1; when the prose front-end goes live
-    /// in the timeline (T-4.6) this hoists up to the `GpuRenderer` so both front-ends
-    /// share one atlas.
-    atlas: GlyphAtlas,
-
-    /// Background / underline solid-quad pipeline (grid-only; built against
-    /// `atlas.viewport_layout()` so it shares the group(0) viewport).
-    bg_pipeline: wgpu::RenderPipeline,
-
     // Reused CPU + GPU instance storage (grid-owned: the rebuild gate reuses these
     // across frames, so nothing else may write them - see the early-out in `prepare`).
     grid_cells: Vec<GridCell>,
-    bg_instances: Vec<BgInstance>,
+    bg_instances: Vec<RectInstance>,
     glyph_instances: Vec<GlyphInstance>,
     bg_buf: InstanceBuffer,
     glyph_buf: InstanceBuffer,
@@ -100,62 +80,20 @@ pub struct GridRenderer {
 }
 
 impl GridRenderer {
-    /// Build the grid front-end (its bg pipeline + the shared [`GlyphAtlas`]) against
-    /// `format` (the surface's sRGB format).
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let atlas = GlyphAtlas::new(device, format);
-
-        // The bg pipeline (solid cell-background + underline quads) shares the WGSL
-        // and the group(0) viewport uniform with the glyph pipeline, but is grid-only
-        // and opaque (REPLACE). Build it against the ATLAS's viewport layout so the
-        // shared `atlas.viewport_bind()` validates against both pipelines.
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("aterm-bg-shader"),
-            source: wgpu::ShaderSource::Wgsl(crate::atlas::SHADER.into()),
-        });
-        let bg_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("aterm-bg-pl"),
-            bind_group_layouts: &[Some(atlas.viewport_layout())],
-            immediate_size: 0,
-        });
-        let bg_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
-        let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("aterm-bg-pipeline"),
-            layout: Some(&bg_pl_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_bg"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: size_of::<BgInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &bg_attrs,
-                }],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_solid"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
+    /// Build the grid front-end: just its reused CPU/GPU instance buffers. The shared
+    /// [`GlyphAtlas`] (which owns both pipelines + the viewport uniform) is constructed
+    /// and owned by [`crate::gpu::GpuRenderer`] and passed into `prepare`/`draw`.
+    pub fn new(device: &wgpu::Device) -> Self {
         Self {
-            atlas,
-            bg_pipeline,
             grid_cells: Vec::new(),
             bg_instances: Vec::new(),
             glyph_instances: Vec::new(),
-            bg_buf: InstanceBuffer::new(device, "aterm-bg-instances", size_of::<BgInstance>(), 256),
+            bg_buf: InstanceBuffer::new(
+                device,
+                "aterm-bg-instances",
+                size_of::<RectInstance>(),
+                256,
+            ),
             glyph_buf: InstanceBuffer::new(
                 device,
                 "aterm-glyph-instances",
@@ -174,16 +112,9 @@ impl GridRenderer {
         self.last_glyph_draw_calls
     }
 
-    /// Distinct glyphs rasterized into the atlas so far (T-1.6 AC5: stable across
-    /// frames once warm - a repeated glyph is never re-rasterized).
-    #[must_use]
-    pub fn rasterizations(&self) -> u64 {
-        self.atlas.rasterizations()
-    }
-
-    /// Build the frame's instances from `snap`, reusing the prior build when the
-    /// `(version, viewport, px, theme)` signature is unchanged (the damage gate).
-    /// Returns `true` if there is anything to draw.
+    /// Build the frame's instances from `snap` through the shared `atlas`, reusing the
+    /// prior build when the `(version, viewport, px, theme)` signature is unchanged (the
+    /// damage gate). Returns `true` if there is anything to draw.
     ///
     /// The unchanged path allocates nothing (the steady-state present; asserted by
     /// `steady_state_prepare_is_allocation_free`). On the CHANGED path the CPU
@@ -194,6 +125,7 @@ impl GridRenderer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        atlas: &mut GlyphAtlas,
         snap: &Snapshot,
         theme: &Theme,
         size: FrameSize,
@@ -224,7 +156,7 @@ impl GridRenderer {
         let cw_i = cw.round().max(1.0) as u32;
         let ch_i = ch.round().max(1.0) as u32;
         let inset = INSET_LOGICAL * scale;
-        let metrics = self.atlas.cell_metrics(FontFamily::Grid, px);
+        let metrics = atlas.cell_metrics(FontFamily::Grid, px);
         // Center the font's line box in the cell box, then baseline = ascent below
         // the box top.
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
@@ -243,7 +175,7 @@ impl GridRenderer {
 
             // Background quad (skip canvas-colored cells; the clear covers them).
             if cell.bg != canvas {
-                self.bg_instances.push(BgInstance {
+                self.bg_instances.push(RectInstance {
                     rect: [cell_x, cell_y, cw_cell, ch],
                     color: cell.bg.to_linear_f32(),
                 });
@@ -251,7 +183,7 @@ impl GridRenderer {
             // Underline: a thin quad just under the baseline.
             if cell.underline {
                 let uy = cell_y + baseline_off + (metrics.descent * 0.3).max(1.0);
-                self.bg_instances.push(BgInstance {
+                self.bg_instances.push(RectInstance {
                     rect: [cell_x, uy, cw_cell, (ch * 0.06).max(1.0)],
                     color: cell.fg.to_linear_f32(),
                 });
@@ -271,7 +203,7 @@ impl GridRenderer {
                 glyph_id: if sprite {
                     cell.ch as u32 as u16 // sprite codepoints are all in the BMP
                 } else {
-                    self.atlas.glyph_id(FontFamily::Grid, face, cell.ch)
+                    atlas.glyph_id(FontFamily::Grid, face, cell.ch)
                 },
                 face,
                 px: px_key,
@@ -282,10 +214,9 @@ impl GridRenderer {
             // guarantee; a sprite codepoint is drawn procedurally into the cell box,
             // everything else from the font's cmap glyph.
             let slot = if sprite {
-                self.atlas.acquire_sprite(queue, gkey, cell.ch, cw_i, ch_i)
+                atlas.acquire_sprite(queue, gkey, cell.ch, cw_i, ch_i)
             } else {
-                self.atlas
-                    .acquire_font(queue, gkey, FontFamily::Grid, face, gkey.glyph_id, px)
+                atlas.acquire_font(queue, gkey, FontFamily::Grid, face, gkey.glyph_id, px)
             };
             let Some((rect, (left, top))) = slot else {
                 continue;
@@ -319,7 +250,7 @@ impl GridRenderer {
                     rect.h as f32,
                 )
             };
-            let inv = 1.0 / self.atlas.atlas_dim() as f32;
+            let inv = 1.0 / atlas.atlas_dim() as f32;
             self.glyph_instances.push(GlyphInstance {
                 rect: [gx, gy, gw, gh],
                 uv: [
@@ -338,7 +269,7 @@ impl GridRenderer {
             self.bg_buf.ensure(
                 device,
                 "aterm-bg-instances",
-                size_of::<BgInstance>(),
+                size_of::<RectInstance>(),
                 self.bg_instances.len(),
             );
             queue.write_buffer(
@@ -363,28 +294,24 @@ impl GridRenderer {
         // Write the shared viewport uniform (idempotent; a no-op when the surface size
         // is unchanged). On the CHANGED path only - the early-out above returns before
         // this, so the zero-alloc steady-state present is untouched.
-        self.atlas.set_viewport(queue, viewport_w, viewport_h);
+        atlas.set_viewport(queue, viewport_w, viewport_h);
 
         self.built = Some(key);
         !self.glyph_instances.is_empty() || !self.bg_instances.is_empty()
     }
 
     /// Record the grid draws into `pass` (which the caller has begun with the canvas
-    /// clear). Background first (opaque), then the single glyph draw (alpha-blended)
-    /// through the shared atlas. The glyph layer is EXACTLY ONE instanced draw call
-    /// (T-1.6 AC c); the counter stays here because the atlas cannot know its caller.
-    pub fn draw(&mut self, pass: &mut wgpu::RenderPass<'_>) {
+    /// clear) through the shared `atlas`. Background first, then the single glyph draw
+    /// (alpha-blended). The glyph layer is EXACTLY ONE instanced draw call (T-1.6 AC c);
+    /// the counter stays here because the atlas cannot know its caller.
+    pub fn draw(&mut self, pass: &mut wgpu::RenderPass<'_>, atlas: &GlyphAtlas) {
         if !self.bg_instances.is_empty() {
-            pass.set_pipeline(&self.bg_pipeline);
-            pass.set_bind_group(0, self.atlas.viewport_bind(), &[]);
-            pass.set_vertex_buffer(0, self.bg_buf.buf().slice(..));
-            pass.draw(0..6, 0..self.bg_instances.len() as u32);
+            atlas.draw_rects(pass, &self.bg_buf, self.bg_instances.len());
         }
         if self.glyph_instances.is_empty() {
             self.last_glyph_draw_calls = 0;
         } else {
-            self.atlas
-                .draw_glyphs(pass, &self.glyph_buf, self.glyph_instances.len());
+            atlas.draw_glyphs(pass, &self.glyph_buf, self.glyph_instances.len());
             self.last_glyph_draw_calls = 1;
         }
     }
@@ -498,6 +425,7 @@ mod gpu_tests {
     fn render(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        atlas: &mut GlyphAtlas,
         grid: &mut GridRenderer,
         snap: &Snapshot,
         w: u32,
@@ -529,6 +457,7 @@ mod gpu_tests {
         grid.prepare(
             device,
             queue,
+            atlas,
             snap,
             &theme(),
             FrameSize {
@@ -556,7 +485,7 @@ mod gpu_tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            grid.draw(&mut pass);
+            grid.draw(&mut pass, atlas);
         }
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -610,7 +539,8 @@ mod gpu_tests {
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        let mut grid = GridRenderer::new(&device, format);
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
         let (w, h) = target_size(4, 1);
         // 'M' white-on-red at col 0; the rest are blank defaults (canvas bg).
         let snap = one_cell(
@@ -620,7 +550,7 @@ mod gpu_tests {
             CellColor::Rgb(255, 0, 0),
             false,
         );
-        let rb = render(&device, &queue, &mut grid, &snap, w, h);
+        let rb = render(&device, &queue, &mut atlas, &mut grid, &snap, w, h);
 
         let (x0, y0, x1, y1) = cell_box(0, 0, false);
         // Background filled red somewhere in the cell (red channel high).
@@ -654,7 +584,8 @@ mod gpu_tests {
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        let mut grid = GridRenderer::new(&device, format);
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
         let (w, h) = target_size(4, 1);
 
         // █ FULL BLOCK, white fg on canvas bg: the cell centre inks white (all
@@ -666,7 +597,7 @@ mod gpu_tests {
             CellColor::Named(257),
             false,
         );
-        let rb = render(&device, &queue, &mut grid, &snap, w, h);
+        let rb = render(&device, &queue, &mut atlas, &mut grid, &snap, w, h);
         let (x0, y0, x1, y1) = cell_box(0, 0, false);
         let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
         assert!(
@@ -678,7 +609,8 @@ mod gpu_tests {
 
         // ─ LIGHT HORIZONTAL: a thin band at the vertical centre, NOT a full fill -
         // distinguishes the sprite from a block and proves it is the procedural line.
-        let mut grid2 = GridRenderer::new(&device, format);
+        let mut atlas2 = GlyphAtlas::new(&device, format);
+        let mut grid2 = GridRenderer::new(&device);
         let snap2 = one_cell(
             4,
             '\u{2500}',
@@ -686,7 +618,7 @@ mod gpu_tests {
             CellColor::Named(257),
             false,
         );
-        let rb2 = render(&device, &queue, &mut grid2, &snap2, w, h);
+        let rb2 = render(&device, &queue, &mut atlas2, &mut grid2, &snap2, w, h);
         // A few rows around the vertical centre catch the thin (1px at 1x) band.
         assert!(
             rb2.any_chan(x0, cy.saturating_sub(2), x1, cy + 3, 0, 150),
@@ -703,7 +635,8 @@ mod gpu_tests {
         let Some((device, queue, format)) = device() else {
             return;
         };
-        let mut grid = GridRenderer::new(&device, format);
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
         let (w, h) = target_size(4, 1);
         let snap = one_cell(
             4,
@@ -712,7 +645,7 @@ mod gpu_tests {
             CellColor::Rgb(0, 0, 0),
             false,
         );
-        render(&device, &queue, &mut grid, &snap, w, h);
+        render(&device, &queue, &mut atlas, &mut grid, &snap, w, h);
         assert_eq!(
             grid.last_glyph_draw_calls(),
             1,
@@ -722,7 +655,7 @@ mod gpu_tests {
         // An all-blank grid issues zero glyph draws.
         let mut blank = Snapshot::empty(1, 4);
         blank.version = 2;
-        render(&device, &queue, &mut grid, &blank, w, h);
+        render(&device, &queue, &mut atlas, &mut grid, &blank, w, h);
         assert_eq!(
             grid.last_glyph_draw_calls(),
             0,
@@ -735,20 +668,21 @@ mod gpu_tests {
         let Some((device, queue, format)) = device() else {
             return;
         };
-        let mut grid = GridRenderer::new(&device, format);
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
         let (w, h) = target_size(4, 1);
         let white = CellColor::Rgb(255, 255, 255);
         let black = CellColor::Rgb(0, 0, 0);
 
         let snap1 = one_cell(4, 'W', white, black, false);
-        render(&device, &queue, &mut grid, &snap1, w, h);
-        let after_first = grid.rasterizations();
+        render(&device, &queue, &mut atlas, &mut grid, &snap1, w, h);
+        let after_first = atlas.rasterizations();
         assert!(after_first > 0, "the first 'W' is rasterized");
 
         // Same version + content: prepare must early-out (no re-raster).
-        render(&device, &queue, &mut grid, &snap1, w, h);
+        render(&device, &queue, &mut atlas, &mut grid, &snap1, w, h);
         assert_eq!(
-            grid.rasterizations(),
+            atlas.rasterizations(),
             after_first,
             "an unchanged frame reuses the build (no rasterization)"
         );
@@ -757,9 +691,9 @@ mod gpu_tests {
         // so still no re-rasterization (T-1.6 AC5).
         let mut snap2 = one_cell(4, 'W', white, black, false);
         snap2.version = 99;
-        render(&device, &queue, &mut grid, &snap2, w, h);
+        render(&device, &queue, &mut atlas, &mut grid, &snap2, w, h);
         assert_eq!(
-            grid.rasterizations(),
+            atlas.rasterizations(),
             after_first,
             "a repeated glyph in a new frame is never re-rasterized (atlas reuse)"
         );
@@ -770,7 +704,8 @@ mod gpu_tests {
         let Some((device, queue, format)) = device() else {
             return;
         };
-        let mut grid = GridRenderer::new(&device, format);
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
         let (w, h) = target_size(4, 1);
         let snap = one_cell(
             4,
@@ -785,13 +720,13 @@ mod gpu_tests {
             scale: SCALE,
         };
         // First prepare builds + caches (allocates).
-        grid.prepare(&device, &queue, &snap, &theme(), size);
+        grid.prepare(&device, &queue, &mut atlas, &snap, &theme(), size);
 
         // An unchanged frame (same version/viewport/theme) must early-out with NO
         // allocation - the steady-state present path (ticket T-1.8 AC1/AC2). This is
         // the renderer-level "skip the rebuild when nothing is dirty".
         let allocs = crate::alloc_probe::count_allocs(|| {
-            let drew = grid.prepare(&device, &queue, &snap, &theme(), size);
+            let drew = grid.prepare(&device, &queue, &mut atlas, &snap, &theme(), size);
             std::hint::black_box(drew);
         });
         assert_eq!(
@@ -805,7 +740,8 @@ mod gpu_tests {
         let Some((device, queue, format)) = device() else {
             return;
         };
-        let mut grid = GridRenderer::new(&device, format);
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
         let (w, h) = target_size(4, 1);
         // A wide cell with a red bg at col 0 (+ spacer at col 1).
         let snap = one_cell(
@@ -815,7 +751,7 @@ mod gpu_tests {
             CellColor::Rgb(255, 0, 0),
             true,
         );
-        let rb = render(&device, &queue, &mut grid, &snap, w, h);
+        let rb = render(&device, &queue, &mut atlas, &mut grid, &snap, w, h);
 
         // The red background must reach into col 1's x-range (the spacer column),
         // proving the wide cell occupies two columns (AC a).
@@ -839,7 +775,8 @@ mod gpu_tests {
         let Some((device, queue, format)) = device() else {
             return;
         };
-        let mut grid = GridRenderer::new(&device, format);
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
         let (w, h) = target_size(4, 1);
         let mut snap = Snapshot::empty(1, 4);
         snap.version = 1;
@@ -851,9 +788,9 @@ mod gpu_tests {
             snap.cells[i].fg = white;
             snap.cells[i].bg = black;
         }
-        let rb = render(&device, &queue, &mut grid, &snap, w, h);
+        let rb = render(&device, &queue, &mut atlas, &mut grid, &snap, w, h);
         assert!(
-            grid.rasterizations() >= 2,
+            atlas.rasterizations() >= 2,
             "two distinct glyphs are rasterized"
         );
 
@@ -900,9 +837,10 @@ mod gpu_tests {
 
         // BMP icon (Font Awesome "home", U+F015): inks the cell's central box,
         // proving the constraint scaled + centered it.
-        let mut grid = GridRenderer::new(&device, format);
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
         let snap = one_cell(4, '\u{F015}', white, canvas_bg, false);
-        let rb = render(&device, &queue, &mut grid, &snap, w, h);
+        let rb = render(&device, &queue, &mut atlas, &mut grid, &snap, w, h);
         let (bx0, bx1) = (x0 + (x1 - x0) / 4, x1 - (x1 - x0) / 4);
         let (by0, by1) = (y0 + (y1 - y0) / 4, y1 - (y1 - y0) / 4);
         assert!(
@@ -912,9 +850,10 @@ mod gpu_tests {
 
         // SMP icon (Material Design, U+F0001, beyond the BMP): must render without
         // panic and reach the atlas (some ink in the cell).
-        let mut grid2 = GridRenderer::new(&device, format);
+        let mut atlas2 = GlyphAtlas::new(&device, format);
+        let mut grid2 = GridRenderer::new(&device);
         let snap2 = one_cell(4, '\u{F0001}', white, canvas_bg, false);
-        let rb2 = render(&device, &queue, &mut grid2, &snap2, w, h);
+        let rb2 = render(&device, &queue, &mut atlas2, &mut grid2, &snap2, w, h);
         assert!(
             rb2.any_chan(x0, y0, x1, y1, 0, 30),
             "a beyond-BMP MDI icon resolves, rasterizes, and inks the cell (no panic)"

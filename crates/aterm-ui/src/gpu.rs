@@ -13,6 +13,7 @@ use winit::window::Window;
 
 use aterm_tokens::Rgba;
 
+use crate::atlas::GlyphAtlas;
 use crate::grid_render::GridRenderer;
 use crate::renderer::{Frame, RenderError, Renderer};
 
@@ -23,8 +24,13 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    /// The instanced terminal-grid pipeline: glyph atlas + bg/glyph instanced draws,
-    /// with version-gated rebuild (ticket T-1.8).
+    /// The shared glyph engine (atlas texture + cache + rasterizer + the rect & glyph
+    /// pipelines + the group(0) viewport uniform). Owned here (the T-4.6 hoist) and lent
+    /// to every front-end - the grid, and the timeline/prose paths that join it - so all
+    /// draw through one atlas and one pair of pipelines.
+    atlas: GlyphAtlas,
+    /// The instanced terminal-grid front-end (bg/glyph instance build + version-gated
+    /// rebuild, ticket T-1.8); draws through the shared `atlas`.
     grid: GridRenderer,
     /// Virtualized-timeline scroll position (ticket T-2.7). Auto-follows the bottom
     /// (the live-terminal default) until scroll input lands (EPIC-3).
@@ -95,13 +101,15 @@ impl GpuRenderer {
         };
         surface.configure(&device, &config);
 
-        let grid = GridRenderer::new(&device, format);
+        let atlas = GlyphAtlas::new(&device, format);
+        let grid = GridRenderer::new(&device);
 
         Ok(Self {
             surface,
             device,
             queue,
             config,
+            atlas,
             grid,
             scroll: crate::timeline::Scroll::default(),
             last_visible_blocks: 0,
@@ -172,6 +180,7 @@ impl GpuRenderer {
                 self.grid.prepare(
                     &self.device,
                     &self.queue,
+                    &mut self.atlas,
                     snap,
                     frame.theme,
                     crate::grid_render::FrameSize {
@@ -230,7 +239,7 @@ impl GpuRenderer {
                 // Always call draw: it internally no-ops (and resets the
                 // glyph-draw-call counter to 0) when there are no instances, so the
                 // counter stays honest after a text frame is followed by a blank one.
-                self.grid.draw(&mut pass);
+                self.grid.draw(&mut pass, &self.atlas);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
