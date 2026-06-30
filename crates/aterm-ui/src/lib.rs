@@ -21,6 +21,7 @@ pub mod app;
 // render path is driven only from within the crate until the atlas hoists up to the
 // live `GpuRenderer` (T-4.6).
 mod atlas;
+pub mod components;
 pub mod constraint;
 pub mod fonts;
 pub mod glyph;
@@ -40,6 +41,10 @@ pub mod window;
 
 pub use app::{run, run_with, AtermApp, HeadlessCallbacks, RenderConfig, UiCallbacks};
 pub use atlas::GlyphAtlas;
+pub use components::{
+    AgentCardStyle, Animation, ChipStyle, ChipVariant, CommandBlockStyle, GutterShape, GutterStyle,
+    MotionSpec, PromptChip, PromptMode, RiskBadge, RiskState,
+};
 pub use constraint::{Align, Constraint, Placed, Sizing};
 pub use glyph::{CellMetrics, GlyphRasterizer, RasterGlyph};
 pub use gpu::GpuRenderer;
