@@ -8,12 +8,15 @@
 //! list on its own model thread (ticket T-1.3); this session no longer parses VT
 //! bytes on the render thread. The three threads are: (1) the PTY reader thread
 //! and (2) the model thread, both inside `aterm-core`'s [`aterm_core::Engine`],
-//! and (3) the winit/render main thread that owns this session. The agent runtime
-//! thread (EPIC-5) is not spawned yet.
+//! and (3) the winit/render main thread that owns this session. The agent turn runs
+//! on a fourth executor - the [`AgentRuntime`]'s tokio worker threads (ticket
+//! T-5.11) - off the render thread, streaming its steps back through the engine's
+//! agent-injector mailbox.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use aterm_agent::AutonomyState;
+use aterm_agent::{AutonomyState, Secrets};
 use aterm_core::{
     keys, BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
 };
@@ -21,11 +24,31 @@ use aterm_ui::{KeyPress, NamedKey, UiCallbacks, Window};
 
 use aterm_core::{InputEvent, InputMode, InputModel, Motion};
 
+use crate::agent_runtime::{AgentRuntime, TurnHandle};
 use crate::config::Config;
 use crate::routing::{classify, decide, keystroke_for, Disposition, KeyBinding, RoutingContext};
 
 /// One terminal session.
+///
+/// **Field order is load-bearing for clean shutdown (ticket T-5.11).** Rust drops
+/// struct fields in declaration order, so `agent` (the tokio runtime) and `turn` are
+/// declared BEFORE `engine`: an in-flight turn's tokio task owns an
+/// [`aterm_core::AgentInjector`] - a clone of the engine's model-mailbox sender - and
+/// while that clone is alive the model thread never sees its mailbox disconnect, so
+/// [`Engine`]'s drop (which joins the model thread) would hang. Dropping the runtime
+/// FIRST cancels that task and releases the injector, so the subsequent `engine` drop
+/// observes the disconnect and joins cleanly (preserving aterm-core's zero-hang
+/// shutdown invariant). Do NOT move `engine` above `agent`/`turn`.
 pub struct Session {
+    /// The off-render-thread agent-turn runtime (ticket T-5.11): owns the tokio
+    /// executor plus the workspace root and the single [`Secrets`] source a turn is
+    /// gated and sandboxed against. Declared first so it (and its injector-holding
+    /// tasks) drop BEFORE `engine` - see the struct-level note.
+    agent: AgentRuntime,
+    /// The in-flight agent turn, if one is running (ticket T-5.11). `Some` while a turn
+    /// streams its steps into the timeline; the handle bridges the keyboard to the
+    /// loop's approval/cancel seam and tells the router whether Esc should interrupt.
+    turn: Option<TurnHandle>,
     engine: Engine,
     input: InputModel,
     window: Option<Arc<Window>>,
@@ -37,8 +60,7 @@ pub struct Session {
     /// The live, session-scoped autonomy posture (ticket T-5.11). Constructed fresh
     /// per session at the configured baseline, so a runtime widening never carries
     /// into a new session (AC5); the cycle hotkey mutates it (AC4), the always-visible
-    /// indicator reads it, and - when the live turn lands - its `policy()` gates the
-    /// loop.
+    /// indicator reads it, and its `policy()` gates each live turn (ticket T-5.11).
     autonomy: AutonomyState,
 }
 
@@ -66,6 +88,11 @@ impl Session {
             pixel_height: 0,
         };
         let engine = Engine::spawn_login_shell(dims, DEFAULT_SCROLLBACK)?;
+        // The agent works in - and confines its writes to - the current working
+        // directory; the single Secrets deny-set feeds the gate, the sandbox, and the
+        // sanitizer alike (ticket T-5.11; key custody is T-8.3, out of scope).
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let agent = AgentRuntime::new(root, Secrets::new()).map_err(aterm_core::PtyError::Io)?;
         Ok(Self {
             engine,
             input: InputModel::new(),
@@ -73,6 +100,8 @@ impl Session {
             toggle_key: cfg.toggle_mode,
             autonomy_key: cfg.autonomy_cycle,
             autonomy: AutonomyState::new(cfg.default_autonomy),
+            agent,
+            turn: None,
         })
     }
 
@@ -97,10 +126,10 @@ impl Session {
     }
 
     /// Build the routing context from live state. `degraded` (integration `None`),
-    /// `alt_screen`, and `foreground_reading_stdin` (a foreground process group
-    /// other than the hidden shell owns the terminal) are sourced live;
-    /// `preedit_active` (T-3.2 IME) and `agent_turn_active` (EPIC-5 agent loop) read
-    /// `false` until those tickets land (documented residuals).
+    /// `alt_screen`, `foreground_reading_stdin` (a foreground process group other than
+    /// the hidden shell owns the terminal), and `agent_turn_active` (a live agent turn
+    /// is running, ticket T-5.11) are all sourced live; only `preedit_active` (T-3.2
+    /// IME) still reads `false` until that ticket lands (a documented residual).
     fn routing_context(&mut self) -> RoutingContext {
         let degraded = matches!(
             self.engine.integration_status().status,
@@ -113,7 +142,7 @@ impl Session {
             degraded,
             alt_screen,
             foreground_reading_stdin: self.engine.foreground_is_foreign(),
-            agent_turn_active: false,
+            agent_turn_active: self.turn.as_ref().is_some_and(TurnHandle::is_active),
         }
     }
 
@@ -206,6 +235,24 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Tear the agent turn down BEFORE the engine's model thread is joined (ticket
+        // T-5.11). A live turn's tokio task holds an `AgentInjector` - a clone of the
+        // engine's model-mailbox sender - and while it is alive `Engine::drop`'s
+        // `model.join()` would wait forever on a mailbox disconnect that can never
+        // come, hanging the winit thread. Cancel the turn (fail-closed denies any
+        // parked approval and unblocks the loop), then shut the runtime down (bounded),
+        // which drops the task and releases the injector. The subsequent field-drop of
+        // `engine` then observes the disconnect and joins cleanly. (Field order -
+        // `agent`/`turn` before `engine` - is a backstop; this is the explicit teardown.)
+        if let Some(turn) = self.turn.take() {
+            turn.cancel();
+        }
+        self.agent.shutdown();
+    }
+}
+
 impl UiCallbacks for Session {
     fn on_ready(&mut self, window: Arc<Window>) {
         self.window = Some(window);
@@ -277,6 +324,27 @@ impl UiCallbacks for Session {
             return None;
         }
 
+        // While the agent is parked on an approval (T-5.11), the keyboard ANSWERS it
+        // instead of editing the line: Enter / `y` approve (the gated call runs), `n`
+        // deny (it is fed back as an error result and the turn continues), Esc cancels
+        // the whole turn. Every other key is swallowed so a pending safety decision can
+        // never be bypassed by stray input. This IS the click/Esc seam the fail-closed
+        // channel-backed `ConfirmHandler` was built for - resolved on the winit thread.
+        if let Some(turn) = self.turn.as_ref() {
+            if turn.is_active() && turn.has_pending_approval() {
+                if matches!(key.named, Some(NamedKey::Escape)) {
+                    turn.cancel();
+                } else if matches!(key.named, Some(NamedKey::Enter))
+                    || key.ch.is_some_and(|c| c.eq_ignore_ascii_case(&'y'))
+                {
+                    turn.approve_pending();
+                } else if key.ch.is_some_and(|c| c.eq_ignore_ascii_case(&'n')) {
+                    turn.deny_pending();
+                }
+                return None;
+            }
+        }
+
         let ctx = self.routing_context();
         let bytes = match decide(classify(&key, &self.toggle_key), &ctx) {
             // The IME owns the key (T-3.2); nothing routes. Unreachable today
@@ -287,15 +355,39 @@ impl UiCallbacks for Session {
                 self.input.reduce(InputEvent::ToggleMode);
                 None
             }
-            // EPIC-5 stub: a real agent turn and its interrupt land with the loop.
+            // Interrupt the in-flight turn (Esc): cancel it and fail-closed deny any
+            // parked approval so the loop unblocks. Only reached when a turn is active
+            // and NOT parked on an approval (that case is handled above, pre-routing).
             Disposition::InterruptAgent => {
-                log::info!("agent interrupt (Esc)");
+                if let Some(turn) = self.turn.as_ref() {
+                    turn.cancel();
+                    log::info!("agent interrupt (Esc)");
+                }
                 None
             }
-            // Agent submit: read+reset the line, hand it to the agent (EPIC-5 stub).
+            // Agent submit (T-5.11): hand the line to the live turn runtime, which
+            // streams the turn's steps into the timeline through the engine's agent
+            // injector, gated by the CURRENT autonomy posture. The turn runs off the
+            // render thread - this returns at once.
             Disposition::SubmitAgent => {
-                let line = self.input.take();
-                log::info!("agent submit: {line}");
+                if self.turn.as_ref().is_some_and(TurnHandle::is_active) {
+                    // A turn is already running: PRESERVE the typed line (do not drain
+                    // the input) so a follow-up is not silently lost; the resubmit is
+                    // ignored for now (queueing is a follow-up).
+                    log::info!("agent busy; keeping the typed line (resubmit ignored)");
+                } else {
+                    // No turn active: now it is safe to consume the line and submit it.
+                    let line = self.input.take();
+                    if line.trim().is_empty() {
+                        log::debug!("agent submit: empty line ignored");
+                    } else if let Some(injector) = self.engine.agent_injector() {
+                        let policy = self.autonomy.policy();
+                        log::info!("agent submit ({}): {line}", self.autonomy.mode().label());
+                        self.turn = Some(self.agent.start_turn(line, policy, injector));
+                    } else {
+                        log::warn!("agent submit dropped: the engine is shutting down");
+                    }
+                }
                 None
             }
             // Shell submit: the shell already received the chars via the Edit mirror

@@ -39,16 +39,18 @@ Render every gated command in the single timeline as a proposal with its parsed 
 
 # Notes
 
-Landed across all four crates as a vertical slice (the model/logic with headless
-tests + the render binding + the session wiring), following the T-5.10 bar: the
-behavioral ACs are proven at the component (`aterm-agent`/`aterm-ui`) + render-binding
-layer; the live agent turn is not yet consumed by `aterm-app` (residual #1). Gate
-green: fmt / clippy `-D warnings` / build / full workspace test (644 tests). An
-independent adversarial review (5 agents, find->refute) cleared the safety invariants,
-the crate-arrow purity, the 60fps damage gate, and the no-regressions claim with zero
-confirmed code defects; its one BROKEN verdict was a governance gap (the locked-decision
-reconciliations were not yet flagged), now closed by this section + the OWNER-CONFIRM
-comments in `policy.rs`.
+Landed across all crates as a vertical slice: the model/logic with headless tests, the
+render binding, the session wiring, AND (2026-07-01) the live agent turn now running in
+the binary - see "Live integration landed" below. The behavioral ACs are exercisable
+end-to-end via the keyless mock path; the component layer additionally proves them at the
+`aterm-agent`/`aterm-ui` unit level. Two independent adversarial reviews (find->refute)
+ran: the component-layer review cleared the safety invariants, crate-arrow purity, the
+60fps damage gate, and the no-regressions claim (its one BROKEN verdict was a governance
+gap, closed by the OWNER-CONFIRM comments in `policy.rs`); the live-integration review (4
+dimensions) returned the render-visibility and fail-closed-safety dimensions CLEAN and
+confirmed four wiring defects (a Session-drop shutdown deadlock + its root-cause injector
+shutdown-contract, a busy-submit input-loss, and a benign non-atomic approval-state
+window), ALL fixed before landing (see below).
 
 ## Landed
 
@@ -75,6 +77,53 @@ comments in `policy.rs`.
   + `autonomy_cycle` with `ATERM_AUTONOMY` / `ATERM_AUTONOMY_KEY` env overrides; the
   agent->ui mode mapping for the indicator.
 - `CHANGELOG.md`: a T-5.11 entry under `## Unreleased -> ### Added`.
+
+## Live integration landed (2026-07-01)
+
+The approval/autonomy UX now runs in the binary end-to-end (closing the former residual
+#1). A submitted agent prompt starts a real turn whose steps interleave into the timeline.
+
+- `crates/aterm-core` (foundation): `ToModel::{PushAgentBlock, AppendAgentText}` + their
+  `handle_mailbox` arms (arm the coalesced publish so an agent step redraws with no PTY
+  output), `AgentInjector` (a `Send + Clone` model-mailbox handle) + `Engine::agent_injector()`,
+  and `BlockList::append_last_agent_text` (point-update the trailing agent block). Tests:
+  injection-through-mailbox appears in the published timeline; trailing-agent-text extend.
+  `aterm-core` still names no agent type - `AgentInjector`/`AgentBlock`/`AgentBadge` are
+  agent-domain-free core types.
+- `crates/aterm-agent/src/turn.rs`: extracted the per-tool gate into a free
+  `pub fn gate_tool(input, policy, secrets) -> Approval` (`AgentTurn::gate` delegates), plus
+  `pub fn badge_for_approval(&Approval) -> AgentBadge`. The app reuses BOTH so the timeline
+  badge and the loop's execution decision come from ONE function - no crown-jewel drift
+  (test: `gate_tool_and_badge_for_approval_agree_across_the_three_verdicts`).
+- `crates/aterm-app/src/agent_runtime.rs` (NEW): a PURE, sink-generic `StreamProjector`
+  mapping `AgentEvent`s to timeline mutations (coalescing streamed thinking/assistant deltas
+  in place; gating a `ToolProposed` via `gate_tool` -> badge + glossed label; result/error
+  blocks) - 9 unit tests over a recording sink, no window/tokio/network. Plus `AgentRuntime`
+  (a tokio multi-thread runtime on dedicated threads) + `TurnHandle` (cancel token + a shared
+  pending-`ApprovalRequest` slot bridged from the async `ChannelConfirmHandler` to the winit
+  thread + an `active` flag). Provider selection reads `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`,
+  falling back to a keyless `MockProvider` demo script (list_dir auto-runs; write_file parks
+  on approval; then EndTurn) so the whole UX is exercisable with zero setup.
+- `crates/aterm-app/src/session.rs`: `Disposition::SubmitAgent` starts a turn via
+  `AgentRuntime::start_turn(line, autonomy.policy(), engine.agent_injector())`; a pre-routing
+  keyboard seam answers a parked approval (Enter/`y` approve, `n` deny, Esc cancels the turn);
+  `Disposition::InterruptAgent` cancels; `routing_context.agent_turn_active` is now live.
+
+### Adversarial-review fixes (all confirmed, all fixed before landing)
+
+- **[HIGH] Session-drop shutdown deadlock.** A live turn's `AgentInjector` (a clone of the
+  engine's model-mailbox `Sender`) kept the mailbox connected, so `Engine::drop`'s
+  `model.join()` would hang forever if the engine dropped while a turn was in flight - and
+  the field order dropped `engine` before the runtime. Fixed with an explicit `Drop for
+  Session` that cancels the turn and shuts the runtime down (bounded `shutdown_timeout`) BEFORE
+  the engine drops, plus a field reorder (agent/turn before engine) as a backstop, plus a
+  documented shutdown contract on `AgentInjector`/`agent_injector()` in `aterm-core`.
+- **[MEDIUM] Busy-submit input loss.** `input.take()` ran before the busy guard, wiping the
+  typed line when a turn was already running. Fixed: the busy branch now preserves the line
+  (take only on the actual submit path).
+- **[LOW] Non-atomic approval-state window.** The completion handler flipped `active` before
+  clearing the pending slot; the keyboard seam now also gates on `is_active()`, and the
+  completion handler denies the pending slot before clearing `active`.
 
 ## Owner-confirm decisions (flagged, not silently overridden)
 
@@ -137,27 +186,32 @@ only doc-comments mention them). The one-way arrow holds.
 
 ## Residuals (recorded follow-ups, not silently shipped)
 
-1. **Live agent turn not yet wired into `aterm-app`.** `SubmitAgent` is still a
-   `log::info!` stub and `agent_turn_active` is hardcoded `false`; the approval card,
-   badge, and auto-run are not yet demonstrable in the running binary. Wiring the loop
-   (tokio runtime + `Sinks`/`Sandbox` construction + event pump + transcript->engine
-   block projection + installing `ChannelConfirmHandler` + Esc->`req.deny()`) is its own
-   integration body of work with no existing scaffolding - a follow-up ticket. The seam
-   is ready: the channel-backed handler IS the click/Esc seam.
-2. **"Always visible" is conditional on the input box being drawn.** The autonomy chip
+1. **No queue for a submit while a turn is running.** A prompt submitted while a turn is
+   active is ignored (the typed line is now PRESERVED, not lost - the review fix); queueing
+   the follow-up is a small follow-up.
+2. **On-device visual acceptance is owner-watched.** The GPU window + a live LLM turn cannot
+   run headless here; the render-visibility review dimension confirmed the wake path (an
+   agent-block injection arms a publish -> version bump -> the same wake as shell output), and
+   the keyless mock path exercises the flow, but the pixel-level look of the streamed
+   agent-card timeline is the owner-watched on-hardware step.
+3. **"Always visible" is conditional on the input box being drawn.** The autonomy chip
    is gated behind `draw_input = !alt_screen && input.is_some()` (gpu.rs), so it is hidden
    in alt-screen TUI mode (the grid owns the screen; no agent interaction there today).
-3. **No GPU-ink test for the autonomy chip / the `frame.autonomy` pass-through.** The
+4. **No GPU-ink test for the autonomy chip / the `frame.autonomy` pass-through.** The
    macOS GPU harness hardcodes `autonomy: None`; the chip-draw path is verified
    structurally + by the headless `AutonomyChip::resolve` test, not by pixel readback.
-4. **Chip labels are re-shaped on every input rebuild (per keystroke), not cached.** A
+5. **Chip labels are re-shaped on every input rebuild (per keystroke), not cached.** A
    pre-existing pattern for the routing chip's 2 labels; T-5.11 adds 3 more (autonomy).
    Gated by the damage signature (idle is allocation-free, proven), but a latent per-edit
    cost worth a future caching pass.
-5. **`transcript::ApprovalMode` stays 2-variant** ({AutoSafe, AskAlways}); the new
+6. **`transcript::ApprovalMode` stays 2-variant** ({AutoSafe, AskAlways}); the new
    3-tier `AutonomyMode` is the control type. Recording the precise tier on an `Approval`
    step (3-variant fidelity) is a small follow-up if the audit record needs it.
-6. **`deny.toml` does not enforce the crate-arrow graph** (only licenses + bans). The
+7. **`deny.toml` does not enforce the crate-arrow graph** (only licenses + bans). The
    one-way arrow is held by source discipline + per-crate `Cargo.toml`, NOT by cargo-deny
    - contrary to CLAUDE.md's "cargo deny enforces this [graph]". Pre-existing; a
    `[graph]`/ban rule would make the boundary tooling-enforced. Worth a follow-up.
+8. **Runtime shutdown may leak a blocking command thread at exit.** `AgentRuntime::shutdown`
+   uses a bounded `shutdown_timeout`, so quitting exactly while a sandboxed command runs in a
+   blocking task can leak that thread (the command self-terminates via its own kill-timeout).
+   Bounded and rare; a cleaner drain is a follow-up.

@@ -525,6 +525,22 @@ impl BlockList {
         }
     }
 
+    /// Append `delta` to the LAST agent entry's text (ticket T-5.11): the streaming
+    /// path the engine's agent-injection mailbox uses, so a text/thinking delta
+    /// extends the open agent block in place without the caller threading an index
+    /// across the thread boundary. A point-update of one Fenwick node. Returns whether
+    /// a trailing agent entry was found to extend.
+    pub fn append_last_agent_text(&mut self, delta: &str) -> bool {
+        match self
+            .blocks
+            .iter()
+            .rposition(|b| matches!(b, Block::Agent(_)))
+        {
+            Some(i) => self.append_agent_text(i, delta),
+            None => false,
+        }
+    }
+
     /// The most recent still-RUNNING command entry (skipping agent steps and
     /// finished commands). The segmenter mutates the open command through this, so
     /// an interleaved agent step that happens to be `last()` cannot be mistaken for
@@ -1935,6 +1951,31 @@ mod tests {
         // flipping NeedsApproval -> Auto) is observable for the renderer's damage gate.
         let approved = agent(AgentBlockKind::ToolCall, "run_command").with_badge(AgentBadge::Auto);
         assert_ne!(gated.badge, approved.badge);
+    }
+
+    #[test]
+    fn append_last_agent_text_extends_the_trailing_agent_block_only() {
+        // T-5.11: the engine's streaming-inject path extends the OPEN (last) agent
+        // block in place, without the caller threading an index across threads. It
+        // targets the last agent entry even when a command block trails it is absent,
+        // and is a no-op (returns false) when there is no agent block.
+        let mut list = BlockList::new();
+        assert!(
+            !list.append_last_agent_text("x"),
+            "no agent block -> nothing to extend"
+        );
+
+        let i = list.push_agent(agent(AgentBlockKind::AssistantText, "Hel"));
+        assert!(list.append_last_agent_text("lo"));
+        assert_eq!(list.get(i).unwrap().as_agent().unwrap().text, "Hello");
+
+        // A second agent block: the append targets the LAST one, and the height index
+        // tracks the new line count (a two-line append spans two rows).
+        let j = list.push_agent(agent(AgentBlockKind::ToolResult, "one"));
+        assert!(list.append_last_agent_text("\ntwo"));
+        assert_eq!(list.get(j).unwrap().as_agent().unwrap().text, "one\ntwo");
+        assert_eq!(list.get(i).unwrap().as_agent().unwrap().text, "Hello"); // first untouched
+        assert_eq!(list.total_height_rows(), 1 + 2, "1 row + 2-line tail");
     }
 
     #[test]

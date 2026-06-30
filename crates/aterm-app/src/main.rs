@@ -6,6 +6,7 @@
 //! the callback set so PTY bytes flow to the renderer and keystrokes flow to the
 //! shell.
 
+mod agent_runtime;
 mod config;
 mod routing;
 mod session;

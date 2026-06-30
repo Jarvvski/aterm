@@ -48,5 +48,6 @@ pub use tools::{
 };
 pub use transcript::{AgentStep, AgentTranscript, ApprovalMode, ResolvedBy, TurnStatus};
 pub use turn::{
-    AgentTurn, CancelToken, ConfirmDecision, ConfirmHandler, ToolDisposition, TurnOutcome,
+    badge_for_approval, gate_tool, AgentTurn, CancelToken, ConfirmDecision, ConfirmHandler,
+    ToolDisposition, TurnOutcome,
 };

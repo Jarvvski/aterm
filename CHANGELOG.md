@@ -13,6 +13,22 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The agent actually runs now: ask it something and watch it work in the timeline.**
+  Submitting a prompt to the agent (Enter in Agent mode, or Opt-Enter from anywhere) now
+  starts a real client-side agentic turn on a background runtime - off the render thread, so
+  the 60fps floor holds while it streams. Its steps land live in the same scrollback as your
+  shell commands: your prompt, the model's thinking and prose (streamed in place, extending
+  one block rather than relaying out the timeline), each proposed tool call with its risk
+  badge, and each tool's sanitized result, interleaved by wall-clock. A proven-safe,
+  non-shell-active tool auto-runs and shows an `auto` badge; a `Caution`/`Dangerous` or
+  shell-active one parks the turn on the keyboard - the badge reads `APPROVE?`/`BLOCKED` with
+  the parsed reason inline, and you answer with Enter/`y` (approve), `n` (deny, the turn
+  continues), or Esc (cancel the whole turn). The approval seam is fail-closed: if you cancel
+  or the turn dies, a parked call is denied, never run. The same `gate_tool` decides both the
+  badge you see and whether the loop actually runs the call, so they can never disagree. With
+  no API key set, a keyless mock turn drives the whole flow as a demo; with `ANTHROPIC_API_KEY`
+  (or `OPENAI_API_KEY`) it runs a real Claude (or OpenAI) turn, sandboxed and gated. Key
+  custody is still a follow-up (T-8.3). (Ticket T-5.11.)
 - **Every gated command shows its risk verdict, and you control how much the agent runs on
   its own.** A proposed tool call now carries the deterministic risk gate's verdict as a
   badge in the timeline, paired ALWAYS with a text label (never color alone): a proven-safe

@@ -57,8 +57,8 @@ use crate::integration::{Integration, IntegrationMonitor};
 use crate::osc::{Mark, PromptKind};
 use crate::shell_integration::{should_inject_zsh, IntegrationDir, ShellKind, ShimNonce};
 use crate::{
-    BlockList, BlockSegmenter, HeuristicSegmenter, OscScanner, Pty, PtyDimensions, PtyError,
-    PtyEvent, Signal, Snapshot, Terminal, TerminalEvent,
+    AgentBlock, BlockList, BlockSegmenter, HeuristicSegmenter, OscScanner, Pty, PtyDimensions,
+    PtyError, PtyEvent, Signal, Snapshot, Terminal, TerminalEvent,
 };
 
 /// Reader read-buffer size. 64 KiB matches Zellij's PTY read buffer; the buffer
@@ -128,6 +128,49 @@ pub enum ToModel {
     /// Bytes to write to the PTY master (shell-mode keystrokes, pastes, and -
     /// later, ticket T-1.9 - query replies).
     Input(Vec<u8>),
+    /// Append an agent transcript step to the timeline (ticket T-5.11). The agent
+    /// runtime (a tokio task off the render thread) sends these as a turn streams, so
+    /// agent steps interleave with command blocks in the single wall-clock timeline
+    /// (the locked architecture: "SSE deltas land by channel and mutate the current
+    /// timeline entry"). The block is the agent-domain-FREE projection
+    /// ([`AgentBlock`]); the engine never sees an LLM/agent type.
+    PushAgentBlock(Box<AgentBlock>),
+    /// Extend the LAST agent block's text in place (ticket T-5.11): a streamed
+    /// assistant/thinking delta. A point-update touching only the tail entry, so a
+    /// long stream never relays out the timeline (the 60fps floor).
+    AppendAgentText(String),
+}
+
+/// A cloneable, `Send` handle for an off-thread agent runtime (a tokio task) to
+/// stream transcript steps into the single timeline (ticket T-5.11). Wraps a clone
+/// of the model mailbox sender; a send after the model thread has stopped is a silent
+/// no-op. Obtained via [`Engine::agent_injector`].
+///
+/// **Shutdown contract (important).** This is a *clone* of the mailbox sender the
+/// [`Engine`] otherwise owns solely, and the model thread's clean-shutdown path relies
+/// on that mailbox disconnecting (all senders dropped) - see this module's docs and
+/// [`Engine`]'s `Drop`. An `AgentInjector` that OUTLIVES its [`Engine`] keeps the
+/// mailbox connected and would make [`Engine`]'s `Drop` (which joins the model thread)
+/// hang. Callers MUST drop every `AgentInjector` - e.g. by tearing down the runtime
+/// that owns the streaming task - BEFORE the `Engine` is dropped. (The app shuts its
+/// agent runtime down ahead of the engine at session teardown for exactly this reason.)
+#[derive(Clone)]
+pub struct AgentInjector {
+    tx: Sender<ToModel>,
+}
+
+impl AgentInjector {
+    /// Append an agent step (already projected to the agent-domain-free
+    /// [`AgentBlock`]) to the timeline.
+    pub fn push_block(&self, block: AgentBlock) {
+        let _ = self.tx.send(ToModel::PushAgentBlock(Box::new(block)));
+    }
+
+    /// Extend the last agent block's text in place - a streamed assistant/thinking
+    /// delta.
+    pub fn append_text(&self, delta: impl Into<String>) {
+        let _ = self.tx.send(ToModel::AppendAgentText(delta.into()));
+    }
 }
 
 /// A running terminal engine: the reader + model threads and the handles the app
@@ -469,6 +512,18 @@ impl Engine {
     /// Write `bytes` to the PTY (shell-mode keystrokes / pastes).
     pub fn send_input(&self, bytes: Vec<u8>) {
         self.send(ToModel::Input(bytes));
+    }
+
+    /// A cloneable handle (ticket T-5.11) for an off-thread agent runtime to stream
+    /// transcript steps into the timeline. `None` only once the engine is shutting
+    /// down (the mailbox sender dropped). The returned [`AgentInjector`] is `Send` +
+    /// `Clone`, so a tokio task can own one - but see its **shutdown contract**: every
+    /// injector MUST be dropped before this [`Engine`] is, or `Drop`'s model-thread join
+    /// will hang on a mailbox that never disconnects.
+    pub fn agent_injector(&self) -> Option<AgentInjector> {
+        self.to_model
+            .as_ref()
+            .map(|tx| AgentInjector { tx: tx.clone() })
     }
 
     fn send(&self, msg: ToModel) {
@@ -1124,6 +1179,25 @@ impl Model {
                     log::warn!("pty write failed: {e}");
                 }
                 false
+            }
+            ToModel::PushAgentBlock(block) => {
+                // Append the agent step to the single timeline (ticket T-5.11) and mark
+                // the block list dirty so the coalesced publish (T-1.4) republishes it.
+                // Returns true so the publish window arms even with no PTY output.
+                self.blocks.push_agent(*block);
+                self.blocks_touched = true;
+                true
+            }
+            ToModel::AppendAgentText(delta) => {
+                // Extend the open (last) agent block in place - a point-update, no
+                // relayout (ticket T-5.11 / T-5.10 AC2). Only dirties if a trailing
+                // agent block was actually found to extend.
+                if self.blocks.append_last_agent_text(&delta) {
+                    self.blocks_touched = true;
+                    true
+                } else {
+                    false
+                }
             }
         }
     }
@@ -2028,6 +2102,66 @@ mod tests {
             "the heuristic must segment exactly two command cycles, no more (no \
              mid-output over-segmentation)"
         );
+        drop(engine);
+    }
+
+    #[test]
+    fn agent_blocks_injected_through_the_mailbox_appear_in_the_published_timeline() {
+        // T-5.11: the off-thread agent runtime streams transcript steps into the
+        // single timeline via the model mailbox (`AgentInjector`). A quiet shell
+        // produces no command blocks, so the published BlockList is exactly the
+        // injected agent steps - and a streamed delta (`append_text`) extends the open
+        // block IN PLACE rather than pushing a new one.
+        // A short-lived quiet shell: injection + publish lands in ~tens of ms, well
+        // before exit, and the engine is dropped the moment the blocks appear - kept
+        // brief so this test does not contend for CPU with the flood tests.
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", "sleep 1"],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            None,
+            Duration::from_millis(100),
+        )
+        .expect("spawn a quiet sh");
+
+        let inj = engine.agent_injector().expect("injector before shutdown");
+        inj.push_block(AgentBlock::new(
+            crate::AgentBlockKind::UserPrompt,
+            "fix the bug",
+            Instant::now(),
+        ));
+        inj.push_block(AgentBlock::new(
+            crate::AgentBlockKind::AssistantText,
+            "On ",
+            Instant::now(),
+        ));
+        inj.append_text("it.");
+
+        // Poll the render-thread view until the two agent steps land (coalesced
+        // publish), then assert the delta extended the open block in place.
+        let deadline = Instant::now() + Duration::from_millis(900);
+        loop {
+            let blocks = engine.latest_blocks();
+            if blocks.len() == 2 {
+                assert_eq!(
+                    blocks.get(0).unwrap().as_agent().unwrap().text,
+                    "fix the bug"
+                );
+                assert_eq!(
+                    blocks.get(1).unwrap().as_agent().unwrap().text,
+                    "On it.",
+                    "the streamed delta extended the open assistant block in place"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "injected agent blocks were never published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         drop(engine);
     }
 

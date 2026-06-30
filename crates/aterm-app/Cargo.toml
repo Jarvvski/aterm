@@ -27,3 +27,10 @@ aterm-agent.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
 env_logger.workspace = true
+# The off-render-thread agent-turn runtime (ticket T-5.11). Already a transitive
+# workspace dep via aterm-agent; the app names it directly to own the runtime.
+tokio.workspace = true
+
+[dev-dependencies]
+# Tests construct tool-call inputs (serde_json::Value) for the StreamProjector.
+serde_json.workspace = true

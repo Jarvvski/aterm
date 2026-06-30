@@ -37,6 +37,8 @@ use std::task::Poll;
 
 use tokio::sync::{mpsc, watch};
 
+use aterm_core::AgentBadge;
+
 use crate::policy::{Approval, ApprovalPolicy};
 use crate::provider::{
     AgentEvent, AgentEventMapper, ContentBlock, LlmProvider, Message, ProviderError, ProviderEvent,
@@ -159,6 +161,59 @@ pub struct AgentTurn<'a, P: LlmProvider> {
     max_rounds: u32,
 }
 
+/// The deterministic gate decision for a typed tool call, as a free function so the
+/// app can recompute the exact same verdict for a `ToolProposed` event without an
+/// `AgentTurn` (ticket T-5.11). Never trusts the model. `run_command` goes through
+/// the full argv risk gate (T-5.5) against the single [`Secrets`] source; file
+/// MUTATIONS are never provably safe, so the gate over-approximates toward
+/// RequireConfirm (the locked autonomy stance); read-only tools auto-run (any secret
+/// VALUES in their output are redacted by the sanitizer before the result re-enters
+/// context, and the file sink re-gates a sensitive-path read as defense in depth,
+/// T-5.9).
+///
+/// This is the ONE place the per-tool-call disposition is decided, so the loop's
+/// execution gate ([`AgentTurn::gate`]) and the UI's badge ([`badge_for_approval`])
+/// can never disagree about whether a given call auto-runs, needs approval, or is
+/// blocked.
+#[must_use]
+pub fn gate_tool(input: &ToolInput, policy: &ApprovalPolicy, secrets: &Secrets) -> Approval {
+    match input {
+        ToolInput::RunCommand(rc) => {
+            policy.decide_command(&rc.command, rc.cwd.as_deref(), None, secrets)
+        }
+        ToolInput::EditFile(_) | ToolInput::WriteFile(_) => {
+            Approval::RequireConfirm(RiskAssessment {
+                level: Risk::Caution,
+                reasons: vec![RiskReason::FileWrite],
+            })
+        }
+        ToolInput::ReadFile(_)
+        | ToolInput::ListDir(_)
+        | ToolInput::Glob(_)
+        | ToolInput::Grep(_) => Approval::AutoApprove,
+    }
+}
+
+/// Project a gate [`Approval`] onto the agent-domain-FREE [`AgentBadge`] the timeline
+/// draws (ticket T-5.11). The auto-safe default means an [`Approval::AutoApprove`] is
+/// [`AgentBadge::Auto`]; an escalation is [`AgentBadge::Blocked`] when the underlying
+/// risk is `Dangerous` (a destructive verdict needs an explicit override) and
+/// [`AgentBadge::NeedsApproval`] otherwise. This mirrors `transcript::badge_for` (the
+/// `ToolDisposition` path) so the live-stream badge and the recorded-step badge agree.
+#[must_use]
+pub fn badge_for_approval(approval: &Approval) -> AgentBadge {
+    match approval {
+        Approval::AutoApprove => AgentBadge::Auto,
+        Approval::RequireConfirm(assessment) => {
+            if assessment.level == Risk::Dangerous {
+                AgentBadge::Blocked
+            } else {
+                AgentBadge::NeedsApproval
+            }
+        }
+    }
+}
+
 impl<'a, P: LlmProvider> AgentTurn<'a, P> {
     /// The default turn: AUTO-SAFE policy, default round cap.
     pub fn new(provider: &'a P, secrets: &'a Secrets) -> Self {
@@ -206,29 +261,12 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
     }
 
     /// The deterministic gate decision for a typed tool call. Never trusts the
-    /// model. `run_command` goes through the full argv risk gate (T-5.5); file
-    /// MUTATIONS are never provably safe so the gate over-approximates toward
-    /// RequireConfirm (the locked autonomy stance); read-only tools auto-run (any
-    /// secret VALUES in their output are redacted by the sanitizer before the
-    /// result re-enters context, and the file sink re-gates a sensitive-path read
-    /// as defense in depth, T-5.9).
+    /// model. Delegates to the free [`gate_tool`] so the SAME verdict the loop acts
+    /// on can be recomputed elsewhere (the UI's `ToolProposed` badge, ticket T-5.11)
+    /// against this turn's policy + single [`Secrets`] source - no crown-jewel
+    /// divergence.
     fn gate(&self, input: &ToolInput) -> Approval {
-        match input {
-            ToolInput::RunCommand(rc) => {
-                self.policy
-                    .decide_command(&rc.command, rc.cwd.as_deref(), None, self.secrets)
-            }
-            ToolInput::EditFile(_) | ToolInput::WriteFile(_) => {
-                Approval::RequireConfirm(RiskAssessment {
-                    level: Risk::Caution,
-                    reasons: vec![RiskReason::FileWrite],
-                })
-            }
-            ToolInput::ReadFile(_)
-            | ToolInput::ListDir(_)
-            | ToolInput::Glob(_)
-            | ToolInput::Grep(_) => Approval::AutoApprove,
-        }
+        gate_tool(input, &self.policy, self.secrets)
     }
 
     /// Run the full agentic loop: plan -> act -> observe -> repeat, until the model
@@ -558,6 +596,60 @@ mod tests {
             effort: Effort::Medium,
             max_tokens: 1024,
         }
+    }
+
+    #[test]
+    fn gate_tool_and_badge_for_approval_agree_across_the_three_verdicts() {
+        // T-5.11: the app recomputes the verdict for a `ToolProposed` badge via the
+        // SAME `gate_tool` the loop's execution gate uses, then maps it to a badge.
+        // This pins the auto-run / needs-approval / blocked partition so the
+        // crown-jewel gate and the timeline badge can never drift.
+        use crate::tools::{ReadFile, RunCommand, WriteFile};
+        let secrets = Secrets::new();
+        let policy = ApprovalPolicy::new(); // AUTO-SAFE default
+        let cmd = |args: &[&str]| {
+            ToolInput::RunCommand(RunCommand {
+                command: args.iter().map(|s| (*s).to_string()).collect(),
+                cwd: None,
+            })
+        };
+
+        // A proven-safe, non-shell-active command auto-runs -> Auto.
+        let safe = gate_tool(&cmd(&["ls", "-la"]), &policy, &secrets);
+        assert_eq!(safe, Approval::AutoApprove);
+        assert_eq!(badge_for_approval(&safe), AgentBadge::Auto);
+
+        // A destructive command is RequireConfirm(Dangerous) -> Blocked.
+        let danger = gate_tool(&cmd(&["rm", "-rf", "/"]), &policy, &secrets);
+        assert!(
+            matches!(&danger, Approval::RequireConfirm(a) if a.level == Risk::Dangerous),
+            "rm -rf / must escalate as Dangerous, got {danger:?}"
+        );
+        assert_eq!(badge_for_approval(&danger), AgentBadge::Blocked);
+
+        // A file MUTATION is always RequireConfirm(Caution) -> NeedsApproval.
+        let write = gate_tool(
+            &ToolInput::WriteFile(WriteFile {
+                path: "out.txt".into(),
+                content: "hi".into(),
+            }),
+            &policy,
+            &secrets,
+        );
+        assert!(matches!(&write, Approval::RequireConfirm(a) if a.level == Risk::Caution));
+        assert_eq!(badge_for_approval(&write), AgentBadge::NeedsApproval);
+
+        // A read-only tool auto-runs -> Auto.
+        let read = gate_tool(
+            &ToolInput::ReadFile(ReadFile {
+                path: "in.txt".into(),
+                range: None,
+            }),
+            &policy,
+            &secrets,
+        );
+        assert_eq!(read, Approval::AutoApprove);
+        assert_eq!(badge_for_approval(&read), AgentBadge::Auto);
     }
 
     /// One provider round that proposes a single tool call and stops on ToolUse.

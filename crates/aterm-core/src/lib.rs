@@ -24,7 +24,7 @@ pub use block::{
     AgentBadge, AgentBlock, AgentBlockKind, Block, BlockList, BlockSegmenter, CommandBlock,
     HeightIndex, HeuristicSegmenter, OutputSpan, RowSnapshot, COLLAPSED_OUTPUT_ROWS,
 };
-pub use engine::{Engine, EngineMetrics, ToModel};
+pub use engine::{AgentInjector, Engine, EngineMetrics, ToModel};
 pub use highlight::{ghost_for, highlight_command_line, highlight_for};
 pub use history::{HistoryEntry, HistoryRing, HistoryScope, Recall, DEFAULT_HISTORY_CAP};
 pub use input::{
