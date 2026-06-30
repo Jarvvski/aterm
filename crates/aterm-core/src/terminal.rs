@@ -161,6 +161,17 @@ pub struct Snapshot {
     /// Whether the alt-screen (a full-screen app) is active. The UI renders the
     /// alt grid as one surface and suppresses block marks while set (ADR-0007).
     pub alt_screen: bool,
+    /// DECCKM application-cursor mode (`TermMode::APP_CURSOR`): arrows + Home/End
+    /// must encode as `SS3` (`ESC O x`) rather than `CSI` for the foreground
+    /// program. Surfaced here so the input router (ticket T-3.3) can build the
+    /// right [`crate::keys::KeyEncodeFlags`] for raw passthrough without touching
+    /// alacritty types - mirroring `alt_screen`.
+    pub app_cursor: bool,
+    /// Kitty keyboard-protocol disambiguate-escape-codes mode
+    /// (`TermMode::DISAMBIGUATE_ESC_CODES`): the foreground program has asked for
+    /// `CSI u` promotion of otherwise-ambiguous keystrokes. Surfaced for the same
+    /// router/encoder use as [`Self::app_cursor`].
+    pub disambiguate: bool,
 }
 
 impl Snapshot {
@@ -179,6 +190,8 @@ impl Snapshot {
             cursor: CursorPos::default(),
             display_offset: 0,
             alt_screen: false,
+            app_cursor: false,
+            disambiguate: false,
         }
     }
 
@@ -440,12 +453,18 @@ impl Terminal {
         let content = self.term.renderable_content();
         let display_offset = content.display_offset;
         let alt_screen = content.mode.contains(TermMode::ALT_SCREEN);
+        // The encode-relevant key modes, surfaced for the T-3.3 router (mirrors
+        // `alt_screen`); `keys::KeyEncodeFlags::from_term_mode` reads the same bits.
+        let app_cursor = content.mode.contains(TermMode::APP_CURSOR);
+        let disambiguate = content.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES);
         let cursor_point = content.cursor.point;
 
         out.rows = rows;
         out.cols = cols;
         out.display_offset = display_offset;
         out.alt_screen = alt_screen;
+        out.app_cursor = app_cursor;
+        out.disambiguate = disambiguate;
 
         // Reuse the existing allocation: clear to length 0 (capacity retained)
         // then refill with blank cells, so a same-size grid never reallocates.
@@ -650,6 +669,38 @@ mod tests {
     }
 
     #[test]
+    fn key_encode_modes_surface_in_the_snapshot() {
+        // The T-3.3 router reads these off the published Snapshot to pick the raw
+        // passthrough encoding; they must track the live TermMode (the same bits
+        // `keys::KeyEncodeFlags::from_term_mode` reads). DECCKM is byte-drivable and
+        // ungated; both fields use the identical one-line mirror in `snapshot_into`.
+        let mut t = Terminal::new(10, 40);
+        let snap = t.snapshot();
+        assert!(!snap.app_cursor);
+        assert!(!snap.disambiguate);
+        // DECCKM application-cursor mode on (`?1h`) / off (`?1l`).
+        t.feed(b"\x1b[?1h");
+        let on = t.snapshot();
+        assert!(on.app_cursor, "?1h should enter DECCKM");
+        assert!(!on.disambiguate, "DECCKM must not touch the Kitty flag");
+        t.feed(b"\x1b[?1l");
+        assert!(!t.snapshot().app_cursor, "?1l should leave DECCKM");
+
+        // The Kitty keyboard protocol is intentionally NOT enabled in our `Term`
+        // config (`Config::default().kitty_keyboard == false`), so a push
+        // (`CSI > 1 u`) is a no-op in `alacritty_terminal` and `disambiguate` stays
+        // dormant. The encoder (`keys::encode`) falls back to legacy/DECCKM when it
+        // is false, so raw passthrough is correct without it. This pins that
+        // behavior: enabling the Kitty protocol is a deliberate future config
+        // decision (the encoder's `CSI u` path is ready + tested) and will flip this.
+        t.feed(b"\x1b[>1u");
+        assert!(
+            !t.snapshot().disambiguate,
+            "Kitty protocol is off in our Term config, so the push is dormant"
+        );
+    }
+
+    #[test]
     fn alt_screen_redraw_then_restore_cells() {
         // Covers the AC's "alt-screen vim redraw produces expected cells" case.
         let mut t = Terminal::new(5, 20);
@@ -801,6 +852,8 @@ mod tests {
         assert_eq!(owned.cells, into.cells);
         assert_eq!(owned.cursor, into.cursor);
         assert_eq!(owned.alt_screen, into.alt_screen);
+        assert_eq!(owned.app_cursor, into.app_cursor);
+        assert_eq!(owned.disambiguate, into.disambiguate);
         assert_eq!(owned.display_offset, into.display_offset);
     }
 
