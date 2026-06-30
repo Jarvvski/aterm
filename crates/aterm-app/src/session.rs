@@ -14,13 +14,13 @@
 use std::sync::Arc;
 
 use aterm_core::{
-    BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
+    keys, BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
 };
 use aterm_ui::{KeyPress, NamedKey, UiCallbacks, Window};
 
 use aterm_core::{InputEvent, InputMode, InputModel, Motion};
 
-use crate::routing::{classify, decide, Disposition, KeyBinding, RoutingContext};
+use crate::routing::{classify, decide, keystroke_for, Disposition, KeyBinding, RoutingContext};
 
 /// One terminal session.
 pub struct Session {
@@ -75,10 +75,11 @@ impl Session {
         }
     }
 
-    /// Build the routing context from live state. `degraded` (integration `None`)
-    /// and `alt_screen` are sourced live; `preedit_active` (T-3.2),
-    /// `agent_turn_active` (EPIC-5), and `foreground_reading_stdin` are not yet
-    /// available and read `false` (documented residuals).
+    /// Build the routing context from live state. `degraded` (integration `None`),
+    /// `alt_screen`, and `foreground_reading_stdin` (a foreground process group
+    /// other than the hidden shell owns the terminal) are sourced live;
+    /// `preedit_active` (T-3.2 IME) and `agent_turn_active` (EPIC-5 agent loop) read
+    /// `false` until those tickets land (documented residuals).
     fn routing_context(&mut self) -> RoutingContext {
         let degraded = matches!(
             self.engine.integration_status().status,
@@ -90,7 +91,7 @@ impl Session {
             preedit_active: false,
             degraded,
             alt_screen,
-            foreground_reading_stdin: false,
+            foreground_reading_stdin: self.engine.foreground_is_foreign(),
             agent_turn_active: false,
         }
     }
@@ -155,10 +156,13 @@ impl Session {
         }
     }
 
-    /// The raw bytes a key sends to the PTY (the Shell-echo mirror and raw
-    /// passthrough). `erased` gates Backspace -> DEL so an empty input box does not
-    /// echo a stray DEL. Arrows/Delete/Home/End send nothing yet - full key->bytes
-    /// encoding (Kitty protocol / DECCKM) is ticket T-3.4.
+    /// The bytes a key sends to the PTY for the **Shell-mode prompt-echo mirror**
+    /// only (the raw passthrough path now encodes via `routing::keystroke_for` +
+    /// `keys::encode`). `erased` gates Backspace -> DEL so an empty input box does
+    /// not echo a stray DEL. Arrows/Delete/Home/End send nothing here on purpose:
+    /// at the prompt those move the `InputModel` caret, not the shell's line - the
+    /// shell-echo mirror is a deliberately minimal cooked stand-in until the T-3.6
+    /// widget is the source of truth.
     fn raw_key_bytes(named: Option<NamedKey>, text: Option<&str>, erased: bool) -> Option<Vec<u8>> {
         match named {
             Some(NamedKey::Enter) => Some(b"\r".to_vec()),
@@ -261,10 +265,21 @@ impl UiCallbacks for Session {
                 let _ = self.input.take();
                 Some(b"\r".to_vec())
             }
-            // Raw passthrough (alt-screen / foreground stdin / degraded): the keys
-            // belong to the PTY (a TUI or a classic ZLE line editor), NOT the input
-            // box, so we do not edit the `InputModel`. T-3.4 owns full encoding.
-            Disposition::PassthroughToPty => Self::raw_key_bytes(key.named, key.text, true),
+            // Raw passthrough (alt-screen / a running foreground command / degraded
+            // ZLE): the keys belong to the foreground program, NOT the input box, so
+            // we do not edit the `InputModel`. Encode them to the correct PTY bytes
+            // (legacy / DECCKM / Kitty) with the T-3.4 encoder, reading the live
+            // key-mode flags off the snapshot.
+            Disposition::PassthroughToPty => {
+                let snap = self.engine.latest_snapshot();
+                let flags = keys::KeyEncodeFlags {
+                    app_cursor: snap.app_cursor,
+                    disambiguate: snap.disambiguate,
+                };
+                keystroke_for(&key)
+                    .map(|stroke| keys::encode(stroke, flags))
+                    .filter(|bytes| !bytes.is_empty())
+            }
             // Ordinary editing: update the input line. In Shell mode ALSO mirror raw
             // to the PTY for the shell's echo (until the T-3.6 widget is the source
             // of truth). Agent mode edits the prompt only - no PTY bytes.

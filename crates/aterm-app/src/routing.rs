@@ -33,7 +33,7 @@
 //! `preedit_active` (T-3.2 IME) and `agent_turn_active` (EPIC-5 agent loop) read
 //! `false` until those land. See session.rs and the ticket Notes.
 
-use aterm_core::InputMode;
+use aterm_core::{keys, InputMode};
 use aterm_ui::{KeyPress, Mods, NamedKey};
 
 /// The routing-relevant classification of a key event. The session maps a winit key
@@ -44,8 +44,8 @@ pub enum KeyInput {
     Enter { alt: bool },
     /// The Escape key.
     Escape,
-    /// The resolved mode-toggle chord (the dossier's `Cmd-/`; a `Tab` placeholder
-    /// until the modifier seam lands).
+    /// The resolved mode-toggle chord - the configurable [`KeyBinding`] (the
+    /// dossier default `Cmd-/`), matched by [`classify`].
     ToggleHotkey,
     /// Any other key: editing the input box, or raw passthrough in a
     /// degraded/alt-screen/in-flight context.
@@ -247,6 +247,82 @@ pub fn classify(key: &KeyPress, binding: &KeyBinding) -> KeyInput {
         Some(NamedKey::Escape) => KeyInput::Escape,
         _ => KeyInput::Other,
     }
+}
+
+/// Map a UI [`KeyPress`] to the core [`keys::KeyStroke`] for raw passthrough
+/// encoding (ticket T-3.4's encoder, adopted on the alt-screen / foreground /
+/// degraded paths). Returns `None` when there is nothing to send to the PTY:
+///
+/// - **`Cmd`/Super held**: on macOS Command is an app-level modifier (menu chords,
+///   the mode toggle) and is never forwarded to the foreground program, so a
+///   Cmd-modified press maps to nothing here.
+/// - an unmapped named key (a key the encoder has no sequence for), or a press that
+///   is neither a named key nor a character.
+///
+/// `Space` is a printable (`U+0020`), not one of the encoder's named keys, so it is
+/// mapped to a code point. Ctrl/Alt/Shift carry through; `meta` stays false (we do
+/// not map Super onto the legacy meta-sends-escape).
+#[must_use]
+pub fn keystroke_for(key: &KeyPress) -> Option<keys::KeyStroke> {
+    if key.mods.cmd {
+        return None;
+    }
+    let (named, code_point) = match key.named {
+        // Space is a printable, not an encoder named key.
+        Some(NamedKey::Space) => (None, Some(u32::from(' '))),
+        Some(n) => match map_named(n) {
+            Some(k) => (Some(k), None),
+            None => return None, // a named key the encoder does not handle
+        },
+        None => (None, key.ch.map(u32::from)),
+    };
+    if named.is_none() && code_point.is_none() {
+        return None;
+    }
+    Some(keys::KeyStroke {
+        code_point,
+        named,
+        ctrl: key.mods.ctrl,
+        alt: key.mods.alt,
+        shift: key.mods.shift,
+        meta: false,
+    })
+}
+
+/// Map a winit [`NamedKey`] to the encoder's [`keys::NamedKey`], or `None` for a key
+/// it has no passthrough sequence for (`Space` is handled by [`keystroke_for`] as a
+/// printable, so it is not here).
+fn map_named(n: NamedKey) -> Option<keys::NamedKey> {
+    use keys::NamedKey as K;
+    Some(match n {
+        NamedKey::Enter => K::Enter,
+        NamedKey::Tab => K::Tab,
+        NamedKey::Backspace => K::Backspace,
+        NamedKey::Escape => K::Escape,
+        NamedKey::ArrowUp => K::Up,
+        NamedKey::ArrowDown => K::Down,
+        NamedKey::ArrowLeft => K::Left,
+        NamedKey::ArrowRight => K::Right,
+        NamedKey::Home => K::Home,
+        NamedKey::End => K::End,
+        NamedKey::PageUp => K::PageUp,
+        NamedKey::PageDown => K::PageDown,
+        NamedKey::Insert => K::Insert,
+        NamedKey::Delete => K::Delete,
+        NamedKey::F1 => K::F1,
+        NamedKey::F2 => K::F2,
+        NamedKey::F3 => K::F3,
+        NamedKey::F4 => K::F4,
+        NamedKey::F5 => K::F5,
+        NamedKey::F6 => K::F6,
+        NamedKey::F7 => K::F7,
+        NamedKey::F8 => K::F8,
+        NamedKey::F9 => K::F9,
+        NamedKey::F10 => K::F10,
+        NamedKey::F11 => K::F11,
+        NamedKey::F12 => K::F12,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -535,5 +611,63 @@ mod tests {
         assert_eq!(KeyBinding::parse("cmd"), None);
         assert_eq!(KeyBinding::parse("a+b"), None);
         assert_eq!(KeyBinding::parse("cmd+"), None);
+    }
+
+    // --- The KeyPress -> keys::KeyStroke mapping for raw passthrough (T-3.4) ---
+
+    #[test]
+    fn keystroke_cmd_is_never_forwarded_to_the_pty() {
+        // Cmd/Super is an app-level modifier on macOS - it must not reach the program.
+        assert!(keystroke_for(&kp(None, Some('k'), mods(true, false, false, false))).is_none());
+        // An unmapped named key (CapsLock) also maps to nothing.
+        let caps = kp(
+            Some(NamedKey::CapsLock),
+            None,
+            mods(false, false, false, false),
+        );
+        assert!(keystroke_for(&caps).is_none());
+    }
+
+    #[test]
+    fn keystroke_maps_space_char_and_named_keys() {
+        // Space is a printable, not an encoder named key.
+        let space = keystroke_for(&kp(Some(NamedKey::Space), None, Mods::default())).unwrap();
+        assert_eq!(space.code_point, Some(u32::from(' ')));
+        assert_eq!(space.named, None);
+        // A plain character carries through as a code point.
+        let a = keystroke_for(&kp(None, Some('a'), Mods::default())).unwrap();
+        assert_eq!(a.code_point, Some(u32::from('a')));
+        // A named arrow maps to the encoder's named key + carries modifiers.
+        let up = keystroke_for(&kp(
+            Some(NamedKey::ArrowUp),
+            None,
+            mods(false, false, true, false),
+        ))
+        .unwrap();
+        assert_eq!(up.named, Some(keys::NamedKey::Up));
+        assert!(up.ctrl);
+    }
+
+    #[test]
+    fn keystroke_feeds_the_encoder_end_to_end() {
+        // The whole point of the adoption: Ctrl-C reaches the PTY as 0x03, and an
+        // arrow switches CSI<->SS3 with the live DECCKM flag - via the real encoder.
+        let ctrl_c = keystroke_for(&kp(None, Some('c'), mods(false, false, true, false))).unwrap();
+        assert_eq!(
+            keys::encode(ctrl_c, keys::KeyEncodeFlags::default()),
+            vec![0x03]
+        );
+
+        let up = keystroke_for(&kp(Some(NamedKey::ArrowUp), None, Mods::default())).unwrap();
+        let csi = keys::KeyEncodeFlags {
+            app_cursor: false,
+            disambiguate: false,
+        };
+        let ss3 = keys::KeyEncodeFlags {
+            app_cursor: true,
+            disambiguate: false,
+        };
+        assert_eq!(keys::encode(up, csi), b"\x1b[A".to_vec());
+        assert_eq!(keys::encode(up, ss3), b"\x1bOA".to_vec());
     }
 }

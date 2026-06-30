@@ -13,6 +13,15 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Keys now reach full-screen apps and running commands correctly.** When a full-screen
+  program (vim, less, htop), a running foreground command, or a shell with no integration
+  owns the terminal, keystrokes are passed through and encoded to the right PTY bytes -
+  arrows, `Ctrl-C`/`Ctrl-Z`, Home/End/PageUp/PageDown, the function keys, and DECCKM
+  application-cursor mode (arrows switch to `SS3`) - via the key encoder, instead of the
+  previous stub that sent nothing for most of them. The terminal also now distinguishes "the
+  shell is at its prompt" from "a foreground command is running" (by comparing the live
+  foreground process group to the shell's), so while a command runs your typing goes to that
+  program rather than the input box. (Ticket T-3.3.)
 - **The mode-toggle hotkey and `Opt-Enter` work for real.** Pressing `Cmd-/` now flips the
   input between Shell and Agent routing with the typed text preserved (the prompt glyph +
   SHELL/AGENT chip change; the caret stays accent-blue) - it is the real chord now, not the

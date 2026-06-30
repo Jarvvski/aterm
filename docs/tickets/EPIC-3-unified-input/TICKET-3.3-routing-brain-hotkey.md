@@ -2,7 +2,7 @@
 id: T-3.3
 epic: EPIC-3-unified-input
 title: Routing brain (disposition gates) + hotkey toggle
-status: ready-for-agent
+status: done
 labels: [app, input]
 depends_on: [T-3.1, T-2.1]
 ---
@@ -85,3 +85,47 @@ agent turn for SubmitAgent/InterruptAgent (EPIC-5); `foreground_reading_stdin`
 detection; full key->bytes encoding for passthrough (T-3.4). 9 routing tests; full gate
 green at `-D warnings`. No version bump (no user-visible behaviour change - the byte
 stream is preserved).
+
+**Done 2026-06-30 (agent).** The modifier seam + the two remaining live signals landed
+across four focused commits (two `aterm-core` enablers, the seam, the adoption). T-3.3's
+own scope is complete; the only residuals are blocked on *other* tickets (T-3.2, EPIC-5).
+
+- **Modifier-aware key seam (the headline).** New neutral `aterm_ui::KeyPress { named,
+  ch, text, mods: Mods }` carries the logical character + Cmd/Opt/Ctrl/Shift through
+  `UiCallbacks::on_key`; `app.rs` tracks winit `ModifiersChanged` and folds it into each
+  press. A new pure `routing::classify(&KeyPress, &KeyBinding) -> KeyInput` resolves the
+  real chords: the configurable `Cmd-/` toggle (matched on `ch` since macOS suppresses
+  `text` under Command), `Opt-Enter` (alt-Enter), Escape, and everything else (incl. a
+  now-freed `Tab`) -> `Other`. The `Tab` placeholder is gone; `Tab` again sends `\t`
+  (shell completion). **AC1** (toggle flips mode, text preserved) and **AC3** (Opt-Enter
+  -> agent) are now runtime-reachable, not just decided.
+- **Rebindable toggle (`KeyBinding`).** `Cmd-/` default via `KeyBinding::default_toggle`;
+  `KeyBinding::parse("ctrl+t")` + the `ATERM_TOGGLE_KEY` env override make it rebindable
+  today (the `config.toml` loader is EPIC-8). Exact-modifier match (so `Cmd-/` is not
+  `Cmd-?`); char match is case-insensitive.
+- **`foreground_reading_stdin` is sourced live (AC5 completion).** `aterm-core` captures
+  the shell's pgid at spawn and adds `Engine::foreground_is_foreign()` (compares it to the
+  live `tcgetpgrp` foreground pgid); `routing_context` feeds it, so keys typed while a
+  foreground command runs pass through to that program (not the input box) - not just the
+  alt-screen case.
+- **Key encoder adopted on passthrough (T-3.4's hand-off).** The alt-screen / foreground /
+  degraded path now maps the press to `keys::KeyStroke` (`routing::keystroke_for`) and runs
+  it through `keys::encode`, reading the live DECCKM/Kitty flags off the `Snapshot` (new
+  `app_cursor`/`disambiguate` fields). Arrows (CSI<->SS3), `Ctrl-C`/`Ctrl-Z`, Home/End/Page/
+  F-keys all reach TUIs and degraded ZLE correctly - the old arrow stubs sent nothing.
+  `Cmd`/Super is treated as an app-level modifier and never forwarded to the program. The
+  Kitty `CSI u` branch is wired but dormant (the Kitty protocol is not enabled in our `Term`
+  config - a deliberate separate decision; the encoder falls back to legacy/DECCKM).
+
+**Residuals (blocked on other tickets, decision tested):**
+- **AC4** (IME composition -> no submit): `preedit_active` is always `false` until the live
+  IME feed lands (**T-3.2**); the gate is tested.
+- **AC6** (Esc interrupts a *live* agent turn): `agent_turn_active` is always `false` until
+  the agent loop lands (**EPIC-5**); the interrupt decision is tested + stub-verifiable.
+
+**Tests / gate.** 18 `routing` unit tests (9 `decide` + 6 `classify`/`KeyBinding` + 3
+`keystroke_for` incl. an end-to-end encode), plus 2 `aterm-core` engine tests
+(`pgrp_is_foreign` exhaustive + a live `foreground_is_foreign` via `/bin/cat`) and the
+`Snapshot` key-mode test. `mise run fmt && lint && build && test` green; clippy clean at
+`-D warnings`. User-visible, so CHANGELOG `## Unreleased` gained two entries (no version
+bump - the repo accumulates under Unreleased until a release is cut).
