@@ -154,6 +154,14 @@ pub struct Engine {
     /// backend exposed no master fd or the dup failed.
     #[cfg(unix)]
     fg_fd: Option<std::os::fd::OwnedFd>,
+    /// The hidden login shell's process-group id (== its pid: `portable-pty`
+    /// spawns it as a session/group leader), captured at spawn before the `Pty`
+    /// moves into the model thread. The input router (ticket T-3.3) compares it to
+    /// the live foreground pgid to tell "the shell is sitting at its prompt" from
+    /// "a foreground command owns the terminal" - see [`Engine::foreground_is_foreign`].
+    /// `None` if the backend reported no pid. Unix-only (a `tcgetpgrp` concept).
+    #[cfg(unix)]
+    shell_pgid: Option<i32>,
     /// The materialized shell-integration shim dir (tickets T-2.2 zsh, T-2.3
     /// bash/fish), held for the engine's lifetime so it is removed only when the
     /// engine drops - AFTER `Drop` has joined the threads and killed the child, so
@@ -363,6 +371,11 @@ impl Engine {
             let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
             borrowed.try_clone_to_owned().ok()
         });
+        // Capture the shell's pgid (== its pid; it is its own session/group leader)
+        // before `pty` moves into the model thread, so the router can later tell a
+        // prompt from a running foreground command (ticket T-3.3).
+        #[cfg(unix)]
+        let shell_pgid = pty.process_id().and_then(|p| i32::try_from(p).ok());
 
         let metrics = Arc::new(EngineMetrics::default());
         let rows = dims.rows as usize;
@@ -430,6 +443,8 @@ impl Engine {
             metrics,
             #[cfg(unix)]
             fg_fd,
+            #[cfg(unix)]
+            shell_pgid,
             integration_active: shim_installed,
             _integration: integration,
             shell_kind,
@@ -543,6 +558,24 @@ impl Engine {
         crate::pty::foreground_pgid(self.fg_fd.as_ref()?.as_fd())
     }
 
+    /// Whether a foreground process group **other than the hidden login shell**
+    /// currently owns the terminal - i.e. a command is running in the foreground
+    /// (and so is likely reading stdin), rather than the shell sitting at its
+    /// prompt. The input router (ticket T-3.3) uses this as its
+    /// `foreground_reading_stdin` gate: when `true`, a keystroke is raw-passed to
+    /// the PTY (the running program owns it) instead of editing the input box.
+    ///
+    /// Best-effort: a `tcgetpgrp` read of the live foreground pgid compared to the
+    /// shell's pgid captured at spawn. Returns `false` when the foreground group
+    /// cannot be read or the shell's own pgid is unknown (conservative - an
+    /// unprovable case is treated as "the shell owns the prompt", keeping the box
+    /// editable). Unlike signalling, a momentary misread across a process-group
+    /// transition is harmless here: it only routes a single keystroke.
+    #[must_use]
+    pub fn foreground_is_foreign(&self) -> bool {
+        pgrp_is_foreign(self.foreground_pgid(), self.shell_pgid)
+    }
+
     /// Send `sig` to the terminal's foreground process group (Ctrl-C interrupts the
     /// running command, not the hidden shell). Errors if there is no master fd or
     /// the signal cannot be delivered.
@@ -561,11 +594,29 @@ impl Engine {
     }
 }
 
+/// Pure decision behind [`Engine::foreground_is_foreign`]: is the live
+/// `foreground` process group a *different* group from the hidden `shell`'s? It is
+/// "foreign" only when both are known and differ; whenever either is unknown the
+/// answer is `false` (conservative - keep the input box editable). Split out so the
+/// comparison is exhaustively testable without a live foreground child.
+#[cfg(unix)]
+#[must_use]
+fn pgrp_is_foreign(foreground: Option<i32>, shell: Option<i32>) -> bool {
+    matches!((foreground, shell), (Some(fg), Some(sh)) if fg != sh)
+}
+
 #[cfg(not(unix))]
 impl Engine {
     /// Foreground-pgroup lookup is Unix-only; always `None` elsewhere.
     pub fn foreground_pgid(&self) -> Option<i32> {
         None
+    }
+
+    /// Foreground-group resolution is Unix-only; always `false` elsewhere (the
+    /// router then relies on `alt_screen` + integration state alone).
+    #[must_use]
+    pub fn foreground_is_foreign(&self) -> bool {
+        false
     }
 
     /// Foreground signalling is Unix-only; always an error elsewhere.
@@ -1471,6 +1522,54 @@ mod tests {
         assert!(
             pgid.is_some(),
             "foreground_pgid() should report a running child's process group"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn pgrp_is_foreign_only_when_both_known_and_differ() {
+        // The pure comparison behind foreground_is_foreign, exhaustively (no live
+        // child needed): foreign iff both pgids are known AND differ; any unknown
+        // is conservatively "not foreign" (the shell owns the editable prompt).
+        assert!(
+            pgrp_is_foreign(Some(42), Some(7)),
+            "distinct groups are foreign"
+        );
+        assert!(
+            !pgrp_is_foreign(Some(7), Some(7)),
+            "same group is the shell"
+        );
+        assert!(
+            !pgrp_is_foreign(None, Some(7)),
+            "no foreground => not foreign"
+        );
+        assert!(
+            !pgrp_is_foreign(Some(42), None),
+            "no shell pgid => not foreign"
+        );
+        assert!(!pgrp_is_foreign(None, None), "both unknown => not foreign");
+    }
+
+    #[test]
+    fn foreground_is_foreign_is_false_when_the_engines_own_child_owns_the_terminal() {
+        // The engine's own child (`cat`, spawned directly) IS the foreground
+        // session-leader group, so its pgid equals the captured `shell_pgid`:
+        // foreground_is_foreign() must read false (do NOT raw-pass to the PTY - the
+        // input box owns the keys). This also proves `shell_pgid` was captured
+        // correctly (it must match the live foreground pgid for the own child).
+        let engine = Engine::spawn_command("/bin/cat", &[], dims(), 1_000).expect("spawn cat");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // Wait until the child is actually the foreground group before asserting.
+        while Instant::now() < deadline && engine.foreground_pgid().is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            engine.foreground_pgid().is_some(),
+            "cat should be the foreground group"
+        );
+        assert!(
+            !engine.foreground_is_foreign(),
+            "the engine's own foreground child is not foreign to the captured shell pgid"
         );
         drop(engine);
     }
