@@ -88,10 +88,11 @@ and shrinks the timeline viewport).
   acceptance step (this crate's "GPU/window code is owner-watched" convention); the render
   path is offscreen GPU-tested.
 
-**Discovered (out of scope - flag for a follow-up, NOT T-3.6):** the already-landed timeline
-gutter markers use BMP geometric glyphs (`●` U+25CF, `○` U+25CB, `◐` U+25D0, `▸` U+25B8) that
-are NOT in the bundled Mono Nerd Font (only `✓` U+2713 is) - they resolve to `.notdef`, so
-running / failed / unknown / approximate / interactive gutters likely render as identical
-`.notdef` boxes on screen (the T-4.6 GPU test only asserts "any ink", which a `.notdef` box
-satisfies). A dedicated fix should swap them for present (PUA) glyphs or sprite-render them,
-and add the same non-`.notdef` gid guard this ticket introduced.
+**Discovered + FIXED (follow-up under T-4.6, landed right after this):** the timeline gutter
+markers used BMP geometric glyphs (`●` U+25CF, `○` U+25CB, `◐` U+25D0, `▸` U+25B8) that are
+NOT in the bundled Mono Nerd Font (only `✓` U+2713 was) - five of six resolved to `.notdef`
+and drew as identical boxes (the T-4.6 GPU test only asserts "any ink", which a `.notdef` box
+satisfies, so it missed this). Fixed by swapping `GutterStyle::resolve` to present Nerd-Font
+PUA icons (`nf-fa-circle`/`-check`/`-circle-o`/`-caret-right`/`-circle-half-stroke`,
+auto-centered by the constraint table) + a cross-platform `gutter_glyphs_exist_in_the_bundled_grid_font`
+guard (the same non-`.notdef` gid pattern this ticket introduced for the prompt glyphs).

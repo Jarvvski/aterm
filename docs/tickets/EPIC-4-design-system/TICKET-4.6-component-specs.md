@@ -79,3 +79,15 @@ non-regressing stand-in. Scroll input is EPIC-3 (T-3.x).
   the **owner-watched** acceptance step, consistent with this crate's "GPU/window code is
   owner-watched, not unit-tested" convention; the render path itself is offscreen
   GPU-tested (gutter + output + hairline ink, both themes).
+
+**Follow-up fix 2026-06-30 (gutter glyphs).** A T-3.6 review found the gutter markers used
+BMP geometric glyphs (`●` U+25CF, `○` U+25CB, `◐` U+25D0, `▸` U+25B8) that are absent from
+the bundled iM Writing Mono Nerd Font - five of six resolved to `.notdef` and rendered as
+identical boxes, collapsing the at-a-glance status distinction (only the `✓` tick was
+correct; the offscreen test asserts only "any ink", which a `.notdef` box satisfies). Fixed
+by mapping `GutterStyle::resolve` to present Nerd-Font PUA icons (`nf-fa-circle` /
+`nf-fa-check` / `nf-fa-circle-o` / `nf-fa-caret-right` / `nf-fa-circle-half-stroke`),
+auto-centered into the cell by the T-4.4 constraint table, plus a cross-platform
+`gutter_glyphs_exist_in_the_bundled_grid_font` guard asserting every gutter glyph resolves
+to a non-`.notdef` gid in the bundled face. The shape/color/label/pulsing contract (and its
+tests) are unchanged - only the glyph codepoints.

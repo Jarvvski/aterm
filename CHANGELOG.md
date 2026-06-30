@@ -192,6 +192,18 @@ the next version (or an `## Unreleased` heading until a version is cut).
   warm frame now allocates nothing on the present path (ticket T-1.5 AC5). Per-cell
   color/attr drawing and the formal debug allocation assertion remain T-1.6 / T-1.8.
 
+### Fixed
+
+- **Timeline gutter status markers now render (they were invisible/indistinct boxes).**
+  The command-block gutter markers (running / ok / failed / unknown / interactive /
+  heuristic) used BMP geometric glyphs (`●` `✓`-aside `○` `◐` `▸`) that are NOT in the
+  bundled iM Writing Mono Nerd Font - five of the six resolved to `.notdef` and drew as
+  identical boxes, collapsing the at-a-glance status distinction (only the success tick
+  was correct). They now use present Nerd-Font icons (`nf-fa-circle` / `-check` / `-circle-o`
+  / `-caret-right` / `-circle-half-stroke`), auto-centered into the cell by the per-codepoint
+  constraint table, with a cross-platform guard test asserting every gutter glyph resolves
+  to a real (non-`.notdef`) glyph in the bundled face. (Ticket T-4.6.)
+
 ### Known limitations
 
 - **Resize is not yet tear-synchronized.** T-1.5 AC4 (toggle `presentsWithTransaction`

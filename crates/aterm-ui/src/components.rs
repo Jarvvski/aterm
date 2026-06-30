@@ -177,19 +177,24 @@ impl GutterStyle {
         let c = &theme.colors;
         match marker {
             // Running: a pulsing accent dot (the sole running animation; no spinner).
+            // The gutter glyphs are Nerd-Font PUA icons (`nf-fa-*`), NOT the BMP geometric
+            // shapes (●○◐▸): those are absent from the bundled Mono Nerd Font and would
+            // render as `.notdef` boxes. The PUA icons are present + auto-centered into the
+            // cell by the T-4.4 constraint table (FIT_CENTER); the
+            // `gutter_glyphs_exist_in_the_bundled_grid_font` test guards their presence.
             GutterMarker::Running => Self {
                 shape: GutterShape::PulsingDot,
-                glyph: '\u{25CF}', // ●
+                glyph: '\u{f111}', // nf-fa-circle (filled dot)
                 color: c.accent_primary,
                 exit_code: None,
                 label: None,
                 pulsing: true,
             },
-            // Exit 0: a thin success tick (a tick, not a dot - shape distinguishes it
-            // from the failure dot for a color-blind reading).
+            // Exit 0: a success tick (a tick, not a dot - shape distinguishes it from the
+            // failure dot for a color-blind reading).
             GutterMarker::Ok => Self {
                 shape: GutterShape::Tick,
-                glyph: '\u{2713}', // ✓
+                glyph: '\u{f00c}', // nf-fa-check
                 color: c.success,
                 exit_code: None,
                 label: None,
@@ -198,7 +203,7 @@ impl GutterStyle {
             // Non-zero exit: a danger dot carrying the code (drawn in type.caption).
             GutterMarker::Failed(code) => Self {
                 shape: GutterShape::Dot,
-                glyph: '\u{25CF}', // ●
+                glyph: '\u{f111}', // nf-fa-circle (filled dot)
                 color: c.danger,
                 exit_code: Some(code),
                 label: None,
@@ -207,7 +212,7 @@ impl GutterStyle {
             // Finished but exit unknown (Ctrl-C / missing D): a muted hollow dot.
             GutterMarker::Unknown => Self {
                 shape: GutterShape::HollowDot,
-                glyph: '\u{25CB}', // ○
+                glyph: '\u{f10c}', // nf-fa-circle-o (hollow dot)
                 color: c.fg_muted,
                 exit_code: None,
                 label: None,
@@ -216,7 +221,7 @@ impl GutterStyle {
             // A full-screen app block ("ran vim"): a secondary right-pointing marker.
             GutterMarker::Interactive => Self {
                 shape: GutterShape::Interactive,
-                glyph: '\u{25B8}', // ▸
+                glyph: '\u{f0da}', // nf-fa-caret-right (▸-class)
                 color: c.fg_secondary,
                 exit_code: None,
                 label: Some("tui"),
@@ -226,7 +231,7 @@ impl GutterStyle {
             // labelled so the approximation is loud (mirrors the integration indicator).
             GutterMarker::Approximate => Self {
                 shape: GutterShape::HalfDot,
-                glyph: '\u{25D0}', // ◐
+                glyph: '\u{f042}', // nf-fa-circle-half-stroke (half dot)
                 color: c.caution,
                 exit_code: None,
                 label: Some("approx"),
@@ -626,6 +631,35 @@ mod tests {
             GutterStyle::resolve(GutterMarker::Approximate, &t).label,
             Some("approx")
         );
+    }
+
+    #[test]
+    fn gutter_glyphs_exist_in_the_bundled_grid_font() {
+        // The gutter markers render through the Mono GRID font; a glyph missing from the
+        // bundled Nerd Font draws `.notdef` (an indistinct box), silently breaking the
+        // status indicator - which is exactly what the BMP geometric ●○◐▸ did (absent
+        // from this face). A cmap lookup of 0 IS `.notdef`, so every marker glyph must
+        // resolve non-zero. Pure font parse: runs on every platform, unlike the
+        // macOS-only timeline GPU test (whose "any ink" check a `.notdef` box satisfies).
+        use crate::glyph::GlyphRasterizer;
+        use crate::text::{FaceStyle, FontFamily};
+        let r = GlyphRasterizer::new();
+        for marker in [
+            GutterMarker::Running,
+            GutterMarker::Ok,
+            GutterMarker::Failed(1),
+            GutterMarker::Unknown,
+            GutterMarker::Interactive,
+            GutterMarker::Approximate,
+        ] {
+            let g = GutterStyle::resolve(marker, &themes()[1]);
+            let gid = r.glyph_id(FontFamily::Grid, FaceStyle::Regular, g.glyph);
+            assert_ne!(
+                gid, 0,
+                "{marker:?} gutter glyph U+{:04X} is .notdef in the bundled Mono Nerd Font",
+                g.glyph as u32
+            );
+        }
     }
 
     // ----- prompt routing chip ------------------------------------------
