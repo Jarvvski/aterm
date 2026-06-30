@@ -54,9 +54,12 @@ impl OutputSpan {
 /// so the collapse decision belongs with it (one coordinate space).
 pub const COLLAPSED_OUTPUT_ROWS: u64 = 16;
 
-/// One command block.
+/// One command block: a shell command and the output it produced. The
+/// [`Block::Command`] timeline variant wraps this; agent transcript steps
+/// ([`Block::Agent`], ticket T-5.10) interleave with these in the same
+/// wall-clock [`BlockList`].
 #[derive(Debug, Clone)]
-pub struct Block {
+pub struct CommandBlock {
     /// The command line as typed (between OSC-133 `B` and `C`). May be empty if
     /// the shell did not report it or output started immediately.
     pub command: String,
@@ -95,7 +98,7 @@ pub struct Block {
     pub approximate: bool,
 }
 
-impl Block {
+impl CommandBlock {
     /// Is this block still running (no `D` seen)?
     pub fn is_running(&self) -> bool {
         self.finished_at.is_none()
@@ -183,6 +186,174 @@ impl Block {
     }
 }
 
+/// Which agent transcript step a [`Block::Agent`] timeline entry renders (ticket
+/// T-5.10). Mirrors the locked `AgentStep` variant set (`06-agent-architecture.md`
+/// section e): the rich step model - risk assessment, gate decision, raw tool
+/// input - lives in `aterm-agent`'s transcript (`AgentStep`); THIS is the
+/// agent-domain-FREE render projection that lives in the single wall-clock
+/// timeline next to command blocks. Keeping it free of agent types is what
+/// preserves the one-way crate arrow (`aterm-agent -> aterm-core`, never the
+/// reverse): `aterm-core` must not name an LLM/agent type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentBlockKind {
+    /// The user's request that opened the turn.
+    UserPrompt,
+    /// A chunk of the model's (summarized) thinking.
+    Thinking,
+    /// A chunk of assistant prose.
+    AssistantText,
+    /// A tool the model proposed (text is the glossed name + risk/decision).
+    ToolCall,
+    /// A tool's sanitized result.
+    ToolResult,
+    /// An approval prompt's resolution (auto / user-approved / user-declined).
+    Approval,
+}
+
+/// One agent transcript step projected into the timeline (ticket T-5.10).
+///
+/// It carries only what the renderer needs: a [`kind`](AgentBlockKind) tag, the
+/// display `text` (already glossed/sanitized upstream by `aterm-agent` - this type
+/// never sees a secret value or a raw `RiskAssessment`), the `tool_use_id` join
+/// key (so a ToolCall/Approval/ToolResult triple can be correlated visually), a
+/// wall-clock `started_at`, an `is_error` flag, and a `version` the streaming path
+/// bumps on every text delta. The version is the 60fps lever: a streamed delta
+/// mutates ONLY this entry's text + version, so the renderer's damage gate redraws
+/// just this entry and never relays out the whole timeline per delta (ties to
+/// T-2.7 / T-1.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBlock {
+    pub kind: AgentBlockKind,
+    pub text: String,
+    pub tool_use_id: Option<String>,
+    pub started_at: Instant,
+    pub is_error: bool,
+    pub version: u64,
+}
+
+impl AgentBlock {
+    /// A fresh agent entry at wall-clock `started_at`, version 0.
+    #[must_use]
+    pub fn new(kind: AgentBlockKind, text: impl Into<String>, started_at: Instant) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+            tool_use_id: None,
+            started_at,
+            is_error: false,
+            version: 0,
+        }
+    }
+
+    /// Attach the `tool_use_id` join key (chainable).
+    #[must_use]
+    pub fn with_tool_use_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_use_id = Some(id.into());
+        self
+    }
+
+    /// Mark this entry as carrying an error result (chainable).
+    #[must_use]
+    pub fn with_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
+    }
+
+    /// Append streamed text and bump the version - the incremental-mutation path
+    /// (ticket T-5.10 AC2). [`BlockList::append_agent_text`] re-derives this
+    /// entry's display height afterward so the [`HeightIndex`] stays in step.
+    pub fn push_text(&mut self, delta: &str) {
+        self.text.push_str(delta);
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// The number of text lines this step occupies (always >= 1). Agent steps are
+    /// never collapsed in v1, so this IS the display height.
+    #[must_use]
+    pub fn line_count(&self) -> u64 {
+        self.text.bytes().filter(|&b| b == b'\n').count() as u64 + 1
+    }
+}
+
+/// One entry in the single wall-clock timeline. A [`BlockList`] interleaves human
+/// command blocks ([`Block::Command`]) with agent transcript steps
+/// ([`Block::Agent`], ticket T-5.10) in append (wall-clock) order - the locked
+/// single-timeline design (`06-agent-architecture.md` section e). The renderer
+/// virtualizes over the uniform display-height geometry exposed here; the variant
+/// only changes WHAT is drawn, not how the timeline is laid out.
+///
+/// This replaces the former `Block` struct + `interactive`/`approximate` flag
+/// stand-ins: the flags now live on the [`CommandBlock`] payload, and the agent
+/// variant is the real thing the T-2.4 note deferred to "be designed alongside
+/// Epic-5's agent variants".
+#[derive(Debug, Clone)]
+pub enum Block {
+    /// A shell command and its output.
+    Command(CommandBlock),
+    /// An agent transcript step (ticket T-5.10).
+    Agent(AgentBlock),
+}
+
+impl Block {
+    /// Borrow the command payload, if this entry is a command block.
+    #[must_use]
+    pub fn as_command(&self) -> Option<&CommandBlock> {
+        match self {
+            Block::Command(c) => Some(c),
+            Block::Agent(_) => None,
+        }
+    }
+
+    /// Borrow the agent payload, if this entry is an agent step.
+    #[must_use]
+    pub fn as_agent(&self) -> Option<&AgentBlock> {
+        match self {
+            Block::Agent(a) => Some(a),
+            Block::Command(_) => None,
+        }
+    }
+
+    /// When this entry started, in wall-clock terms - the key the timeline orders
+    /// by (insertion order IS wall-clock order; see [`BlockList`]).
+    #[must_use]
+    pub fn started_at(&self) -> Instant {
+        match self {
+            Block::Command(c) => c.started_at,
+            Block::Agent(a) => a.started_at,
+        }
+    }
+
+    /// Is this a still-running command (no `D` yet)? Agent steps are settled the
+    /// moment they are recorded, so they are never "running".
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        match self {
+            Block::Command(c) => c.is_running(),
+            Block::Agent(_) => false,
+        }
+    }
+
+    /// This entry's RAW height in grid rows (uncollapsed).
+    #[must_use]
+    pub fn height_rows(&self) -> u64 {
+        match self {
+            Block::Command(c) => c.height_rows(),
+            Block::Agent(a) => a.line_count(),
+        }
+    }
+
+    /// This entry's height in *display* rows - what the timeline reserves and the
+    /// [`HeightIndex`] tracks (collapsing long FINISHED command output, ticket
+    /// T-2.7; agent steps never collapse).
+    #[must_use]
+    pub fn display_height_rows(&self) -> u64 {
+        match self {
+            Block::Command(c) => c.display_height_rows(),
+            Block::Agent(a) => a.line_count(),
+        }
+    }
+}
+
 /// The ordered list of blocks for a session, with a [`HeightIndex`] giving
 /// O(log n) viewport queries for the virtualized timeline renderer (ticket T-2.4).
 ///
@@ -255,18 +426,85 @@ impl BlockList {
         self.index.blocks_in_viewport(scroll_top, viewport_h)
     }
 
-    /// Replace block `i`'s output snapshot (the lifecycle driver, T-2.5, calls this
-    /// on `D` with the captured grid rows) and update the height index to match its
-    /// new *display* height (collapsing long output, ticket T-2.7).
+    /// Replace command block `i`'s output snapshot (the lifecycle driver, T-2.5,
+    /// calls this on `D` with the captured grid rows) and update the height index to
+    /// match its new *display* height (collapsing long output, ticket T-2.7). No-op
+    /// if `i` is out of range or is an agent entry.
     pub fn set_block_output(&mut self, i: usize, rows: Vec<RowSnapshot>) {
-        if let Some(b) = self.blocks.get_mut(i) {
-            b.output = rows;
-            self.index.set(i, b.display_height_rows());
+        if let Some(Block::Command(c)) = self.blocks.get_mut(i) {
+            c.output = rows;
+            let h = self.blocks[i].display_height_rows();
+            self.index.set(i, h);
         }
     }
 
-    fn last_mut(&mut self) -> Option<&mut Block> {
-        self.blocks.last_mut()
+    /// Replace the output snapshot of the most recent COMMAND entry (skipping any
+    /// interleaved agent steps, ticket T-5.10) and update its display height.
+    /// Returns whether a command entry was found.
+    ///
+    /// The engine's capture path targets the command it is currently capturing,
+    /// which is always the *last command* in the list - agent steps pushed after it
+    /// (in wall-clock order) do not move it, so this replaces the old "running block
+    /// == last block" assumption that interleaving would break.
+    pub fn set_last_command_output(&mut self, rows: Vec<RowSnapshot>) -> bool {
+        let Some(i) = self
+            .blocks
+            .iter()
+            .rposition(|b| matches!(b, Block::Command(_)))
+        else {
+            return false;
+        };
+        if let Block::Command(c) = &mut self.blocks[i] {
+            c.output = rows;
+        }
+        let h = self.blocks[i].display_height_rows();
+        self.index.set(i, h);
+        true
+    }
+
+    /// Append an agent transcript step to the timeline (ticket T-5.10), returning
+    /// its index. Wall-clock ordering is the append order, so the caller MUST push
+    /// steps as they are emitted (not batch-insert later) to interleave correctly
+    /// with concurrently-running command blocks.
+    pub fn push_agent(&mut self, agent: AgentBlock) -> usize {
+        let i = self.blocks.len();
+        self.push(Block::Agent(agent));
+        i
+    }
+
+    /// Append `delta` to agent entry `i`'s text and keep the height index in step
+    /// (ticket T-5.10 AC2 - the incremental-mutation path). A point-update of one
+    /// Fenwick node: only entry `i`'s height changes, never the whole timeline.
+    /// Returns whether `i` is an agent entry.
+    pub fn append_agent_text(&mut self, i: usize, delta: &str) -> bool {
+        if let Some(Block::Agent(a)) = self.blocks.get_mut(i) {
+            a.push_text(delta);
+            let h = self.blocks[i].display_height_rows();
+            self.index.set(i, h);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The most recent still-RUNNING command entry (skipping agent steps and
+    /// finished commands). The segmenter mutates the open command through this, so
+    /// an interleaved agent step that happens to be `last()` cannot be mistaken for
+    /// the running command.
+    fn last_running_command_mut(&mut self) -> Option<&mut CommandBlock> {
+        self.blocks.iter_mut().rev().find_map(|b| match b {
+            Block::Command(c) if c.is_running() => Some(c),
+            _ => None,
+        })
+    }
+
+    /// The most recent command entry regardless of run state (for setting the
+    /// command text just after a block opens, when it is still running).
+    fn last_command_mut(&mut self) -> Option<&mut CommandBlock> {
+        self.blocks.iter_mut().rev().find_map(|b| match b {
+            Block::Command(c) => Some(c),
+            Block::Agent(_) => None,
+        })
     }
 
     fn push(&mut self, block: Block) {
@@ -507,10 +745,8 @@ impl BlockSegmenter {
             // ensures we never flag a stale block left running by an earlier
             // missing-`D` (whose phase would not be Output) as interactive.
             if self.phase == Phase::Output {
-                if let Some(b) = list.last_mut() {
-                    if b.is_running() {
-                        b.interactive = true;
-                    }
+                if let Some(c) = list.last_running_command_mut() {
+                    c.interactive = true;
                 }
             }
             // The launching command is now the TUI; drop any command line staged
@@ -542,11 +778,9 @@ impl BlockSegmenter {
             Mark::ShellVersion(_) => {}
             Mark::Cwd(path) => {
                 self.pending_cwd = Some(path.clone());
-                // If a block is open, update its cwd too.
-                if let Some(b) = list.last_mut() {
-                    if b.is_running() {
-                        b.cwd = Some(path.clone());
-                    }
+                // If a command block is open, update its cwd too.
+                if let Some(c) = list.last_running_command_mut() {
+                    c.cwd = Some(path.clone());
                 }
             }
             Mark::Prompt(PromptKind::PromptStart) => {
@@ -554,12 +788,10 @@ impl BlockSegmenter {
                 // open means the command never reported `D` (Ctrl-C, a kill, a crash
                 // mid-output). Auto-close the orphan with an UNKNOWN exit (None) so
                 // it is finalized rather than dangling forever.
-                if let Some(b) = list.last_mut() {
-                    if b.is_running() {
-                        b.output_span.end = Some(offset);
-                        b.finished_at = Some(Instant::now());
-                        // exit_code stays None == unknown.
-                    }
+                if let Some(c) = list.last_running_command_mut() {
+                    c.output_span.end = Some(offset);
+                    c.finished_at = Some(Instant::now());
+                    // exit_code stays None == unknown.
                 }
                 self.phase = Phase::Prompt;
                 self.command_start_offset = None;
@@ -576,7 +808,7 @@ impl BlockSegmenter {
                 // is created (AC4); a command that runs but emits nothing yields a
                 // block whose output span stays empty -> `Block::is_thin`.
                 self.phase = Phase::Output;
-                list.push(Block {
+                list.push(Block::Command(CommandBlock {
                     command: self.pending_command.take().unwrap_or_default(),
                     output_span: OutputSpan::open(offset),
                     exit_code: None,
@@ -589,16 +821,14 @@ impl BlockSegmenter {
                     interactive: false,
                     // Mark-driven: authoritative, not an approximation.
                     approximate: false,
-                });
+                }));
             }
             Mark::Prompt(PromptKind::CommandDone { exit_code }) => {
                 // `D`: close the current block.
-                if let Some(b) = list.last_mut() {
-                    if b.is_running() {
-                        b.output_span.end = Some(offset);
-                        b.exit_code = *exit_code;
-                        b.finished_at = Some(Instant::now());
-                    }
+                if let Some(c) = list.last_running_command_mut() {
+                    c.output_span.end = Some(offset);
+                    c.exit_code = *exit_code;
+                    c.finished_at = Some(Instant::now());
                 }
                 self.phase = Phase::Idle;
                 self.command_start_offset = None;
@@ -610,8 +840,8 @@ impl BlockSegmenter {
     /// Set the command text for the most recently opened (running) block. The app
     /// layer calls this once it has sliced the input echo between `B` and `C`.
     pub fn set_last_command(&self, list: &mut BlockList, command: impl Into<String>) {
-        if let Some(b) = list.last_mut() {
-            b.command = command.into();
+        if let Some(c) = list.last_command_mut() {
+            c.command = command.into();
         }
     }
 }
@@ -739,7 +969,7 @@ impl HeuristicSegmenter {
         // A command cycle ran in [last_prompt_offset, offset). Emit it, labeled
         // approximate and already finished (the heuristic has no running tail).
         let now = Instant::now();
-        list.push(Block {
+        list.push(Block::Command(CommandBlock {
             command: String::new(),
             output_span: OutputSpan {
                 start: self.last_prompt_offset,
@@ -752,7 +982,7 @@ impl HeuristicSegmenter {
             output: Vec::new(),
             interactive: false,
             approximate: true,
-        });
+        }));
         self.last_prompt_offset = offset;
         self.newlines_since_prompt = 0;
     }
@@ -789,10 +1019,11 @@ mod tests {
 
         assert_eq!(list.len(), 1);
         let blk = list.last().unwrap();
-        assert_eq!(blk.output_span.start, 17);
-        assert_eq!(blk.output_span.end, Some(42));
-        assert_eq!(blk.exit_code, Some(0));
-        assert_eq!(blk.succeeded(), Some(true));
+        let c0 = blk.as_command().unwrap();
+        assert_eq!(c0.output_span.start, 17);
+        assert_eq!(c0.output_span.end, Some(42));
+        assert_eq!(c0.exit_code, Some(0));
+        assert_eq!(c0.succeeded(), Some(true));
         assert!(!blk.is_running());
     }
 
@@ -805,8 +1036,9 @@ mod tests {
         seg.apply(&c(), 8, &mut list);
         let blk = list.last().unwrap();
         assert!(blk.is_running());
-        assert_eq!(blk.output_span.end, None);
-        assert_eq!(blk.succeeded(), None);
+        let c0 = blk.as_command().unwrap();
+        assert_eq!(c0.output_span.end, None);
+        assert_eq!(c0.succeeded(), None);
     }
 
     #[test]
@@ -826,9 +1058,23 @@ mod tests {
             seg.apply(&m, off, &mut list);
         }
         assert_eq!(list.len(), 2);
-        assert_eq!(list.iter().next().unwrap().exit_code, Some(0));
-        assert_eq!(list.iter().nth(1).unwrap().exit_code, Some(1));
-        assert_eq!(list.iter().nth(1).unwrap().succeeded(), Some(false));
+        assert_eq!(
+            list.iter().next().unwrap().as_command().unwrap().exit_code,
+            Some(0)
+        );
+        assert_eq!(
+            list.iter().nth(1).unwrap().as_command().unwrap().exit_code,
+            Some(1)
+        );
+        assert_eq!(
+            list.iter()
+                .nth(1)
+                .unwrap()
+                .as_command()
+                .unwrap()
+                .succeeded(),
+            Some(false)
+        );
     }
 
     #[test]
@@ -839,7 +1085,10 @@ mod tests {
         seg.apply(&a(), 0, &mut list);
         seg.apply(&b(), 2, &mut list);
         seg.apply(&c(), 4, &mut list);
-        assert_eq!(list.last().unwrap().cwd.as_deref(), Some("/home/me"));
+        assert_eq!(
+            list.last().unwrap().as_command().unwrap().cwd.as_deref(),
+            Some("/home/me")
+        );
     }
 
     #[test]
@@ -850,7 +1099,7 @@ mod tests {
         seg.apply(&b(), 2, &mut list);
         seg.apply(&c(), 4, &mut list);
         seg.set_last_command(&mut list, "ls -la");
-        assert_eq!(list.last().unwrap().command, "ls -la");
+        assert_eq!(list.last().unwrap().as_command().unwrap().command, "ls -la");
     }
 
     // --- HeightIndex (SumTree) -------------------------------------------------
@@ -1071,8 +1320,9 @@ mod tests {
         seg.apply(&d(0), 40, &mut list);
         list.set_block_output(0, vec![row(80); 3]);
         let short = list.get(0).unwrap();
-        assert_eq!(short.collapsed_hidden_rows(), None);
-        assert_eq!(short.shown_output_rows(), 3);
+        let sc = short.as_command().unwrap();
+        assert_eq!(sc.collapsed_hidden_rows(), None);
+        assert_eq!(sc.shown_output_rows(), 3);
         assert_eq!(short.display_height_rows(), short.height_rows());
         assert_eq!(short.display_height_rows(), 1 + 3);
 
@@ -1083,8 +1333,9 @@ mod tests {
         seg.apply(&d(0), 200, &mut list);
         list.set_block_output(1, vec![row(80); long_rows]);
         let long = list.get(1).unwrap();
-        assert_eq!(long.shown_output_rows(), COLLAPSED_OUTPUT_ROWS);
-        assert_eq!(long.collapsed_hidden_rows(), Some(25));
+        let lc = long.as_command().unwrap();
+        assert_eq!(lc.shown_output_rows(), COLLAPSED_OUTPUT_ROWS);
+        assert_eq!(lc.collapsed_hidden_rows(), Some(25));
         // command + CAP shown + 1 affordance row, NOT 1 + long_rows.
         assert_eq!(long.display_height_rows(), 1 + COLLAPSED_OUTPUT_ROWS + 1);
         assert!(long.display_height_rows() < long.height_rows());
@@ -1106,13 +1357,14 @@ mod tests {
         running.set_block_output(0, vec![row(80); long_rows]);
         let rb = running.get(0).unwrap();
         assert!(rb.is_running(), "no command-done -> still running");
+        let rc = rb.as_command().unwrap();
         assert_eq!(
-            rb.collapsed_hidden_rows(),
+            rc.collapsed_hidden_rows(),
             None,
             "a running block never collapses"
         );
         assert_eq!(
-            rb.shown_output_rows(),
+            rc.shown_output_rows(),
             long_rows as u64,
             "a running block shows ALL its live output"
         );
@@ -1131,8 +1383,9 @@ mod tests {
         finished.set_block_output(0, vec![row(80); long_rows]);
         let fb = finished.get(0).unwrap();
         assert!(!fb.is_running());
-        assert_eq!(fb.shown_output_rows(), COLLAPSED_OUTPUT_ROWS);
-        assert_eq!(fb.collapsed_hidden_rows(), Some(50));
+        let fc = fb.as_command().unwrap();
+        assert_eq!(fc.shown_output_rows(), COLLAPSED_OUTPUT_ROWS);
+        assert_eq!(fc.collapsed_hidden_rows(), Some(50));
         assert_eq!(fb.display_height_rows(), 1 + COLLAPSED_OUTPUT_ROWS + 1);
     }
 
@@ -1180,7 +1433,7 @@ mod tests {
 
         let mut source = vec![row(80), row(80)];
         list.set_block_output(0, source.clone());
-        let snapshot = list.get(0).unwrap().output.clone();
+        let snapshot = list.get(0).unwrap().as_command().unwrap().output.clone();
 
         // "Reflow": mutate the source rows + push another block. The finished
         // block's stored output must be unchanged (it owns its copy).
@@ -1190,12 +1443,12 @@ mod tests {
         seg.apply(&c(), 104, &mut list);
 
         assert_eq!(
-            list.get(0).unwrap().output,
+            list.get(0).unwrap().as_command().unwrap().output,
             snapshot,
             "a finished block's snapshot must survive later reflow/activity unchanged"
         );
         assert_eq!(
-            list.get(0).unwrap().output.len(),
+            list.get(0).unwrap().as_command().unwrap().output.len(),
             2,
             "still 2 rows, 80 wide each"
         );
@@ -1217,12 +1470,13 @@ mod tests {
 
         assert_eq!(list.len(), 1);
         let b0 = list.get(0).unwrap();
-        assert_eq!(b0.command, "cargo build");
-        assert_eq!(b0.exit_code, Some(0));
-        assert_eq!(b0.succeeded(), Some(true));
-        assert_eq!(b0.cwd.as_deref(), Some("/home/me/project"));
+        let c0 = b0.as_command().unwrap();
+        assert_eq!(c0.command, "cargo build");
+        assert_eq!(c0.exit_code, Some(0));
+        assert_eq!(c0.succeeded(), Some(true));
+        assert_eq!(c0.cwd.as_deref(), Some("/home/me/project"));
         assert!(!b0.is_running());
-        assert_eq!(b0.output.len(), 2, "immutable output snapshot captured");
+        assert_eq!(c0.output.len(), 2, "immutable output snapshot captured");
         assert_eq!(b0.height_rows(), 3);
     }
 
@@ -1242,7 +1496,10 @@ mod tests {
         }
         assert_eq!(list.len(), 2);
         assert!(list.iter().all(|b| !b.is_running()));
-        assert_eq!(list.get(0).unwrap().exit_code, Some(0));
+        assert_eq!(
+            list.get(0).unwrap().as_command().unwrap().exit_code,
+            Some(0)
+        );
     }
 
     #[test]
@@ -1256,7 +1513,10 @@ mod tests {
         seg.apply(&Mark::CommandLine("git status".into()), 4, &mut list);
         seg.apply(&c(), 4, &mut list);
         seg.apply(&d(0), 20, &mut list);
-        assert_eq!(list.get(0).unwrap().command, "git status");
+        assert_eq!(
+            list.get(0).unwrap().as_command().unwrap().command,
+            "git status"
+        );
     }
 
     #[test]
@@ -1273,7 +1533,7 @@ mod tests {
         assert_eq!(list.len(), 1);
         // vim enters the alt screen -> the launching block becomes Interactive.
         seg.set_alt_screen(true, &mut list);
-        assert!(list.get(0).unwrap().interactive);
+        assert!(list.get(0).unwrap().as_command().unwrap().interactive);
         // Phantom marks the TUI emits while in the alt screen are suppressed.
         seg.apply(&a(), 50, &mut list);
         seg.apply(&b(), 52, &mut list);
@@ -1284,13 +1544,14 @@ mod tests {
         seg.set_alt_screen(false, &mut list);
         seg.apply(&d(0), 100, &mut list);
         let b0 = list.get(0).unwrap();
+        let c0 = b0.as_command().unwrap();
         assert_eq!(list.len(), 1);
-        assert!(b0.interactive);
+        assert!(c0.interactive);
         assert!(
             !b0.is_running(),
             "the interactive block is finalized on exit"
         );
-        assert_eq!(b0.command, "vim");
+        assert_eq!(c0.command, "vim");
     }
 
     #[test]
@@ -1324,7 +1585,7 @@ mod tests {
         seg.apply(&d(0), 20, &mut list); // finished; phase -> Idle
         seg.set_alt_screen(true, &mut list);
         assert!(
-            !list.get(0).unwrap().interactive,
+            !list.get(0).unwrap().as_command().unwrap().interactive,
             "a finished (non-Output) block is not retroactively made interactive"
         );
     }
@@ -1343,7 +1604,11 @@ mod tests {
         seg.apply(&a(), 30, &mut list);
         let b0 = list.get(0).unwrap();
         assert!(!b0.is_running(), "orphaned block auto-closed");
-        assert_eq!(b0.exit_code, None, "auto-closed exit is unknown");
+        assert_eq!(
+            b0.as_command().unwrap().exit_code,
+            None,
+            "auto-closed exit is unknown"
+        );
         // The recovery did not spawn a phantom block.
         assert_eq!(list.len(), 1);
         // A real next command still segments normally.
@@ -1351,7 +1616,10 @@ mod tests {
         seg.apply(&c(), 34, &mut list);
         seg.apply(&d(0), 60, &mut list);
         assert_eq!(list.len(), 2);
-        assert_eq!(list.get(1).unwrap().exit_code, Some(0));
+        assert_eq!(
+            list.get(1).unwrap().as_command().unwrap().exit_code,
+            Some(0)
+        );
     }
 
     #[test]
@@ -1370,7 +1638,7 @@ mod tests {
         seg.apply(&d(0), 8, &mut list); // no output bytes between C and D
         assert_eq!(list.len(), 1);
         assert!(
-            list.get(0).unwrap().is_thin(),
+            list.get(0).unwrap().as_command().unwrap().is_thin(),
             "no-output command collapses to a thin marker"
         );
     }
@@ -1446,7 +1714,10 @@ mod tests {
             1,
             "exactly one block for the whole wget command"
         );
-        assert_eq!(list.get(0).unwrap().output_span.start, 0);
+        assert_eq!(
+            list.get(0).unwrap().as_command().unwrap().output_span.start,
+            0
+        );
     }
 
     #[test]
@@ -1469,7 +1740,7 @@ mod tests {
             "heuristic blocks are emitted already finished"
         );
         assert_eq!(
-            b0.output_span,
+            b0.as_command().unwrap().output_span,
             OutputSpan {
                 start: 0,
                 end: Some(30)
@@ -1480,7 +1751,7 @@ mod tests {
         h.note_prompt_if_idle(2, 50, &mut list); // P2 -> emit [30,50)
         assert_eq!(list.len(), 2);
         assert_eq!(
-            list.get(1).unwrap().output_span,
+            list.get(1).unwrap().as_command().unwrap().output_span,
             OutputSpan {
                 start: 30,
                 end: Some(50)
@@ -1523,7 +1794,7 @@ mod tests {
         h.note_prompt_if_idle(2, 18, &mut list); // the real next prompt
         assert_eq!(list.len(), 1);
         assert_eq!(
-            list.get(0).unwrap().output_span,
+            list.get(0).unwrap().as_command().unwrap().output_span,
             OutputSpan {
                 start: 0,
                 end: Some(18)
@@ -1556,7 +1827,7 @@ mod tests {
         h.observe_output(b"true\r\n");
         h.note_prompt_if_idle(2, 10, &mut list);
 
-        let b = list.get(0).unwrap();
+        let b = list.get(0).unwrap().as_command().unwrap();
         assert!(b.approximate, "heuristic blocks are labeled approximate");
         assert_eq!(b.exit_code, None, "no authoritative exit code");
         assert!(b.command.is_empty(), "no authoritative command text");
@@ -1578,7 +1849,7 @@ mod tests {
         h.note_prompt_if_idle(2, 60, &mut list);
         assert_eq!(list.len(), 1, "the first real command cycle then segments");
         assert_eq!(
-            list.get(0).unwrap().output_span.start,
+            list.get(0).unwrap().as_command().unwrap().output_span.start,
             40,
             "the block starts at the first prompt, not in the banner"
         );
@@ -1597,9 +1868,137 @@ mod tests {
         }
         assert_eq!(list.len(), 1, "one block despite repeated idle samples");
         assert_eq!(
-            list.get(0).unwrap().output_span.end,
+            list.get(0).unwrap().as_command().unwrap().output_span.end,
             Some(30),
             "emitted at the first idle sample of the new prompt"
         );
+    }
+
+    // --- agent steps in the timeline (ticket T-5.10) ---------------------------
+
+    fn agent(kind: AgentBlockKind, text: &str) -> AgentBlock {
+        AgentBlock::new(kind, text, Instant::now())
+    }
+
+    #[test]
+    fn agent_steps_interleave_with_command_blocks_in_append_order() {
+        // T-5.10 AC1: agent steps and human command blocks live in ONE wall-clock
+        // timeline; append order IS wall-clock order, so the segmenter's commands and
+        // the agent's pushed steps interleave by the order they happen.
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+
+        // A human command runs and finishes (block 0).
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&c(), 4, &mut list);
+        seg.apply(&d(0), 40, &mut list);
+        // Then an agent turn: prompt + assistant text (blocks 1, 2).
+        list.push_agent(agent(AgentBlockKind::UserPrompt, "fix the test"));
+        list.push_agent(agent(AgentBlockKind::AssistantText, "On it."));
+        // Then a second human command (block 3).
+        seg.apply(&a(), 100, &mut list);
+        seg.apply(&c(), 104, &mut list);
+        seg.apply(&d(0), 140, &mut list);
+
+        assert_eq!(list.len(), 4);
+        let kinds: Vec<&str> = list
+            .iter()
+            .map(|b| match b {
+                Block::Command(_) => "cmd",
+                Block::Agent(a) => match a.kind {
+                    AgentBlockKind::UserPrompt => "prompt",
+                    AgentBlockKind::AssistantText => "assistant",
+                    _ => "agent",
+                },
+            })
+            .collect();
+        assert_eq!(kinds, vec!["cmd", "prompt", "assistant", "cmd"]);
+
+        // The height index accounts for the agent entries too (each 1 line here).
+        assert_eq!(list.total_height_rows(), 4);
+        // Viewport queries span across the interleave without confusion.
+        assert_eq!(list.blocks_in_viewport(0, 4), 0..4);
+        assert_eq!(
+            list.block_top_row(2),
+            2,
+            "the assistant step is the 3rd entry"
+        );
+    }
+
+    #[test]
+    fn append_agent_text_is_a_point_update_touching_only_the_tail() {
+        // T-5.10 AC2: streaming a delta into an agent step mutates ONLY that entry -
+        // its version + height - and leaves every earlier entry's geometry untouched
+        // (no full-timeline relayout per delta; the 60fps floor).
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&a(), 0, &mut list);
+        seg.apply(&c(), 4, &mut list);
+        seg.apply(&d(0), 40, &mut list);
+        let agent_idx = list.push_agent(agent(AgentBlockKind::AssistantText, "Hel"));
+        assert_eq!(agent_idx, 1);
+
+        let top_of_command = list.block_top_row(0);
+        let top_of_agent = list.block_top_row(agent_idx);
+        let total_before = list.total_height_rows();
+        assert_eq!(list.get(agent_idx).unwrap().as_agent().unwrap().version, 0);
+
+        // One delta that does NOT add a line: same height, version bumps.
+        assert!(list.append_agent_text(agent_idx, "lo, world"));
+        assert_eq!(
+            list.get(agent_idx).unwrap().as_agent().unwrap().text,
+            "Hello, world"
+        );
+        assert_eq!(list.get(agent_idx).unwrap().as_agent().unwrap().version, 1);
+        assert_eq!(
+            list.total_height_rows(),
+            total_before,
+            "no new line, no height change"
+        );
+
+        // A delta that adds a line grows ONLY this entry's height by exactly one row.
+        assert!(list.append_agent_text(agent_idx, "\nsecond line"));
+        assert_eq!(list.get(agent_idx).unwrap().as_agent().unwrap().version, 2);
+        assert_eq!(list.total_height_rows(), total_before + 1);
+
+        // The earlier command entry is geometrically untouched by the deltas.
+        assert_eq!(list.block_top_row(0), top_of_command);
+        assert_eq!(list.block_top_row(agent_idx), top_of_agent);
+        assert_eq!(list.get(0).unwrap().height_rows(), 1);
+
+        // Appending to a non-agent (command) entry is a no-op that reports false.
+        assert!(!list.append_agent_text(0, "nope"));
+    }
+
+    #[test]
+    fn set_last_command_output_targets_the_command_under_a_trailing_agent_step() {
+        // The engine's capture path must land on the running COMMAND even when an
+        // agent step (T-5.10) is the LAST entry - the interleaving-correctness
+        // invariant that the old "running block == last block" assumption broke.
+        let mut list = BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&a(), 0, &mut list); // prompt
+        seg.apply(&c(), 4, &mut list); // command opens at index 0, running
+                                       // An agent step interleaves AFTER the command opened (index 1 is now last()).
+        list.push_agent(agent(AgentBlockKind::Thinking, "considering"));
+        assert!(matches!(list.last().unwrap(), Block::Agent(_)));
+
+        // The capture lands on the COMMAND (index 0), not the trailing agent step.
+        assert!(list.set_last_command_output(vec![row(80), row(80)]));
+        assert_eq!(
+            list.get(0).unwrap().as_command().unwrap().output.len(),
+            2,
+            "the command block received the captured rows"
+        );
+        assert_eq!(
+            list.get(1).unwrap().as_agent().unwrap().text,
+            "considering",
+            "the trailing agent step is untouched"
+        );
+
+        // With no command entry at all, it reports false (no-op).
+        let mut empty = BlockList::new();
+        empty.push_agent(agent(AgentBlockKind::AssistantText, "hi"));
+        assert!(!empty.set_last_command_output(vec![row(80)]));
     }
 }

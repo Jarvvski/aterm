@@ -13,6 +13,21 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **An agent turn now lives in the same timeline as your commands.** The agent's work is
+  modelled as a transcript of timestamped steps - your prompt, the model's thinking and
+  prose, each tool call (with the deterministic gate's decision), its approval, and its
+  sanitized result - and those steps render as blocks interleaved by wall-clock with your
+  shell command blocks in one scrollback, so a long-running tool call sits in order next to
+  whatever you typed meanwhile. Streaming is incremental: a new chunk of assistant text
+  extends the current entry in place and redraws only that entry, never relaying out the
+  whole timeline (the 60fps floor holds while the model streams). The transcript keeps two
+  separate views that never bleed into each other - the rendered timeline (glossed risk,
+  approval state, sanitized output) and the API conversation history sent back to the model
+  (raw assistant + `tool_result` blocks); the derived history is a valid provider
+  conversation that round-trips, and per-turn token usage is attributed to the turn.
+  Internally this turned the timeline's block model into a proper variant type (a command
+  block or an agent step) while keeping the agent-domain types out of the engine crate. The
+  on-screen card styling + approval controls ride EPIC-4 / T-5.11. (Ticket T-5.10.)
 - **The agent can now actually run its tools - safely.** The execution sinks the turn loop
   dispatches to are implemented: `run_command` runs the argv as a subprocess with NO shell
   (so a `|`, `>`, `$(...)`, or `~` in an argument is an inert literal, never interpreted) and

@@ -883,10 +883,10 @@ impl Model {
         // Drop the incremental live terminal; the authoritative final capture below
         // comes from replaying the full byte buffer (unchanged from T-2.7).
         self.live_capture = None;
-        if !self.blocks.is_empty() {
-            let idx = self.blocks.len() - 1;
-            let rows = Terminal::capture_output_rows(self.terminal.cols(), &self.capture_buf);
-            self.blocks.set_block_output(idx, rows);
+        let rows = Terminal::capture_output_rows(self.terminal.cols(), &self.capture_buf);
+        // Target the last COMMAND entry, not `len() - 1`: an agent step (ticket
+        // T-5.10) may now be the last entry while a shell command is captured.
+        if self.blocks.set_last_command_output(rows) {
             self.blocks_touched = true;
         }
         // Free the buffer between commands so a large command does not pin memory.
@@ -1053,11 +1053,11 @@ impl Model {
         // nothing here.
         if self.capturing {
             if let Some(t) = self.live_capture.as_ref() {
-                if let Some(idx) = self.blocks.len().checked_sub(1) {
-                    if self.blocks.get(idx).is_some_and(|b| b.is_running()) {
-                        self.blocks.set_block_output(idx, t.live_output_rows());
-                        self.blocks_touched = true;
-                    }
+                // The captured command is the last COMMAND entry (it stays running
+                // while `capturing`); agent steps (T-5.10) interleaved after it do
+                // not move it, so target it directly rather than `len() - 1`.
+                if self.blocks.set_last_command_output(t.live_output_rows()) {
+                    self.blocks_touched = true;
                 }
             }
         }
@@ -1908,7 +1908,7 @@ mod tests {
         let mut found = false;
         while Instant::now() < deadline {
             let blocks = engine.latest_blocks();
-            if let Some(b) = blocks.iter().last() {
+            if let Some(b) = blocks.iter().last().and_then(|b| b.as_command()) {
                 let has_row = b.output.iter().any(|r| {
                     r.cells
                         .iter()
@@ -2068,7 +2068,7 @@ mod tests {
             "the published block list must carry the two segmented cycles"
         );
         assert!(
-            blocks.iter().all(|b| b.approximate),
+            blocks.iter().all(|b| b.as_command().unwrap().approximate),
             "a heuristic session's published blocks are labeled approximate"
         );
         drop(engine);
@@ -2101,7 +2101,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let blocks = engine.latest_blocks();
-            if let Some(b) = blocks.get(0) {
+            if let Some(b) = blocks.get(0).and_then(|b| b.as_command()) {
                 if !b.is_running() && !b.output.is_empty() {
                     let text: Vec<String> = b
                         .output

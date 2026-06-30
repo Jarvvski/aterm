@@ -423,7 +423,7 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
             match registry.parse(call) {
                 Err(e) => {
                     let msg = format!("tool input rejected: {e}");
-                    Self::emit_result(events, &call.id, &msg).await;
+                    Self::emit_result(events, &call.id, &msg, true).await;
                     results[idx] = Some(ContentBlock::tool_result(call.id.clone(), msg, true));
                 }
                 Ok(input) => match self.gate(&input) {
@@ -435,7 +435,7 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
                             }
                             ConfirmDecision::Denied => {
                                 let msg = "tool call declined by user".to_string();
-                                Self::emit_result(events, &call.id, &msg).await;
+                                Self::emit_result(events, &call.id, &msg, true).await;
                                 results[idx] =
                                     Some(ContentBlock::tool_result(call.id.clone(), msg, true));
                             }
@@ -464,7 +464,7 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
 
         for (idx, id, outcome) in parallel_results.into_iter().chain(serial_results) {
             let clean = self.sanitize_observation(&outcome.output, None);
-            Self::emit_result(events, &id, &clean).await;
+            Self::emit_result(events, &id, &clean, outcome.is_error).await;
             results[idx] = Some(ContentBlock::tool_result(id, clean, outcome.is_error));
         }
 
@@ -472,12 +472,20 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
         results.into_iter().flatten().collect()
     }
 
-    /// Forward a tool result to the timeline.
-    async fn emit_result(events: &mpsc::Sender<AgentEvent>, id: &str, output: &str) {
+    /// Forward a tool result to the timeline. `is_error` mirrors the `tool_result`
+    /// block's flag (a declined / parse-rejected / failed call), so the transcript
+    /// (T-5.10) records a faithful step without re-deriving it.
+    async fn emit_result(
+        events: &mpsc::Sender<AgentEvent>,
+        id: &str,
+        output: &str,
+        is_error: bool,
+    ) {
         let _ = events
             .send(AgentEvent::ToolResult {
                 id: id.to_string(),
                 output: output.to_string(),
+                is_error,
             })
             .await;
     }
@@ -710,6 +718,119 @@ mod tests {
             Some(&AgentEvent::TurnComplete {
                 stop_reason: StopReason::EndTurn
             })
+        );
+    }
+
+    // ---- T-5.10 AC4: the transcript's API history round-trips --------------
+
+    /// Fold a real turn's emitted [`AgentEvent`]s into a transcript, mirroring how the
+    /// app (T-5.11) will record one. Risk/decision are render-only and not carried by
+    /// the event stream, so a placeholder is used (the derived API history ignores
+    /// them; the round-trip below exercises only the message shape).
+    fn transcript_from_events(
+        user: &str,
+        events: &[AgentEvent],
+    ) -> crate::transcript::AgentTranscript {
+        use crate::transcript::{AgentTranscript, TurnStatus};
+        let now = std::time::Instant::now();
+        let mut tr = AgentTranscript::new("turn", now);
+        tr.record_user_prompt(user, now);
+        for e in events {
+            match e {
+                AgentEvent::Assistant(t) => tr.push_assistant_delta(t, now),
+                AgentEvent::Thinking(t) => tr.push_thinking_delta(t, now),
+                AgentEvent::ToolProposed(call) => tr.record_tool_call(
+                    call.id.clone(),
+                    call.name.clone(),
+                    call.input.clone(),
+                    RiskAssessment {
+                        level: Risk::Safe,
+                        reasons: Vec::new(),
+                    },
+                    ToolDisposition::AutoRun,
+                    now,
+                ),
+                AgentEvent::ToolResult {
+                    id,
+                    output,
+                    is_error,
+                } => tr.record_tool_result(id, output, *is_error, now),
+                AgentEvent::Usage(u) => tr.add_usage(*u),
+                AgentEvent::TurnComplete { .. } => tr.finish(TurnStatus::Completed),
+                _ => {}
+            }
+        }
+        tr
+    }
+
+    #[tokio::test]
+    async fn transcript_derived_history_reproduces_and_round_trips_through_the_mock() {
+        // Drive a real turn, fold its events into a transcript, and prove the derived
+        // API history (1) reproduces EXACTLY what the loop sent the provider on the
+        // follow-up round, and (2) round-trips: fed back into a fresh provider it is
+        // accepted verbatim as a valid conversation, tool_use/tool_result join intact.
+        let provider = MockProvider::scripted(vec![
+            tool_round("toolu_1", "run_command", r#"{"command":["ls","-la"]}"#),
+            end_round("all done"),
+        ]);
+        let secrets = Secrets::new();
+        let dispatch = RecordingDispatch::default();
+        let (etx, mut erx) = mpsc::channel(256);
+        AgentTurn::new(&provider, &secrets)
+            .run(
+                req(),
+                &ToolRegistry::default(),
+                &dispatch,
+                &ApproveAll,
+                &CancelToken::new(),
+                etx,
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut erx);
+        let tr = transcript_from_events("do the thing", &events);
+        let history = tr.derive_history();
+
+        // (1) The tool-bearing prefix equals the loop's accumulated follow-up request
+        //     ([user, assistant(tool_use), tool_results]); the derived history then adds
+        //     the final assistant turn the loop never re-sends.
+        let sent = &provider.requests()[1].messages;
+        assert_eq!(
+            &history[..sent.len()],
+            &sent[..],
+            "derived history reproduces what the loop actually sent the provider"
+        );
+        assert!(
+            history.len() > sent.len(),
+            "the full transcript also carries the closing assistant turn"
+        );
+
+        // (2) Round-trip: feed the derived history into a fresh provider as the start of
+        //     a new turn; it is recorded verbatim, so it is a valid provider conversation.
+        let mock2 = MockProvider::scripted(vec![end_round("ok")]);
+        let mut req2 = req();
+        req2.messages = history.clone();
+        let (tx2, _rx2) = mpsc::channel(64);
+        AgentTurn::new(&mock2, &secrets)
+            .run(
+                req2,
+                &ToolRegistry::default(),
+                &RecordingDispatch::default(),
+                &ApproveAll,
+                &CancelToken::new(),
+                tx2,
+            )
+            .await
+            .unwrap();
+        let got = &mock2.requests()[0].messages;
+        assert_eq!(
+            got, &history,
+            "the mock received the derived history verbatim"
+        );
+        assert!(
+            has_tool_result(got, Some(false)),
+            "the round-tripped history carries the joined (non-error) tool_result"
         );
     }
 

@@ -237,6 +237,17 @@ impl GutterStyle {
                 label: Some("approx"),
                 pulsing: false,
             },
+            // An agent transcript step (ticket T-5.10): a neutral secondary marker,
+            // labelled so it reads as agent (not command) content. Real iconography is
+            // EPIC-4 (T-4.6); reuses an already-bundled, font-coverage-tested glyph.
+            GutterMarker::Agent => Self {
+                shape: GutterShape::Interactive,
+                glyph: '\u{f0da}', // nf-fa-caret-right (already bundled + tested)
+                color: c.fg_secondary,
+                exit_code: None,
+                label: Some("agent"),
+                pulsing: false,
+            },
         }
     }
 }

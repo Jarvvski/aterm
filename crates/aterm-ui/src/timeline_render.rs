@@ -205,10 +205,16 @@ impl TimelineRenderer {
                 });
             }
 
+            // The variant payloads: a command block's rows draw command/output, an
+            // agent step's rows draw its text (ticket T-5.10).
+            let command_block = vb.block.as_command();
+            let agent_block = vb.block.as_agent();
+
             for (k, row) in vb.rows.iter().enumerate() {
                 let y = top_margin + (vb.first_row_in_viewport + k as i64) as f32 * ch;
                 match row {
                     TimelineRow::Command => {
+                        let Some(cb) = command_block else { continue };
                         // Gutter status marker (Mono glyph in the marker color).
                         let marker = grid_glyph(gutter.glyph, gutter.color, canvas);
                         emit_cell(
@@ -222,7 +228,7 @@ impl TimelineRenderer {
                         );
                         // The re-rendered command line (Mono fg.primary).
                         let mut x = content_x;
-                        for c in vb.block.command.chars() {
+                        for c in cb.command.chars() {
                             let cell = grid_glyph(c, cmd.command_fg, canvas);
                             emit_cell(
                                 atlas,
@@ -262,7 +268,7 @@ impl TimelineRenderer {
                         }
                     }
                     TimelineRow::Output(i) => {
-                        if let Some(snap_row) = vb.block.output.get(*i) {
+                        if let Some(snap_row) = command_block.and_then(|c| c.output.get(*i)) {
                             for (col, sc) in snap_row.cells.iter().enumerate() {
                                 if sc.wide_spacer {
                                     continue;
@@ -312,6 +318,41 @@ impl TimelineRenderer {
                                 &mut self.glyph_instances,
                             );
                             x += cw;
+                        }
+                    }
+                    TimelineRow::Agent(line) => {
+                        // An agent transcript step (ticket T-5.10): draw the gutter
+                        // marker on its first line, then this line of its (pre-glossed,
+                        // pre-sanitized) text in Mono fg.primary. Real card styling is
+                        // EPIC-4 (T-4.6); this is the data binding.
+                        let Some(ab) = agent_block else { continue };
+                        if *line == 0 {
+                            let marker = grid_glyph(gutter.glyph, gutter.color, canvas);
+                            emit_cell(
+                                atlas,
+                                queue,
+                                &marker,
+                                (marker_x, y),
+                                &ctx,
+                                &mut self.bg_instances,
+                                &mut self.glyph_instances,
+                            );
+                        }
+                        let mut x = content_x;
+                        if let Some(text_line) = ab.text.split('\n').nth(*line) {
+                            for c in text_line.chars() {
+                                let cell = grid_glyph(c, cmd.command_fg, canvas);
+                                emit_cell(
+                                    atlas,
+                                    queue,
+                                    &cell,
+                                    (x, y),
+                                    &ctx,
+                                    &mut self.bg_instances,
+                                    &mut self.glyph_instances,
+                                );
+                                x += cw;
+                            }
                         }
                     }
                 }
@@ -404,6 +445,7 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
             GutterMarker::Unknown => 4,
             GutterMarker::Interactive => 5,
             GutterMarker::Approximate => 6,
+            GutterMarker::Agent => 7,
         }
     }
 
@@ -476,9 +518,21 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
         s = fold_u64(s, vb.display_height);
         s = fold_u64(s, vb.rows.len() as u64);
         s = fold_u64(s, gutter_code(vb.gutter));
-        s = fold_u64(s, vb.block.output.len() as u64);
-        s = fold_u64(s, vb.block.exit_code.map_or(u64::MAX, |c| c as i64 as u64));
+        let command_block = vb.block.as_command();
+        let agent_block = vb.block.as_agent();
+        s = fold_u64(s, command_block.map_or(0, |c| c.output.len() as u64));
+        s = fold_u64(
+            s,
+            command_block
+                .and_then(|c| c.exit_code)
+                .map_or(u64::MAX, |c| c as i64 as u64),
+        );
         s = fold_u64(s, vb.block.is_running() as u64);
+        // An agent step's version (ticket T-5.10): a streamed text delta bumps ONLY
+        // this entry's version, so folding it invalidates the gate for exactly this
+        // entry and nothing else - no full-timeline relayout per delta (the 60fps
+        // floor, ties to T-2.7 / T-1.8).
+        s = fold_u64(s, agent_block.map_or(0, |a| a.version));
         // Fold the DRAWN CONTENT of each visible row - bounded by the visible rows
         // (~viewport), so it stays cheap - so an in-place redraw (a running command's
         // `\r` progress bar / spinner: row count unchanged, content changed) and a
@@ -487,12 +541,13 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
         for row in &vb.rows {
             match row {
                 TimelineRow::Command => {
-                    s = fold_u64(s, vb.block.command.len() as u64);
-                    for ch in vb.block.command.chars() {
+                    let cmd = command_block.map(|c| c.command.as_str()).unwrap_or("");
+                    s = fold_u64(s, cmd.len() as u64);
+                    for ch in cmd.chars() {
                         s = fold_u64(s, ch as u64);
                     }
                 }
-                TimelineRow::Output(i) => match vb.block.output.get(*i) {
+                TimelineRow::Output(i) => match command_block.and_then(|c| c.output.get(*i)) {
                     Some(r) => {
                         s = fold_u64(s, r.cells.len() as u64);
                         for cell in &r.cells {
@@ -503,6 +558,18 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
                 },
                 TimelineRow::CollapseAffordance { hidden } => {
                     s = fold_u64(s, *hidden);
+                }
+                TimelineRow::Agent(line) => {
+                    // Fold this text line's content (the version above already moves on
+                    // any delta, but folding the drawn text keeps the gate exact even if
+                    // a future mutation does not bump the version).
+                    let text = agent_block
+                        .and_then(|a| a.text.split('\n').nth(*line))
+                        .unwrap_or("");
+                    s = fold_u64(s, text.len() as u64);
+                    for ch in text.chars() {
+                        s = fold_u64(s, ch as u64);
+                    }
                 }
             }
         }
@@ -641,6 +708,108 @@ mod sig_tests {
             signature(&alt, 800, 600, 13, &dark()),
             "alt-screen vs timeline mode must differ (one draws nothing)"
         );
+    }
+
+    /// A finished command block (exit 0) followed by one streaming agent text step -
+    /// the interleaved single timeline of T-5.10.
+    fn command_then_agent(agent_text: &str) -> aterm_core::BlockList {
+        use aterm_core::{AgentBlock, AgentBlockKind, BlockSegmenter, Mark, PromptKind};
+        use std::time::Instant;
+        let mut list = aterm_core::BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&Mark::Prompt(PromptKind::PromptStart), 0, &mut list);
+        seg.apply(&Mark::Prompt(PromptKind::OutputStart), 1, &mut list);
+        seg.apply(
+            &Mark::Prompt(PromptKind::CommandDone { exit_code: Some(0) }),
+            3,
+            &mut list,
+        );
+        list.push_agent(AgentBlock::new(
+            AgentBlockKind::AssistantText,
+            agent_text,
+            Instant::now(),
+        ));
+        list
+    }
+
+    #[test]
+    fn agent_text_delta_invalidates_the_damage_gate() {
+        // T-5.10 AC2: streaming a delta into the tail agent step changes its drawn
+        // content (and version), so the damage gate must redraw - the agent card must
+        // never freeze at its first value (the running-block MAJOR-1 analogue).
+        let short = command_then_agent("Hel");
+        let long_list = command_then_agent("Hello, world");
+        let s1 = signature(
+            &layout(&short, false, Scroll::default(), 20),
+            800,
+            600,
+            13,
+            &dark(),
+        );
+        let s2 = signature(
+            &layout(&long_list, false, Scroll::default(), 20),
+            800,
+            600,
+            13,
+            &dark(),
+        );
+        assert_ne!(s1, s2, "an agent text delta must invalidate the gate");
+
+        // The in-place streaming path (BlockList::append_agent_text) also moves it.
+        let mut streamed = command_then_agent("Hel");
+        let before = signature(
+            &layout(&streamed, false, Scroll::default(), 20),
+            800,
+            600,
+            13,
+            &dark(),
+        );
+        let tail = streamed.len() - 1;
+        assert!(streamed.append_agent_text(tail, "lo"));
+        let after = signature(
+            &layout(&streamed, false, Scroll::default(), 20),
+            800,
+            600,
+            13,
+            &dark(),
+        );
+        assert_ne!(before, after, "append_agent_text must invalidate the gate");
+    }
+
+    #[test]
+    fn an_agent_delta_does_not_relayout_the_earlier_command_block() {
+        // T-5.10 AC2: "mutates only the current entry". A single-line delta into the
+        // tail agent step leaves the EARLIER command block's on-screen geometry
+        // byte-identical - only the tail entry's content/version changed (no
+        // full-timeline relayout per delta; the 60fps floor).
+        let mut list = command_then_agent("Hel");
+        // Capture the head block's owned geometry, then drop the layout borrow so the
+        // list can be mutated (a VisibleBlock borrows its block, so it cannot be held
+        // across the append).
+        let (idx, top, first, dh, gutter, rows) = {
+            let before = layout(&list, false, Scroll::default(), 20);
+            let h = &before.visible[0];
+            (
+                h.index,
+                h.top_in_viewport,
+                h.first_row_in_viewport,
+                h.display_height,
+                h.gutter,
+                h.rows.clone(),
+            )
+        };
+
+        let tail = list.len() - 1;
+        list.append_agent_text(tail, "lo"); // same line count, just more text
+        let after = layout(&list, false, Scroll::default(), 20);
+        let h = &after.visible[0];
+
+        assert_eq!(idx, h.index);
+        assert_eq!(top, h.top_in_viewport);
+        assert_eq!(first, h.first_row_in_viewport);
+        assert_eq!(dh, h.display_height);
+        assert_eq!(rows, h.rows);
+        assert_eq!(gutter, h.gutter);
     }
 }
 

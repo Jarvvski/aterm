@@ -170,25 +170,34 @@ pub enum GutterMarker {
     /// A heuristic (approximate) block - boundaries are a best-effort guess, not
     /// integration-confirmed (ticket T-2.6); the renderer labels it so.
     Approximate,
+    /// An agent transcript step (ticket T-5.10) - not a command block. Its styling
+    /// is EPIC-4 (T-4.6); for now it reads as a neutral, labelled marker.
+    Agent,
 }
 
 impl GutterMarker {
-    /// The marker for `block`. Approximate and interactive take priority over the
-    /// exit-based markers because they describe how the block was *segmented* (and
-    /// they are mutually exclusive: heuristic blocks are never interactive).
+    /// The marker for `block`. For a command block, Approximate and interactive take
+    /// priority over the exit-based markers because they describe how the block was
+    /// *segmented* (and they are mutually exclusive: heuristic blocks are never
+    /// interactive). An agent step is always [`Self::Agent`].
     #[must_use]
     pub fn for_block(block: &Block) -> Self {
-        if block.approximate {
-            Self::Approximate
-        } else if block.interactive {
-            Self::Interactive
-        } else if block.is_running() {
-            Self::Running
-        } else {
-            match block.exit_code {
-                Some(0) => Self::Ok,
-                Some(code) => Self::Failed(code),
-                None => Self::Unknown,
+        match block {
+            Block::Agent(_) => Self::Agent,
+            Block::Command(c) => {
+                if c.approximate {
+                    Self::Approximate
+                } else if c.interactive {
+                    Self::Interactive
+                } else if c.is_running() {
+                    Self::Running
+                } else {
+                    match c.exit_code {
+                        Some(0) => Self::Ok,
+                        Some(code) => Self::Failed(code),
+                        None => Self::Unknown,
+                    }
+                }
             }
         }
     }
@@ -205,6 +214,9 @@ pub enum TimelineRow {
     /// The "... +`hidden` lines" affordance shown at the foot of a collapsed block
     /// (ticket T-2.7, AC4).
     CollapseAffordance { hidden: u64 },
+    /// Line `index` (0-based) of an agent step's wrapped text (ticket T-5.10). Only
+    /// appears for a [`Block::Agent`] entry.
+    Agent(usize),
 }
 
 /// A block intersecting the viewport, with its on-screen placement and the subset of
@@ -353,18 +365,27 @@ fn visible_rows(
     vp_top: u64,
     vp_bottom: u64,
 ) -> (Vec<TimelineRow>, u64) {
-    let shown = block.shown_output_rows();
-    let hidden = block.collapsed_hidden_rows();
-
     // The block's full display-row list (length == display_height_rows()).
-    let mut all = Vec::with_capacity(1 + shown as usize + usize::from(hidden.is_some()));
-    all.push(TimelineRow::Command);
-    for i in 0..shown as usize {
-        all.push(TimelineRow::Output(i));
-    }
-    if let Some(hidden) = hidden {
-        all.push(TimelineRow::CollapseAffordance { hidden });
-    }
+    let all: Vec<TimelineRow> = match block {
+        Block::Command(c) => {
+            let shown = c.shown_output_rows();
+            let hidden = c.collapsed_hidden_rows();
+            let mut all = Vec::with_capacity(1 + shown as usize + usize::from(hidden.is_some()));
+            // row 0 is the command line; rows 1..=shown are output rows.
+            all.push(TimelineRow::Command);
+            for i in 0..shown as usize {
+                all.push(TimelineRow::Output(i));
+            }
+            if let Some(hidden) = hidden {
+                all.push(TimelineRow::CollapseAffordance { hidden });
+            }
+            all
+        }
+        // An agent step is its text lines, one TimelineRow::Agent per line.
+        Block::Agent(a) => (0..a.line_count() as usize)
+            .map(TimelineRow::Agent)
+            .collect(),
+    };
 
     // Keep only the rows whose absolute display-row is inside the viewport.
     let mut rows = Vec::new();
@@ -769,7 +790,7 @@ mod tests {
         assert_eq!(list.len(), 1);
         let l = layout(&list, false, Scroll::default(), 30);
         assert_eq!(l.visible[0].gutter, GutterMarker::Approximate);
-        assert!(l.visible[0].block.approximate);
+        assert!(l.visible[0].block.as_command().unwrap().approximate);
     }
 
     #[test]
@@ -778,5 +799,46 @@ mod tests {
         let l = layout(&blocks, false, Scroll::default(), 0);
         assert!(l.visible.is_empty());
         assert_eq!(visible_block_count(&blocks, false, Scroll::default(), 0), 0);
+    }
+
+    #[test]
+    fn agent_steps_render_interleaved_with_command_blocks_in_order() {
+        // T-5.10 AC1: an agent turn renders as ordered steps interleaved by wall-clock
+        // with human command blocks in ONE timeline. Append order is wall-clock order;
+        // layout visits the entries in that order, emitting command/output rows for a
+        // command block and Agent(line) rows for an agent step.
+        use aterm_core::{AgentBlock, AgentBlockKind};
+        use std::time::Instant;
+
+        let mut list = build_blocks(1); // one finished command (exit 0)
+        list.push_agent(AgentBlock::new(
+            AgentBlockKind::UserPrompt,
+            "do it",
+            Instant::now(),
+        ));
+        list.push_agent(AgentBlock::new(
+            AgentBlockKind::AssistantText,
+            "line one\nline two",
+            Instant::now(),
+        ));
+
+        let l = layout(&list, false, Scroll::default(), 30);
+        assert_eq!(l.visible.len(), 3, "command + two agent steps, in order");
+
+        // Entry 0: the command block.
+        assert_eq!(l.visible[0].gutter, GutterMarker::Ok);
+        assert_eq!(l.visible[0].rows[0], TimelineRow::Command);
+
+        // Entry 1: a single-line agent step.
+        assert_eq!(l.visible[1].gutter, GutterMarker::Agent);
+        assert_eq!(l.visible[1].rows, vec![TimelineRow::Agent(0)]);
+
+        // Entry 2: a two-line agent step -> two Agent rows.
+        assert_eq!(l.visible[2].gutter, GutterMarker::Agent);
+        assert_eq!(
+            l.visible[2].rows,
+            vec![TimelineRow::Agent(0), TimelineRow::Agent(1)]
+        );
+        assert_eq!(l.visible[2].display_height, 2);
     }
 }

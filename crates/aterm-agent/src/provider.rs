@@ -327,9 +327,16 @@ pub enum AgentEvent {
     /// A complete, parsed tool call the model proposed - subject to the risk
     /// gate before it may run.
     ToolProposed(ToolCall),
-    /// A tool finished; carries the (already-sanitized) result text. Emitted by
-    /// the turn loop, not the mapper.
-    ToolResult { id: String, output: String },
+    /// A tool finished; carries the (already-sanitized) result text and whether it
+    /// was an error result (a declined/rejected/failed call, fed back with
+    /// `is_error`). Emitted by the turn loop, not the mapper; `is_error` lets the
+    /// transcript (T-5.10) record a faithful `ToolResult` step / `tool_result`
+    /// block without re-deriving it.
+    ToolResult {
+        id: String,
+        output: String,
+        is_error: bool,
+    },
     /// A tool call the model emitted whose streamed input JSON was malformed (e.g.
     /// a truncated stream). Carries the originating `tool_use` id so the turn loop
     /// can feed an `is_error` tool_result back keyed to it - the call is surfaced

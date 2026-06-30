@@ -21,6 +21,7 @@ pub mod sanitizer;
 pub mod secrets;
 pub mod sink;
 pub mod tools;
+pub mod transcript;
 pub mod turn;
 
 // Root re-exports for the load-bearing public surface.
@@ -43,6 +44,7 @@ pub use tools::{
     EditFile, Glob, Grep, ListDir, ReadFile, RunCommand, ToolDispatch, ToolError, ToolInput,
     ToolKind, ToolOutcome, ToolRegistry, WriteFile,
 };
+pub use transcript::{AgentStep, AgentTranscript, ApprovalMode, ResolvedBy, TurnStatus};
 pub use turn::{
     AgentTurn, CancelToken, ConfirmDecision, ConfirmHandler, ToolDisposition, TurnOutcome,
 };
