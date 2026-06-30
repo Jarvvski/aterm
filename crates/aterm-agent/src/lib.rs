@@ -19,6 +19,7 @@ pub mod risk;
 pub mod sandbox;
 pub mod sanitizer;
 pub mod secrets;
+pub mod sink;
 pub mod tools;
 pub mod turn;
 
@@ -37,6 +38,7 @@ pub use sandbox::{
 };
 pub use sanitizer::OutputSanitizer;
 pub use secrets::{Secrets, SENSITIVE_PATHS};
+pub use sink::{CommandSink, FileSink, InjectDisposition, PtyInjectSink, Sinks};
 pub use tools::{
     EditFile, Glob, Grep, ListDir, ReadFile, RunCommand, ToolDispatch, ToolError, ToolInput,
     ToolKind, ToolOutcome, ToolRegistry, WriteFile,

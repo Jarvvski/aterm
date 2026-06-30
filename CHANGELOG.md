@@ -13,6 +13,20 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The agent can now actually run its tools - safely.** The execution sinks the turn loop
+  dispatches to are implemented: `run_command` runs the argv as a subprocess with NO shell
+  (so a `|`, `>`, `$(...)`, or `~` in an argument is an inert literal, never interpreted) and
+  is wrapped by the mandatory OS sandbox; the filesystem tools (`read_file`, `edit_file`,
+  `write_file`, `list_dir`, `glob`, `grep`) run in-process and apply the gate's path checks
+  themselves - they refuse to touch any credential path in the `Secrets` deny-set (so a
+  secret file's contents never enter the result at all) and confine every write to the
+  workspace root (a write escaping via an absolute path, `..`, or a symlinked parent is
+  denied). `edit_file` makes an exactly-one-match replacement and rejects a stale edit (a
+  file changed on disk since the agent last read it), and writes are atomic (temp file +
+  rename). A separate, harder-gated path injects a command into the live interactive shell:
+  because a real shell interprets it, any shell-active command must be confirmed even when it
+  would otherwise rate safe. Raw output is captured and returned; the turn loop sanitizes it
+  against the same `Secrets` source before it re-enters the model's context. (Ticket T-5.9.)
 - **The block timeline now breathes like iA Writer instead of a dense terminal.** The
   command/output blocks get a generous horizontal gutter and top/bottom canvas breathing
   room (no longer flush to the window edge), a full blank line of whitespace between
