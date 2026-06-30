@@ -32,7 +32,8 @@ pub use provider::{
 };
 pub use risk::{gloss_for, DefaultRiskClassifier, RemoteContext, Risk, RiskAssessment, RiskReason};
 pub use sandbox::{
-    ConfinedCommand, NoSandbox, Sandbox, SandboxError, SandboxPolicy, SeatbeltSandbox,
+    ConfinedCommand, ConfinedOutput, NoSandbox, ResourceLimits, Sandbox, SandboxError,
+    SandboxPolicy, SandboxRunner, SeatbeltSandbox,
 };
 pub use sanitizer::OutputSanitizer;
 pub use secrets::{Secrets, SENSITIVE_PATHS};

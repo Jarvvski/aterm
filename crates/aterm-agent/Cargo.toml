@@ -18,3 +18,12 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# Unix-only: the confined runner's OS boundary - setrlimit resource caps
+# (`resource`) installed in the child's pre_exec, and process-group timeout-kill
+# (`signal` -> killpg) so a runaway command's whole subtree is reaped. The
+# Seatbelt `.sb` profile generation itself is pure/portable; only the spawn path
+# needs these. Target-gated so the crate still builds on non-Unix (the runner is
+# a documented stub there). nix re-exports `libc`. See [`sandbox`] (T-5.7).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["resource", "signal"] }

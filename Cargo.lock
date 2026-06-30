@@ -199,6 +199,7 @@ name = "aterm-agent"
 version = "0.1.0"
 dependencies = [
  "aterm-core",
+ "nix",
  "reqwest",
  "serde",
  "serde_json",

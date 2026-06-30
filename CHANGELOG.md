@@ -13,6 +13,19 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Agent-run commands are now confined by a mandatory OS sandbox.** Before a command the
+  agent proposes can run, it is wrapped in a macOS Seatbelt profile (`sandbox-exec`) generated
+  on the spot: it may write only inside the project/cwd (a write to `$HOME` or `/tmp` is
+  denied), it cannot read OR overwrite any credential path from the single `Secrets` deny-set
+  (`~/.ssh`, `~/.aws`, `.env`, `.git-credentials`, ... - even one living inside the project),
+  and outbound network is denied by default (only local IPC kept; an explicit allowlist can
+  punch holes). On top of that, every confined command runs under `setrlimit` caps (CPU time,
+  address space, open files) and a wall-clock timeout that kills the whole process group, so a
+  runaway cannot hang or fork-bomb the machine. This is the OS boundary beneath the risk gate -
+  the gate is a classifier, this is the enforcement - and it is mandatory because the autonomy
+  default is auto-safe. It sits behind a `Sandbox` trait so a future backend can replace the
+  (deprecated-but-only-documented) `sandbox-exec`. Not yet wired to the agent's command tool
+  (that is the execution sinks, T-5.9); this lands the boundary itself. (Ticket T-5.7.)
 - **Keys now reach full-screen apps and running commands correctly.** When a full-screen
   program (vim, less, htop), a running foreground command, or a shell with no integration
   owns the terminal, keystrokes are passed through and encoded to the right PTY bytes -
