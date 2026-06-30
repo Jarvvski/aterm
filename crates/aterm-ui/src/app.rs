@@ -90,6 +90,15 @@ pub trait UiCallbacks {
         aterm_core::Integration::from(aterm_core::IntegrationReason::UnsupportedShell)
     }
 
+    /// The unified-input state to draw this frame (ticket T-3.6): the host's
+    /// `Session`-owned [`aterm_core::InputModel`], or `None` for a host with no input
+    /// (e.g. [`HeadlessCallbacks`]), in which case no input box is drawn. Borrowed (not
+    /// cloned) so the box reads the live buffer with no per-frame allocation, mirroring
+    /// [`Self::snapshot`]/[`Self::blocks`]; the renderer only reads it.
+    fn input(&self) -> Option<&aterm_core::InputModel> {
+        None
+    }
+
     /// A key was pressed; return bytes to forward to the PTY (Shell mode), if any.
     fn on_key(&mut self, _text: Option<&str>, _named: Option<NamedKey>) -> Option<Vec<u8>> {
         None
@@ -302,6 +311,9 @@ impl<C: UiCallbacks> AtermApp<C> {
                 snapshot: snapshot.as_deref(),
                 blocks: blocks.as_deref(),
                 integration,
+                // Borrows `self.callbacks` immutably; `renderer` borrows the disjoint
+                // `self.renderer` field, so the two coexist (no per-frame alloc).
+                input: self.callbacks.input(),
             };
             if let Err(e) = renderer.render(frame) {
                 log::warn!("frame render error: {e}");

@@ -15,10 +15,14 @@
 //! Both share one atlas + one rect/glyph pipeline pair; the timeline path is gated so an
 //! idle present allocates nothing (the 60fps floor, T-1.8).
 //!
-//! NOTE (T-3.6): the unified input box is a separate widget; the shell's pre-submit line
-//! echo lives there, not in the timeline. Until it lands, a command's typed text appears
-//! in the timeline once submitted (its block's command line), and the on-hardware iA
-//! visual review (AC5) is the owner-watched acceptance step for this render path.
+//! On top of the primary view, in normal mode, the **unified input box**
+//! ([`crate::input_widget::InputWidgetRenderer`], ticket T-3.6) draws over a reserved
+//! bottom zone: the live pre-submit command line, the mode-carrying prompt glyph + chip,
+//! the caret, ghost text, and preedit. It reads the host's `InputModel` ([`Frame::input`])
+//! and is the single on-screen home of the in-progress line (the raw grid, with the
+//! shell's own echo, is not drawn in normal mode, so there is no double echo). The
+//! timeline viewport is shrunk by [`crate::input_widget::zone_px`] so the two never
+//! overlap; in alt-screen the box is hidden (the full-screen app owns input).
 
 use std::sync::Arc;
 
@@ -51,6 +55,12 @@ pub struct GpuRenderer {
     /// (non-alt-screen) mode, drawing finished + running blocks from the block model
     /// through the shared `atlas`.
     timeline: crate::timeline_render::TimelineRenderer,
+    /// The unified-input box front-end (ticket T-3.6): drawn over the bottom zone in
+    /// normal (non-alt-screen) mode when the host supplies an `InputModel`. It is
+    /// self-gated (its own damage signature), so it allocates nothing on an idle present;
+    /// the timeline viewport is shrunk by its [`crate::input_widget::zone_px`] so the two
+    /// never overlap.
+    input: crate::input_widget::InputWidgetRenderer,
     /// Idle gate for the timeline path: the `(snapshot version, scroll, viewport, theme,
     /// alt)` signature last laid out + prepared. When unchanged, the per-frame
     /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
@@ -65,8 +75,13 @@ pub struct GpuRenderer {
     /// until a block list is published.
     last_visible_blocks: usize,
     /// Which front-end drew the last frame - so [`Self::last_glyph_draw_calls`] reports
-    /// the active path's counter (the timeline in normal mode, the grid in alt-screen).
+    /// the active PRIMARY path's counter (the timeline in normal mode, the grid in
+    /// alt-screen). The input box, when shown, is an ADDITIONAL one-glyph-draw layer on
+    /// top; its counter lives on the input front-end.
     drew_timeline: bool,
+    /// Whether the input box drew on the last frame (it is drawn over the bottom zone in
+    /// normal mode when the host supplies an `InputModel`).
+    drew_input: bool,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -131,6 +146,7 @@ impl GpuRenderer {
         let atlas = GlyphAtlas::new(&device, format);
         let grid = GridRenderer::new(&device);
         let timeline = crate::timeline_render::TimelineRenderer::new(&device);
+        let input = crate::input_widget::InputWidgetRenderer::new(&device);
 
         Ok(Self {
             surface,
@@ -140,22 +156,15 @@ impl GpuRenderer {
             atlas,
             grid,
             timeline,
+            input,
             timeline_sig: None,
             scroll: crate::timeline::Scroll::default(),
             last_visible_blocks: 0,
             drew_timeline: false,
+            drew_input: false,
             _window: window,
             scale_factor,
         })
-    }
-
-    /// The number of grid rows that fit in the current surface - the timeline
-    /// viewport height in display rows (ticket T-2.7). Uses the same GRID cell-height
-    /// metric as the PTY grid sizing ([`crate::window::cell_px`]), so the timeline
-    /// viewport matches the terminal's row count.
-    fn viewport_rows(&self) -> u64 {
-        let (_, ch) = crate::window::cell_px(self.scale_factor);
-        (self.config.height as f32 / ch).floor().max(0.0) as u64
     }
 
     /// The number of blocks that built timeline geometry on the last drawn frame -
@@ -165,16 +174,24 @@ impl GpuRenderer {
         self.last_visible_blocks
     }
 
-    /// Glyph-layer draw calls from the last frame (T-1.6 AC c: exactly 1 when the active
-    /// front-end has text). Reports whichever front-end drew last - the timeline in
-    /// normal mode, the grid in alt-screen. Exposed for tests / instrumentation.
+    /// Glyph-layer draw calls from the last frame: the PRIMARY front-end's (the timeline
+    /// in normal mode, the grid in alt-screen - each exactly 1 when it has text, T-1.6
+    /// AC c) plus the input box's one draw when it is shown (T-3.6). So a normal frame
+    /// with input is 2 (timeline + box); an alt-screen frame is 1 (the grid, no box).
+    /// Exposed for tests / instrumentation.
     #[must_use]
     pub fn last_glyph_draw_calls(&self) -> u32 {
-        if self.drew_timeline {
+        let primary = if self.drew_timeline {
             self.timeline.last_glyph_draw_calls()
         } else {
             self.grid.last_glyph_draw_calls()
-        }
+        };
+        let input = if self.drew_input {
+            self.input.last_glyph_draw_calls()
+        } else {
+            0
+        };
+        primary + input
     }
 
     /// Render the snapshot grid (and always clear). Split out so `render` reads
@@ -196,14 +213,35 @@ impl GpuRenderer {
         // only when a full-screen app owns the screen (alt-screen, ADR-0007) or there is
         // no engine (the headless / no-blocks stand-in).
         let alt_screen = frame.snapshot.is_some_and(|s| s.alt_screen);
-        let viewport_rows = self.viewport_rows();
         let draw_timeline = !alt_screen && frame.blocks.is_some();
+        // The input box draws over the bottom zone in normal mode (a full-screen app owns
+        // input in alt-screen, so it is hidden there). It is the single on-screen home of
+        // the live command line - the raw grid (with the shell's own echo) is not drawn in
+        // normal mode (T-4.6), so there is no double echo.
+        let draw_input = !alt_screen && frame.input.is_some();
         self.drew_timeline = draw_timeline;
+        self.drew_input = draw_input;
         let size = crate::grid_render::FrameSize {
             width: self.config.width,
             height: self.config.height,
             scale: self.scale_factor,
         };
+
+        // Reserve the bottom input zone (ticket T-3.6) so the timeline lays out ABOVE it.
+        // `zone_px` is the single source of the zone height shared with the input front-end.
+        // The viewport uniform stays the FULL surface size; only the layout row budget
+        // shrinks, which keeps the timeline's last row (and bottom hairline) above the box.
+        let (_, ch) = crate::window::cell_px(self.scale_factor);
+        let input_zone = if draw_input {
+            crate::input_widget::zone_px(
+                frame.input.expect("draw_input implies input"),
+                self.scale_factor,
+            )
+        } else {
+            0.0
+        };
+        let effective_h = (self.config.height as f32 - input_zone).max(0.0);
+        let viewport_rows = (effective_h / ch).floor().max(0.0) as u64;
 
         // Build instances BEFORE acquiring the surface texture. Each front-end's rebuild
         // is damage-gated and reuses its buffers with zero allocation when nothing
@@ -221,11 +259,13 @@ impl GpuRenderer {
                 // Idle gate: `timeline::layout` allocates, so skip it (and the rebuild)
                 // when nothing drawn changed - an idle present then allocates nothing and
                 // simply redraws the prior timeline instances.
+                // Fold the EFFECTIVE timeline height (surface minus the input zone), so a
+                // growing multi-line input box reflows the timeline above it.
                 let sig = (
                     frame.snapshot.map_or(0, |s| s.version),
                     self.scroll.offset_rows,
                     self.config.width,
-                    self.config.height,
+                    effective_h.round() as u32,
                     theme_kind_code(frame.theme),
                     false,
                 );
@@ -256,6 +296,18 @@ impl GpuRenderer {
                 }
                 // Force a timeline rebuild the next time we re-enter timeline mode.
                 self.timeline_sig = None;
+            }
+
+            // The input box (self-gated: its own damage signature early-outs alloc-free).
+            if draw_input {
+                self.input.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.atlas,
+                    frame.input.expect("draw_input implies input"),
+                    frame.theme,
+                    size,
+                );
             }
         }
 
@@ -310,6 +362,11 @@ impl GpuRenderer {
                     self.timeline.draw(&mut pass, &self.atlas);
                 } else {
                     self.grid.draw(&mut pass, &self.atlas);
+                }
+                // The input box draws last, over the reserved bottom zone (its hairline +
+                // text + chip + caret sit on top of the cleared canvas).
+                if draw_input {
+                    self.input.draw(&mut pass, &self.atlas);
                 }
             }
             self.queue.submit(std::iter::once(encoder.finish()));

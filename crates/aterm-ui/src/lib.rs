@@ -29,6 +29,7 @@ pub mod glyph;
 pub mod gpu;
 pub mod grid_render;
 pub mod indicator;
+pub mod input_widget;
 pub mod present;
 pub mod profiling;
 pub mod prose;
@@ -52,6 +53,7 @@ pub use glyph::{CellMetrics, GlyphRasterizer, RasterGlyph};
 pub use gpu::GpuRenderer;
 pub use grid_render::{FrameSize, GridRenderer};
 pub use indicator::IntegrationIndicator;
+pub use input_widget::InputWidgetRenderer;
 pub use present::{DisplayLink, FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
 pub use prose::{measure_px, PositionedGlyph, ProseLayout, ProseRenderer, ProseShaper, MEASURE_CH};
 pub use recorder::{

@@ -13,6 +13,25 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The unified input box is drawn (the live command line + iA mode indicator).** aterm's
+  single shell-first input field now renders as a persistent bottom footer: a hairline
+  separates it from the timeline, a mode-carrying prompt glyph (a `❯` chevron for Shell, a
+  Nerd-Font "sparkles" icon for the agent) sits at the left edge, the typed command line
+  draws in Mono with a thin 2px accent-blue caret (the caret stays the one accent in BOTH
+  modes), and a small right-aligned SHELL/AGENT chip carries the routing target. When the
+  buffer is empty a muted placeholder ("Type a command" / "Ask the agent") reinforces the
+  mode; a selection paints with the selection color, the fish-style ghost-text tail draws
+  muted after the line, an inline IME preedit underlines, and the async syntax-highlight
+  overlay tints the line - all reading the input model the session already owns and drives,
+  so agent-mode typing (previously invisible) now shows on screen. Toggling the mode swaps
+  the prompt glyph + chip with the typed text preserved and no reflow. The box draws over a
+  reserved bottom zone (the timeline viewport shrinks to sit above it; the box is hidden
+  while a full-screen app owns the screen), through the shared glyph atlas as one rect plus
+  one glyph draw, damage-gated so an idle present allocates nothing - in both themes.
+  (Ticket T-3.6.) The mode-toggle hotkey + routing (T-3.3), history (T-3.7), and the
+  async highlight/ghost (T-3.5) and IME preedit (T-3.2) feeds wire in under their own
+  tickets; the `motion.fast` chip cross-fade and the on-hardware iA visual review are the
+  remaining residuals (a frame clock for live motion, and the owner-watched visual pass).
 - **The block timeline is now drawn on screen (iA component styling).** The renderer no
   longer falls back to the raw VT grid in normal use: it composes the Warp-style block
   timeline from the published block model - a left-gutter status marker (running =

@@ -4,7 +4,7 @@
 //! drop in without touching the app's frame loop, and keeps the 60fps fast-path
 //! behind a stable surface.
 
-use aterm_core::{BlockList, Integration, Snapshot};
+use aterm_core::{BlockList, InputModel, Integration, Snapshot};
 use aterm_tokens::Theme;
 
 /// Errors a renderer can surface during a frame.
@@ -39,6 +39,13 @@ pub struct Frame<'a> {
     /// [`crate::app::UiCallbacks::integration_status`]. `Copy`, so it rides along by
     /// value with no per-frame allocation.
     pub integration: Integration,
+    /// The unified-input state for this frame (ticket T-3.6), borrowed from the host's
+    /// `Session`-owned [`InputModel`]. `None` for a host with no input (e.g. the headless
+    /// UI), in which case the renderer draws no input box and the timeline/grid uses the
+    /// full window. The renderer reads only the model's accessors (text/caret/selection/
+    /// mode/ghost/preedit/highlight) - it never mutates it. The host supplies it through
+    /// [`crate::app::UiCallbacks::input`].
+    pub input: Option<&'a InputModel>,
 }
 
 /// The swappable renderer seam.

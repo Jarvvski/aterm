@@ -222,6 +222,14 @@ impl UiCallbacks for Session {
         self.engine.integration_status()
     }
 
+    fn input(&self) -> Option<&InputModel> {
+        // The unified-input box (ticket T-3.6) reads the live buffer this Session owns
+        // and drives in `on_key` (the reducer mutations + the mode toggle). Borrowed, not
+        // cloned - the renderer only reads it; this finally makes the in-progress line
+        // (and, in Agent mode, the previously feedback-less prompt) visible on screen.
+        Some(&self.input)
+    }
+
     fn on_key(&mut self, text: Option<&str>, named: Option<NamedKey>) -> Option<Vec<u8>> {
         // T-3.3 routing brain. The pure `InputModel` reducer (T-3.1) owns the
         // in-progress line; this layer is the caller that decides where a key goes
