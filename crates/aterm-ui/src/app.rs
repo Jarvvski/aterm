@@ -128,6 +128,15 @@ pub trait UiCallbacks {
         None
     }
 
+    /// The autonomy posture to show in the always-visible indicator this frame
+    /// (ticket T-5.11), or `None` for a host with no agent (e.g.
+    /// [`HeadlessCallbacks`]), in which case no autonomy chip is drawn. A real session
+    /// maps its `aterm_agent::AutonomyMode` onto the UI-local
+    /// [`crate::components::AutonomyMode`]. `Copy`, returned by value.
+    fn autonomy_mode(&self) -> Option<crate::components::AutonomyMode> {
+        None
+    }
+
     /// A key was pressed; return bytes to forward to the PTY (Shell mode), if any.
     /// `key` carries the named key / logical character / insertion text and the
     /// live modifier state, so the host can route the real `Cmd-/` toggle chord and
@@ -352,6 +361,7 @@ impl<C: UiCallbacks> AtermApp<C> {
                 // Borrows `self.callbacks` immutably; `renderer` borrows the disjoint
                 // `self.renderer` field, so the two coexist (no per-frame alloc).
                 input: self.callbacks.input(),
+                autonomy: self.callbacks.autonomy_mode(),
             };
             if let Err(e) = renderer.render(frame) {
                 log::warn!("frame render error: {e}");

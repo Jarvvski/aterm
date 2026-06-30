@@ -7,6 +7,8 @@
 use aterm_core::{BlockList, InputModel, Integration, Snapshot};
 use aterm_tokens::Theme;
 
+use crate::components::AutonomyMode;
+
 /// Errors a renderer can surface during a frame.
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
@@ -46,6 +48,13 @@ pub struct Frame<'a> {
     /// mode/ghost/preedit/highlight) - it never mutates it. The host supplies it through
     /// [`crate::app::UiCallbacks::input`].
     pub input: Option<&'a InputModel>,
+    /// The autonomy posture to show in the always-visible indicator this frame
+    /// (ticket T-5.11), or `None` for a host with no agent (e.g. the headless UI), in
+    /// which case no autonomy chip is drawn. `Copy`, so it rides along by value with
+    /// no per-frame allocation. The host supplies it through
+    /// [`crate::app::UiCallbacks::autonomy_mode`]; `aterm-app` maps its
+    /// `aterm_agent::AutonomyMode` onto this UI-local one.
+    pub autonomy: Option<AutonomyMode>,
 }
 
 /// The swappable renderer seam.

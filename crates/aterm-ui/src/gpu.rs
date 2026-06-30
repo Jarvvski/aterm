@@ -317,6 +317,7 @@ impl GpuRenderer {
                     &self.queue,
                     &mut self.atlas,
                     frame.input.expect("draw_input implies input"),
+                    frame.autonomy,
                     frame.theme,
                     size,
                 );

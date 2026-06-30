@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use aterm_core::{AgentBlock, AgentBlockKind};
+use aterm_core::{AgentBadge, AgentBlock, AgentBlockKind};
 
 use crate::provider::{ContentBlock, Message, Usage};
 use crate::risk::{gloss_for, Risk, RiskAssessment};
@@ -159,6 +159,7 @@ impl AgentStep {
             AgentStep::ToolCall {
                 tool_use_id,
                 name,
+                risk,
                 decision,
                 ..
             } => AgentBlock::new(
@@ -166,7 +167,8 @@ impl AgentStep {
                 render_tool_call(name, decision),
                 self.ts(),
             )
-            .with_tool_use_id(tool_use_id.clone()),
+            .with_tool_use_id(tool_use_id.clone())
+            .with_badge(badge_for(risk, decision)),
             AgentStep::ToolResult {
                 tool_use_id,
                 output,
@@ -186,6 +188,25 @@ impl AgentStep {
                 *ts,
             )
             .with_tool_use_id(tool_use_id.clone()),
+        }
+    }
+}
+
+/// Map a tool call's deterministic gate verdict onto the agent-domain-FREE timeline
+/// badge (ticket T-5.11). The gate decision drives whether it auto-ran; the risk
+/// LEVEL distinguishes a confirmable escalation ([`AgentBadge::NeedsApproval`]) from
+/// a destructive verdict ([`AgentBadge::Blocked`]). This is the ONLY place the
+/// agent-side `Risk` is translated into the renderer's vocabulary, so `aterm-core`
+/// and `aterm-ui` never name an agent type.
+fn badge_for(risk: &RiskAssessment, decision: &ToolDisposition) -> AgentBadge {
+    match decision {
+        ToolDisposition::AutoRun => AgentBadge::Auto,
+        ToolDisposition::NeedsConfirm(_) => {
+            if risk.level == Risk::Dangerous {
+                AgentBadge::Blocked
+            } else {
+                AgentBadge::NeedsApproval
+            }
         }
     }
 }
@@ -755,8 +776,10 @@ mod tests {
             !call.text.contains("ls"),
             "raw argv must not leak into the gloss"
         );
+        // T-5.11: an auto-run call carries the `Auto` badge (the renderer draws "auto").
+        assert_eq!(call.badge, Some(AgentBadge::Auto));
 
-        // A dangerous call glosses its reasons.
+        // A dangerous call glosses its reasons AND carries the `Blocked` badge.
         let danger = AgentStep::ToolCall {
             tool_use_id: "x".into(),
             name: "run_command".into(),
@@ -765,10 +788,24 @@ mod tests {
             decision: ToolDisposition::NeedsConfirm(vec![RiskReason::Destructive]),
             ts: t0(),
         };
-        assert!(danger
-            .to_block()
-            .text
-            .contains("deletes or overwrites files"));
+        let danger_block = danger.to_block();
+        assert!(danger_block.text.contains("deletes or overwrites files"));
+        assert_eq!(danger_block.badge, Some(AgentBadge::Blocked));
+
+        // A Caution (non-destructive) escalation carries the confirmable
+        // `NeedsApproval` badge, not `Blocked`.
+        let caution = AgentStep::ToolCall {
+            tool_use_id: "y".into(),
+            name: "run_command".into(),
+            input: json!({}),
+            risk: RiskAssessment {
+                level: Risk::Caution,
+                reasons: vec![RiskReason::PackageMutator],
+            },
+            decision: ToolDisposition::NeedsConfirm(vec![RiskReason::PackageMutator]),
+            ts: t0(),
+        };
+        assert_eq!(caution.to_block().badge, Some(AgentBadge::NeedsApproval));
     }
 
     #[test]

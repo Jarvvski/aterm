@@ -58,7 +58,7 @@ use aterm_core::{Highlight, InputMode, InputModel, Preedit, Selection, SpanKind}
 
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
-use crate::components::{PromptChip, PromptMode};
+use crate::components::{AutonomyChip, AutonomyMode, PromptChip, PromptMode};
 use crate::grid_render::{FrameSize, INSET_LOGICAL};
 use crate::prose::ProseShaper;
 use crate::text::{FaceStyle, FontFamily, GlyphKey, GridCell};
@@ -125,6 +125,10 @@ fn chip_label(mode: InputMode) -> &'static str {
         InputMode::Agent => CHIP_LABELS[1],
     }
 }
+
+/// The autonomy-indicator labels (ticket T-5.11); the slot is sized to the WIDEST so
+/// a tier switch is reflow-free, mirroring the routing chip.
+const AUTONOMY_LABELS: [&str; 3] = ["ASK", "AUTO-SAFE", "AUTO-RUN"];
 
 /// The (fg, underline) a highlighted span contributes - a deliberately RESTRAINED,
 /// near-monochrome, token-only mapping (iA discipline; no syntax rainbow). Command/argument
@@ -483,12 +487,17 @@ impl InputWidgetRenderer {
     /// The unchanged path allocates nothing (the steady-state early-out); the changed path
     /// reuses its warm `Vec`s + the glyph cache (`queue.write_buffer` is wgpu staging, not
     /// part of that claim).
+    // The renderer fast-path threads device/queue/atlas/model/autonomy/theme/size by
+    // value to stay allocation-free; bundling them into a struct would add a borrow
+    // dance per frame for no clarity gain. Mirrors the grid/timeline prepare shape.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         atlas: &mut GlyphAtlas,
         input: &InputModel,
+        autonomy: Option<AutonomyMode>,
         theme: &Theme,
         size: FrameSize,
     ) -> bool {
@@ -501,7 +510,18 @@ impl InputWidgetRenderer {
         let px_key = px as u32;
         let view = InputView::from_model(input);
 
-        let sig = signature(&view, width, height, px_key, theme);
+        // Fold the autonomy posture (ticket T-5.11) into the damage signature so a
+        // mode switch redraws the always-visible indicator even when the input buffer
+        // is unchanged (AC4). `None` (a host with no agent) is its own state.
+        let autonomy_code: u64 = match autonomy {
+            None => 0,
+            Some(AutonomyMode::AskAlways) => 1,
+            Some(AutonomyMode::AutoSafe) => 2,
+            Some(AutonomyMode::AutoRunInSession) => 3,
+        };
+        let sig = signature(&view, width, height, px_key, theme)
+            .wrapping_mul(0x0000_0100_0000_01b3)
+            ^ autonomy_code.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
         }
@@ -652,10 +672,109 @@ impl InputWidgetRenderer {
             });
         }
 
+        // The autonomy-mode indicator (ticket T-5.11): an always-visible chip to the
+        // LEFT of the routing chip so the safety posture is never hidden (AC4). Sized
+        // to the WIDEST tier label so a switch never reflows; ALWAYS color + label.
+        // Returns the chip's left edge so the text region clears it too.
+        let left_edge = if let Some(mode) = autonomy {
+            let mut a_slot_w: f32 = 0.0;
+            let mut a_label_h: f32 = line_h_label;
+            for lbl in AUTONOMY_LABELS {
+                let l = self.shaper.layout(
+                    lbl,
+                    FontFamily::Ui,
+                    FaceStyle::Regular,
+                    px_label,
+                    f32::MAX,
+                    line_h_label,
+                );
+                a_slot_w = a_slot_w.max(l.width);
+                a_label_h = a_label_h.max(l.height);
+            }
+            let a_slot_w = a_slot_w + 2.0 * pad_x;
+            let a_chip_h = a_label_h + 2.0 * pad_y;
+            let gap = f32::from(space::S2) * scale;
+            let a_chip_x = (chip_x - gap - a_slot_w).max(inset);
+            let a_chip_y = first_row_y + (ch - a_chip_h) * 0.5;
+
+            let ac = AutonomyChip::resolve(mode, theme);
+            // Chip fill (+ hairline border on the neutral ASK chip only).
+            if let Some(border) = ac.chip.border {
+                self.bg_instances.push(RectInstance {
+                    rect: [a_chip_x, a_chip_y, a_slot_w, a_chip_h],
+                    color: border.to_linear_f32(),
+                });
+                let b = hairline_h;
+                self.bg_instances.push(RectInstance {
+                    rect: [
+                        a_chip_x + b,
+                        a_chip_y + b,
+                        (a_slot_w - 2.0 * b).max(0.0),
+                        (a_chip_h - 2.0 * b).max(0.0),
+                    ],
+                    color: ac.chip.fill.to_linear_f32(),
+                });
+            } else {
+                self.bg_instances.push(RectInstance {
+                    rect: [a_chip_x, a_chip_y, a_slot_w, a_chip_h],
+                    color: ac.chip.fill.to_linear_f32(),
+                });
+            }
+            // The active label, shaped + centered in the slot.
+            let a_layout = self.shaper.layout(
+                ac.label,
+                FontFamily::Ui,
+                FaceStyle::Regular,
+                px_label,
+                f32::MAX,
+                line_h_label,
+            );
+            let a_label_x = a_chip_x + (a_slot_w - a_layout.width) * 0.5;
+            let a_label_y = a_chip_y + (a_chip_h - a_layout.height) * 0.5;
+            let a_color = ac.chip.text.to_linear_f32();
+            for pg in &a_layout.glyphs {
+                let key = GlyphKey {
+                    family: FontFamily::Ui,
+                    glyph_id: pg.glyph_id,
+                    face: FaceStyle::Regular,
+                    px: px_label as u32,
+                    sprite: false,
+                };
+                let Some((rect, (left, top))) = atlas.acquire_font(
+                    queue,
+                    key,
+                    FontFamily::Ui,
+                    FaceStyle::Regular,
+                    pg.glyph_id,
+                    px_label,
+                ) else {
+                    continue;
+                };
+                self.glyph_instances.push(GlyphInstance {
+                    rect: [
+                        (a_label_x + pg.pen_x + left as f32).round(),
+                        (a_label_y + pg.baseline - top as f32).round(),
+                        rect.w as f32,
+                        rect.h as f32,
+                    ],
+                    uv: [
+                        rect.x as f32 * inv,
+                        rect.y as f32 * inv,
+                        (rect.x + rect.w) as f32 * inv,
+                        (rect.y + rect.h) as f32 * inv,
+                    ],
+                    color: a_color,
+                });
+            }
+            a_chip_x
+        } else {
+            chip_x
+        };
+
         // The editable region: from after the prompt glyph (one blank cell) to clear of
-        // the chip. Clip the text to the columns that fit (clip-by-omission; no scissor).
+        // the chips. Clip the text to the columns that fit (clip-by-omission; no scissor).
         let text_x = inset + 2.0 * cw;
-        let text_right = (chip_x - cw).max(text_x);
+        let text_right = (left_edge - cw).max(text_x);
         let visible_cols = (((text_right - text_x) / cw).floor() as i64).max(1) as u16;
         let laid = layout_cells(&view, theme, visible_cols);
 
@@ -1375,6 +1494,7 @@ mod gpu_tests {
             queue,
             atlas,
             input,
+            None,
             theme,
             FrameSize {
                 width: w,
@@ -1526,9 +1646,9 @@ mod gpu_tests {
             height: 160,
             scale: SCALE,
         };
-        iw.prepare(&device, &queue, &mut atlas, &m, &theme, size);
+        iw.prepare(&device, &queue, &mut atlas, &m, None, &theme, size);
         let allocs = crate::alloc_probe::count_allocs(|| {
-            let drew = iw.prepare(&device, &queue, &mut atlas, &m, &theme, size);
+            let drew = iw.prepare(&device, &queue, &mut atlas, &m, None, &theme, size);
             std::hint::black_box(drew);
         });
         assert_eq!(

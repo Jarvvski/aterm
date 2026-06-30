@@ -13,6 +13,23 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Every gated command shows its risk verdict, and you control how much the agent runs on
+  its own.** A proposed tool call now carries the deterministic risk gate's verdict as a
+  badge in the timeline, paired ALWAYS with a text label (never color alone): a proven-safe
+  command reads `auto`, an escalated one reads `APPROVE?`, and a destructive one reads
+  `BLOCKED`, with the parsed reason ("deletes or overwrites files", ...) shown inline. An
+  escalated command blocks the turn on an explicit Approve/Deny - the loop parks on a
+  fail-closed approval channel (if the approval is dropped or the UI is gone, the command is
+  DENIED, never run) until you answer. Autonomy is graduated and always visible as a chip
+  next to the SHELL/AGENT routing chip: `ask-always` (confirm everything), `auto-safe` (the
+  shipped default - a proven-safe, non-shell-active command auto-runs), and a session-scoped
+  `auto-run` widening; `Cmd-Shift-A` cycles the tier and it takes effect on the next command.
+  Two safety invariants hold in EVERY tier and can never be widened: a command with a
+  shell-active reason (a pipe, redirect, `$(...)`, `&&`) never auto-runs, and a `Dangerous`
+  command never auto-runs. A widening is session-scoped: a new session reverts to the
+  AUTO-SAFE baseline, so a loosened posture never silently persists. The badge data rides
+  into the timeline as an agent-domain-free projection, so the engine and renderer crates
+  still name no agent type. (Ticket T-5.11.)
 - **An agent turn now lives in the same timeline as your commands.** The agent's work is
   modelled as a transcript of timestamped steps - your prompt, the model's thinking and
   prose, each tool call (with the deterministic gate's decision), its approval, and its

@@ -42,12 +42,25 @@ use aterm_tokens::{type_scale, Theme};
 
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
-use crate::components::{CommandBlockStyle, GutterStyle};
+use crate::components::{CommandBlockStyle, GutterStyle, RiskBadge, RiskState};
 use crate::grid_render::FrameSize;
 use crate::text::{resolve_color, FontFamily, GridCell};
 use crate::timeline::{GutterMarker, TimelineLayout, TimelineMode, TimelineRow, GAP_ROWS};
 use crate::window::cell_px;
+use aterm_core::AgentBadge;
 use aterm_tokens::space;
+
+/// Map the agent-domain-free [`AgentBadge`] a tool-call block carries onto the
+/// UI-local [`RiskState`] the badge styler speaks (ticket T-5.11). This is the
+/// renderer's side of the one-way crate arrow: `aterm-ui` reads the projected
+/// `AgentBadge` from the block, never an `aterm-agent` type.
+fn risk_state_for(badge: AgentBadge) -> RiskState {
+    match badge {
+        AgentBadge::Auto => RiskState::Allowed,
+        AgentBadge::NeedsApproval => RiskState::NeedsApproval,
+        AgentBadge::Blocked => RiskState::Blocked,
+    }
+}
 
 /// The block-timeline front-end over the shared [`GlyphAtlas`]. Owns its own instance
 /// buffers + rebuild gate (so the grid's and prose's buffers are never touched) and
@@ -321,9 +334,13 @@ impl TimelineRenderer {
                         }
                     }
                     TimelineRow::Agent(line) => {
-                        // An agent transcript step (ticket T-5.10): draw the gutter
-                        // marker on its first line, then this line of its (pre-glossed,
-                        // pre-sanitized) text in Mono fg.primary. Real card styling is
+                        // An agent transcript step (T-5.10): draw the gutter marker on
+                        // its first line, then this line of its (pre-glossed,
+                        // pre-sanitized) text in Mono fg.primary. A gated tool-call step
+                        // ALSO draws its risk-gate badge inline at the head of line 0
+                        // (T-5.11): the badge LABEL in the saturated semantic color,
+                        // always paired with text (color-blind safety); the parsed
+                        // reason gloss is already in `ab.text`. Real card styling is
                         // EPIC-4 (T-4.6); this is the data binding.
                         let Some(ab) = agent_block else { continue };
                         if *line == 0 {
@@ -339,6 +356,26 @@ impl TimelineRenderer {
                             );
                         }
                         let mut x = content_x;
+                        // The risk-gate badge prefixes line 0 of a gated tool call.
+                        if *line == 0 {
+                            if let Some(badge) = ab.badge {
+                                let rb = RiskBadge::resolve(risk_state_for(badge), theme);
+                                for c in rb.label.chars() {
+                                    let cell = grid_glyph(c, rb.gutter_color, canvas);
+                                    emit_cell(
+                                        atlas,
+                                        queue,
+                                        &cell,
+                                        (x, y),
+                                        &ctx,
+                                        &mut self.bg_instances,
+                                        &mut self.glyph_instances,
+                                    );
+                                    x += cw;
+                                }
+                                x += cw; // a space between the badge and the gloss
+                            }
+                        }
                         if let Some(text_line) = ab.text.split('\n').nth(*line) {
                             for c in text_line.chars() {
                                 let cell = grid_glyph(c, cmd.command_fg, canvas);
@@ -533,6 +570,19 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
         // entry and nothing else - no full-timeline relayout per delta (the 60fps
         // floor, ties to T-2.7 / T-1.8).
         s = fold_u64(s, agent_block.map_or(0, |a| a.version));
+        // The risk-gate badge verdict (ticket T-5.11): a transition (e.g. an
+        // approval flipping NeedsApproval -> Auto, or a re-projection to Blocked)
+        // changes the drawn chip without necessarily bumping `version`, so fold it
+        // so exactly this entry redraws on a verdict change.
+        s = fold_u64(
+            s,
+            match agent_block.and_then(|a| a.badge) {
+                None => 0,
+                Some(AgentBadge::Auto) => 1,
+                Some(AgentBadge::NeedsApproval) => 2,
+                Some(AgentBadge::Blocked) => 3,
+            },
+        );
         // Fold the DRAWN CONTENT of each visible row - bounded by the visible rows
         // (~viewport), so it stays cheap - so an in-place redraw (a running command's
         // `\r` progress bar / spinner: row count unchanged, content changed) and a
@@ -810,6 +860,63 @@ mod sig_tests {
         assert_eq!(dh, h.display_height);
         assert_eq!(rows, h.rows);
         assert_eq!(gutter, h.gutter);
+    }
+
+    #[test]
+    fn agent_badge_maps_each_verdict_to_its_risk_state() {
+        // T-5.11: the agent-domain-free badge maps onto the three UI risk states the
+        // chip styler speaks - a total, order-preserving mapping.
+        assert_eq!(risk_state_for(AgentBadge::Auto), RiskState::Allowed);
+        assert_eq!(
+            risk_state_for(AgentBadge::NeedsApproval),
+            RiskState::NeedsApproval
+        );
+        assert_eq!(risk_state_for(AgentBadge::Blocked), RiskState::Blocked);
+    }
+
+    #[test]
+    fn a_badge_verdict_change_invalidates_the_damage_gate() {
+        // T-5.11 AC1/AC2: a gated tool-call step draws its badge; an approval flipping
+        // the verdict (NeedsApproval -> Auto) - or a re-projection to Blocked - changes
+        // the drawn chip, so the damage gate must redraw exactly this entry. Same text,
+        // same version; only the badge differs.
+        use aterm_core::{AgentBlock, AgentBlockKind};
+        use std::time::Instant;
+
+        let with_badge = |badge: Option<AgentBadge>| {
+            let mut list = aterm_core::BlockList::new();
+            let mut b = AgentBlock::new(AgentBlockKind::ToolCall, "run_command", Instant::now())
+                .with_tool_use_id("toolu_1");
+            if let Some(badge) = badge {
+                b = b.with_badge(badge);
+            }
+            list.push_agent(b);
+            list
+        };
+        let sig = |list: &aterm_core::BlockList| {
+            signature(
+                &layout(list, false, Scroll::default(), 20),
+                800,
+                600,
+                13,
+                &dark(),
+            )
+        };
+
+        let needs = sig(&with_badge(Some(AgentBadge::NeedsApproval)));
+        let auto = sig(&with_badge(Some(AgentBadge::Auto)));
+        let blocked = sig(&with_badge(Some(AgentBadge::Blocked)));
+        let none = sig(&with_badge(None));
+
+        // Every distinct verdict (and the no-badge case) is a distinct drawn state.
+        for (a, b, what) in [
+            (needs, auto, "NeedsApproval vs Auto"),
+            (auto, blocked, "Auto vs Blocked"),
+            (needs, blocked, "NeedsApproval vs Blocked"),
+            (none, auto, "no badge vs Auto"),
+        ] {
+            assert_ne!(a, b, "a badge change must invalidate the gate: {what}");
+        }
     }
 }
 

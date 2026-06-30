@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use aterm_agent::AutonomyState;
 use aterm_core::{
     keys, BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
 };
@@ -20,6 +21,7 @@ use aterm_ui::{KeyPress, NamedKey, UiCallbacks, Window};
 
 use aterm_core::{InputEvent, InputMode, InputModel, Motion};
 
+use crate::config::Config;
 use crate::routing::{classify, decide, keystroke_for, Disposition, KeyBinding, RoutingContext};
 
 /// One terminal session.
@@ -30,19 +32,36 @@ pub struct Session {
     /// The configured mode-toggle hotkey (ticket T-3.3), consulted by
     /// [`crate::routing::classify`] each keystroke. Default `Cmd-/`.
     toggle_key: KeyBinding,
+    /// The configured autonomy-cycle hotkey (ticket T-5.11). Default `Cmd-Shift-A`.
+    autonomy_key: KeyBinding,
+    /// The live, session-scoped autonomy posture (ticket T-5.11). Constructed fresh
+    /// per session at the configured baseline, so a runtime widening never carries
+    /// into a new session (AC5); the cycle hotkey mutates it (AC4), the always-visible
+    /// indicator reads it, and - when the live turn lands - its `policy()` gates the
+    /// loop.
+    autonomy: AutonomyState,
+}
+
+/// Map the agent's autonomy tier onto the UI-local indicator enum. The crate boundary
+/// keeps `aterm-ui` free of `aterm-agent`, so the app does this translation (ticket
+/// T-5.11), exactly as it maps `InputMode` onto the routing chip's `PromptMode`.
+fn ui_autonomy(mode: aterm_agent::AutonomyMode) -> aterm_ui::AutonomyMode {
+    match mode {
+        aterm_agent::AutonomyMode::AskAlways => aterm_ui::AutonomyMode::AskAlways,
+        aterm_agent::AutonomyMode::AutoSafe => aterm_ui::AutonomyMode::AutoSafe,
+        aterm_agent::AutonomyMode::AutoRunInSession => aterm_ui::AutonomyMode::AutoRunInSession,
+    }
 }
 
 impl Session {
     /// Spawn a login shell over the three-thread engine and build the session with
-    /// the configured mode-toggle hotkey.
-    pub fn spawn(
-        cols: u16,
-        rows: u16,
-        toggle_key: KeyBinding,
-    ) -> Result<Self, aterm_core::PtyError> {
+    /// the configured hotkeys and the baseline autonomy posture. A fresh session
+    /// always starts at `cfg.default_autonomy` (the AUTO-SAFE baseline), so a prior
+    /// session's runtime widening never carries over (ticket T-5.11 AC5).
+    pub fn spawn(cfg: &Config) -> Result<Self, aterm_core::PtyError> {
         let dims = PtyDimensions {
-            cols,
-            rows,
+            cols: cfg.initial_cols,
+            rows: cfg.initial_rows,
             pixel_width: 0,
             pixel_height: 0,
         };
@@ -51,7 +70,9 @@ impl Session {
             engine,
             input: InputModel::new(),
             window: None,
-            toggle_key,
+            toggle_key: cfg.toggle_mode,
+            autonomy_key: cfg.autonomy_cycle,
+            autonomy: AutonomyState::new(cfg.default_autonomy),
         })
     }
 
@@ -229,6 +250,13 @@ impl UiCallbacks for Session {
         Some(&self.input)
     }
 
+    fn autonomy_mode(&self) -> Option<aterm_ui::AutonomyMode> {
+        // The always-visible autonomy indicator (ticket T-5.11 AC4): the renderer draws
+        // the live session posture as a chip beside the routing chip. Mapped onto the
+        // UI-local enum so `aterm-ui` never names an `aterm-agent` type.
+        Some(ui_autonomy(self.autonomy.mode()))
+    }
+
     fn on_key(&mut self, key: KeyPress<'_>) -> Option<Vec<u8>> {
         // T-3.3 routing brain. The pure `InputModel` reducer (T-3.1) owns the
         // in-progress line; this layer is the caller that decides where a key goes
@@ -238,6 +266,17 @@ impl UiCallbacks for Session {
         // INTERACTIVITY: until the T-3.6 widget is the source of truth, Shell-mode
         // editing keys are still mirrored raw to the PTY so the shell's own line
         // editor echoes them - the byte stream stays what the prior scaffold sent.
+
+        // The autonomy-cycle hotkey (T-5.11) is a SESSION-posture flip, checked before
+        // the routing brain - parallel to how the mode toggle flips routing only. It
+        // steps the safety tier (taking effect on the next gate decision, AC4) and
+        // sends no PTY bytes.
+        if self.autonomy_key.matches(&key) {
+            self.autonomy.cycle();
+            log::info!("autonomy -> {}", self.autonomy.mode().label());
+            return None;
+        }
+
         let ctx = self.routing_context();
         let bytes = match decide(classify(&key, &self.toggle_key), &ctx) {
             // The IME owns the key (T-3.2); nothing routes. Unreachable today

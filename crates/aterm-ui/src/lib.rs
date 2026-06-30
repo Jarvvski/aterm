@@ -47,8 +47,9 @@ pub use app::{
 };
 pub use atlas::GlyphAtlas;
 pub use components::{
-    AgentCardStyle, Animation, ChipStyle, ChipVariant, CommandBlockStyle, GutterShape, GutterStyle,
-    MotionSpec, PromptChip, PromptMode, RiskBadge, RiskState,
+    AgentCardStyle, Animation, AutonomyChip, AutonomyMode, ChipStyle, ChipVariant,
+    CommandBlockStyle, GutterShape, GutterStyle, MotionSpec, PromptChip, PromptMode, RiskBadge,
+    RiskState,
 };
 pub use constraint::{Align, Constraint, Placed, Sizing};
 pub use glyph::{CellMetrics, GlyphRasterizer, RasterGlyph};

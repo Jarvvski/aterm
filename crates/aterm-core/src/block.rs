@@ -210,6 +210,27 @@ pub enum AgentBlockKind {
     Approval,
 }
 
+/// The agent-domain-FREE risk-gate verdict a tool-call step carries for the
+/// timeline badge (ticket T-5.11). Mirrors the three risk-gate badge states
+/// (`07-ia-design-language.md` §5) WITHOUT naming `aterm-agent`'s `Risk` /
+/// `RiskAssessment` (the one-way crate arrow forbids the dependency):
+/// `aterm-agent`'s `to_block()` maps a deterministic `RiskAssessment` + gate
+/// decision onto this, and `aterm-ui` maps it onto its own local `RiskState` for
+/// the chip styling. The auto-safe default means a proven-safe, non-shell-active
+/// command is [`Auto`](AgentBadge::Auto); an escalated command is
+/// [`NeedsApproval`](AgentBadge::NeedsApproval); a destructive (`Dangerous`)
+/// verdict is [`Blocked`](AgentBadge::Blocked). Color is ALWAYS paired with a text
+/// label downstream (color-blind safety); this enum is the label-bearing datum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentBadge {
+    /// Auto-approved: proven `Safe` with no shell-active reason. Renders "auto".
+    Auto,
+    /// Escalated; needs explicit confirmation. Renders "APPROVE?".
+    NeedsApproval,
+    /// Destructive / blocked; requires an explicit override. Renders "BLOCKED".
+    Blocked,
+}
+
 /// One agent transcript step projected into the timeline (ticket T-5.10).
 ///
 /// It carries only what the renderer needs: a [`kind`](AgentBlockKind) tag, the
@@ -229,6 +250,13 @@ pub struct AgentBlock {
     pub started_at: Instant,
     pub is_error: bool,
     pub version: u64,
+    /// The risk-gate verdict for a [`ToolCall`](AgentBlockKind::ToolCall) step
+    /// (ticket T-5.11), used to draw its badge. `None` for non-tool-call kinds
+    /// (a prompt / thinking / assistant prose / result has no gate verdict). This
+    /// is the agent-domain-FREE projection of the deterministic gate decision -
+    /// `aterm-agent` sets it via [`with_badge`](AgentBlock::with_badge); the
+    /// renderer maps it to a chip without ever naming an agent type.
+    pub badge: Option<AgentBadge>,
 }
 
 impl AgentBlock {
@@ -242,6 +270,7 @@ impl AgentBlock {
             started_at,
             is_error: false,
             version: 0,
+            badge: None,
         }
     }
 
@@ -249,6 +278,15 @@ impl AgentBlock {
     #[must_use]
     pub fn with_tool_use_id(mut self, id: impl Into<String>) -> Self {
         self.tool_use_id = Some(id.into());
+        self
+    }
+
+    /// Attach the risk-gate badge verdict (ticket T-5.11; chainable). Set by
+    /// `aterm-agent` when projecting a `ToolCall` step so the renderer can draw the
+    /// gate badge without naming an agent type.
+    #[must_use]
+    pub fn with_badge(mut self, badge: AgentBadge) -> Self {
+        self.badge = Some(badge);
         self
     }
 
@@ -1878,6 +1916,25 @@ mod tests {
 
     fn agent(kind: AgentBlockKind, text: &str) -> AgentBlock {
         AgentBlock::new(kind, text, Instant::now())
+    }
+
+    #[test]
+    fn agent_block_carries_an_agent_domain_free_badge() {
+        // T-5.11: a tool-call step's gate verdict rides on the block as a
+        // label-bearing datum (AgentBadge), NOT an aterm-agent type - so the
+        // renderer draws the badge without crossing the one-way crate arrow. A
+        // fresh block (and any non-tool kind) carries no badge.
+        let plain = agent(AgentBlockKind::AssistantText, "hi");
+        assert_eq!(plain.badge, None);
+
+        let gated =
+            agent(AgentBlockKind::ToolCall, "run_command").with_badge(AgentBadge::NeedsApproval);
+        assert_eq!(gated.badge, Some(AgentBadge::NeedsApproval));
+
+        // The verdict is part of the block's identity, so a transition (an approval
+        // flipping NeedsApproval -> Auto) is observable for the renderer's damage gate.
+        let approved = agent(AgentBlockKind::ToolCall, "run_command").with_badge(AgentBadge::Auto);
+        assert_ne!(gated.badge, approved.badge);
     }
 
     #[test]

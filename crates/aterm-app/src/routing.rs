@@ -166,6 +166,21 @@ impl KeyBinding {
         }
     }
 
+    /// The default autonomy-cycle chord (ticket T-5.11): `Cmd-Shift-A` (A = autonomy).
+    /// Distinct from the `Cmd-/` mode toggle so the two postures (routing target vs
+    /// safety tier) never collide. Owner-confirm: the exact chord is a UX choice.
+    #[must_use]
+    pub fn default_autonomy_cycle() -> Self {
+        Self {
+            key: BindKey::Char('a'),
+            mods: Mods {
+                cmd: true,
+                shift: true,
+                ..Mods::default()
+            },
+        }
+    }
+
     /// Whether `key` is exactly this chord: the modifiers match exactly and the base
     /// key matches (a character case-insensitively, a named key exactly).
     #[must_use]
@@ -536,6 +551,32 @@ mod tests {
         // A bare `/` (no Cmd) is ordinary input, never the toggle.
         let bare_slash = kp(None, Some('/'), mods(false, false, false, false));
         assert_eq!(classify(&bare_slash, &binding), KeyInput::Other);
+    }
+
+    #[test]
+    fn default_autonomy_cycle_chord_is_cmd_shift_a_and_distinct_from_the_toggle() {
+        // T-5.11: the autonomy-cycle hotkey is `Cmd-Shift-A`, recognized as its own
+        // chord and NEVER colliding with the `Cmd-/` mode toggle (the two postures -
+        // routing target vs safety tier - must never fire each other).
+        let autonomy = KeyBinding::default_autonomy_cycle();
+        let toggle = KeyBinding::default_toggle();
+
+        let cmd_shift_a = kp(None, Some('A'), mods(true, false, false, true));
+        assert!(
+            autonomy.matches(&cmd_shift_a),
+            "Cmd-Shift-A is the cycle chord"
+        );
+        // Case-insensitive on the character (the OS may report 'A' with Shift held).
+        let cmd_shift_lower_a = kp(None, Some('a'), mods(true, false, false, true));
+        assert!(autonomy.matches(&cmd_shift_lower_a));
+
+        // It is not the toggle, and the toggle chord is not the cycle.
+        assert!(!toggle.matches(&cmd_shift_a));
+        let cmd_slash = kp(None, Some('/'), mods(true, false, false, false));
+        assert!(!autonomy.matches(&cmd_slash));
+        // Exact on modifiers: a bare `A` (no Cmd/Shift) never cycles autonomy.
+        let bare_a = kp(None, Some('a'), mods(false, false, false, false));
+        assert!(!autonomy.matches(&bare_a));
     }
 
     #[test]

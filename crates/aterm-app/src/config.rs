@@ -1,6 +1,7 @@
 //! Configuration. STUB: hardcoded defaults today. TODO(ticket EPIC-8): load from
 //! `~/.config/aterm/config.toml` (theme, font size, keybindings, provider keys).
 
+use aterm_agent::AutonomyMode;
 use aterm_ui::ThemeKind;
 
 use crate::routing::KeyBinding;
@@ -20,6 +21,14 @@ pub struct Config {
     /// `ATERM_TOGGLE_KEY` env override today (e.g. `ctrl+t`), the `config.toml`
     /// loader later (EPIC-8).
     pub toggle_mode: KeyBinding,
+    /// The baseline autonomy tier a NEW session starts at (ticket T-5.11). The
+    /// shipped default is AUTO-SAFE (the locked decision); a session may widen or
+    /// narrow at runtime but reverts to this baseline on a new session.
+    pub default_autonomy: AutonomyMode,
+    /// The autonomy-cycle hotkey (ticket T-5.11): steps the live tier through
+    /// ask-always -> auto-safe -> auto-run-in-session. Default `Cmd-Shift-A`;
+    /// rebindable via the `ATERM_AUTONOMY_KEY` env override (e.g. `ctrl+a`).
+    pub autonomy_cycle: KeyBinding,
 }
 
 impl Default for Config {
@@ -30,7 +39,22 @@ impl Default for Config {
             initial_rows: 32,
             display_link: false,
             toggle_mode: KeyBinding::default_toggle(),
+            default_autonomy: AutonomyMode::AutoSafe, // the locked AUTO-SAFE default
+            autonomy_cycle: KeyBinding::default_autonomy_cycle(),
         }
+    }
+}
+
+/// Parse an autonomy tier from a config/env spec (case-insensitive). Recognizes the
+/// tier names + a couple of friendly aliases; `None` on an unrecognized spec.
+fn parse_autonomy(spec: &str) -> Option<AutonomyMode> {
+    match spec.trim().to_ascii_lowercase().as_str() {
+        "ask" | "ask-always" | "ask_always" => Some(AutonomyMode::AskAlways),
+        "auto-safe" | "auto_safe" | "autosafe" | "safe" => Some(AutonomyMode::AutoSafe),
+        "auto-run" | "auto-run-in-session" | "auto_run_in_session" | "auto-run-session" => {
+            Some(AutonomyMode::AutoRunInSession)
+        }
+        _ => None,
     }
 }
 
@@ -53,6 +77,22 @@ impl Config {
                 Some(binding) => cfg.toggle_mode = binding,
                 None => log::warn!(
                     "ignoring invalid ATERM_TOGGLE_KEY={spec:?}; keeping the default toggle (Cmd-/)"
+                ),
+            }
+        }
+        if let Ok(spec) = std::env::var("ATERM_AUTONOMY") {
+            match parse_autonomy(&spec) {
+                Some(mode) => cfg.default_autonomy = mode,
+                None => log::warn!(
+                    "ignoring invalid ATERM_AUTONOMY={spec:?}; keeping the default (auto-safe)"
+                ),
+            }
+        }
+        if let Ok(spec) = std::env::var("ATERM_AUTONOMY_KEY") {
+            match KeyBinding::parse(&spec) {
+                Some(binding) => cfg.autonomy_cycle = binding,
+                None => log::warn!(
+                    "ignoring invalid ATERM_AUTONOMY_KEY={spec:?}; keeping the default (Cmd-Shift-A)"
                 ),
             }
         }

@@ -12,6 +12,7 @@
 //! model proposes is re-classified locally by [`risk::DefaultRiskClassifier`]
 //! and gated by [`policy::ApprovalPolicy`] before it can run.
 
+pub mod approval;
 pub mod command;
 pub mod policy;
 pub mod provider;
@@ -25,8 +26,9 @@ pub mod transcript;
 pub mod turn;
 
 // Root re-exports for the load-bearing public surface.
+pub use approval::{ApprovalRequest, ChannelConfirmHandler};
 pub use command::ShellCommand;
-pub use policy::{Approval, ApprovalPolicy};
+pub use policy::{Approval, ApprovalPolicy, AutonomyMode, AutonomyState};
 pub use provider::{
     AgentEvent, AgentEventMapper, AnthropicProvider, ContentBlock, Effort, LlmProvider, Message,
     MockProvider, OpenAiProvider, ProviderError, ProviderEvent, Role, StopReason, ToolCall,

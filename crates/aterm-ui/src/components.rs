@@ -333,6 +333,64 @@ impl PromptChip {
 }
 
 // ---------------------------------------------------------------------------
+// Autonomy-mode indicator chip (the always-visible safety posture)
+// ---------------------------------------------------------------------------
+
+/// The autonomy tier the agent runs under (ticket T-5.11), surfaced as an
+/// always-visible indicator so the user can never lose track of the safety posture
+/// (AC4). UI-local, NOT `aterm_agent::AutonomyMode` (the crate boundary forbids the
+/// dependency); `aterm-app` maps the agent's mode onto these three. The ladder runs
+/// most-conservative to most-permissive; `AutoSafe` is the shipped default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutonomyMode {
+    /// Every command requires explicit confirmation.
+    AskAlways,
+    /// The default: a proven-safe, non-shell-active command auto-runs.
+    AutoSafe,
+    /// A session-scoped widening that also auto-runs non-shell-active Caution.
+    AutoRunInSession,
+}
+
+/// The resolved autonomy-mode indicator chip. Like every chip it ALWAYS pairs a
+/// `label` with the `chip` color (color-blind safety): the more permissive the tier,
+/// the louder the color (neutral -> success -> caution), but the label alone always
+/// carries the meaning. A mode switch cross-fades within `motion.fast`
+/// ([`Animation::CrossFade`]) - the same animation the routing chip uses, no fourth.
+#[derive(Debug, Clone, Copy)]
+pub struct AutonomyChip {
+    pub mode: AutonomyMode,
+    pub label: &'static str,
+    pub chip: ChipStyle,
+}
+
+impl AutonomyChip {
+    /// Resolve the indicator for `mode` against `theme`. ask-always is the neutral
+    /// chrome chip; auto-safe is `success` (the safe-by-default posture); the
+    /// auto-run-in-session widening is `caution` so the looser posture reads as
+    /// slightly louder. The label is always present and non-empty.
+    #[must_use]
+    pub fn resolve(mode: AutonomyMode, theme: &Theme) -> Self {
+        let (label, variant) = match mode {
+            AutonomyMode::AskAlways => ("ASK", ChipVariant::Neutral),
+            AutonomyMode::AutoSafe => ("AUTO-SAFE", ChipVariant::Success),
+            AutonomyMode::AutoRunInSession => ("AUTO-RUN", ChipVariant::Caution),
+        };
+        Self {
+            mode,
+            label,
+            chip: ChipStyle::resolve(variant, theme),
+        }
+    }
+
+    /// The animation that plays when the autonomy tier switches: the shared
+    /// `motion.fast` cross-fade (NOT a fourth animation).
+    #[must_use]
+    pub fn switch_animation() -> Animation {
+        Animation::CrossFade
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent card
 // ---------------------------------------------------------------------------
 
@@ -778,6 +836,33 @@ mod tests {
             assert_ne!(labels[1], labels[2]);
             assert_ne!(labels[0], labels[2]);
         }
+    }
+
+    // ----- autonomy-mode indicator --------------------------------------
+
+    #[test]
+    fn autonomy_chip_always_has_a_distinct_label_beside_its_color_for_all_tiers() {
+        // AC4 + AC6: the autonomy posture is always shown as a non-empty text label
+        // paired with a color, in BOTH themes, and the three tiers are distinguishable
+        // from text alone (never color-only).
+        for theme in themes() {
+            let cases = [
+                AutonomyMode::AskAlways,
+                AutonomyMode::AutoSafe,
+                AutonomyMode::AutoRunInSession,
+            ];
+            let mut labels = Vec::new();
+            for mode in cases {
+                let chip = AutonomyChip::resolve(mode, &theme);
+                assert!(!chip.label.is_empty(), "{mode:?} must carry a label");
+                labels.push(chip.label);
+            }
+            assert_ne!(labels[0], labels[1]);
+            assert_ne!(labels[1], labels[2]);
+            assert_ne!(labels[0], labels[2]);
+        }
+        // The autonomy switch reuses the shared cross-fade (no fourth animation).
+        assert_eq!(AutonomyChip::switch_animation(), Animation::CrossFade);
     }
 
     // ----- motion budget ------------------------------------------------

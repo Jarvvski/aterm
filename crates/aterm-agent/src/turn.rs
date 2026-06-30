@@ -900,6 +900,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn caution_command_parks_on_the_channel_seam_until_the_ui_answers() {
+        // AC2 (T-5.11) at the loop level: a Caution command does NOT auto-run; the
+        // loop parks on the ChannelConfirmHandler until the UI answers the surfaced
+        // request. Approving runs the tool; the two halves are driven concurrently so
+        // the loop genuinely waits on the channel (it can only proceed once we reply).
+        use crate::approval::ChannelConfirmHandler;
+
+        let provider = MockProvider::scripted(vec![
+            tool_round(
+                "toolu_1",
+                "run_command",
+                r#"{"command":["brew","install","wget"]}"#,
+            ),
+            end_round("done"),
+        ]);
+        let secrets = Secrets::new();
+        let dispatch = RecordingDispatch::default();
+        let turn = AgentTurn::new(&provider, &secrets);
+        let (handler, mut rx) = ChannelConfirmHandler::new();
+        let (etx, _erx) = mpsc::channel(256);
+        let registry = ToolRegistry::default();
+        let cancel = CancelToken::new();
+
+        let run = turn.run(req(), &registry, &dispatch, &handler, &cancel, etx);
+        let ui = async {
+            let r = rx
+                .recv()
+                .await
+                .expect("a Caution command must surface for approval");
+            assert_eq!(r.assessment.level, Risk::Caution, "brew install is Caution");
+            assert_eq!(r.call.name, "run_command");
+            r.approve();
+        };
+        let (outcome, ()) = tokio::join!(run, ui);
+
+        assert_eq!(outcome.unwrap().stop_reason, StopReason::EndTurn);
+        assert_eq!(dispatch.count(), 1, "the approved Caution command ran once");
+    }
+
+    #[tokio::test]
+    async fn caution_command_denied_over_the_channel_seam_is_never_run() {
+        // AC2: denying over the same seam feeds back an is_error result and the tool
+        // never reaches the dispatcher.
+        use crate::approval::ChannelConfirmHandler;
+
+        let provider = MockProvider::scripted(vec![
+            tool_round(
+                "toolu_1",
+                "run_command",
+                r#"{"command":["brew","install","wget"]}"#,
+            ),
+            end_round("stopped"),
+        ]);
+        let secrets = Secrets::new();
+        let dispatch = RecordingDispatch::default();
+        let turn = AgentTurn::new(&provider, &secrets);
+        let (handler, mut rx) = ChannelConfirmHandler::new();
+        let (etx, _erx) = mpsc::channel(256);
+        let registry = ToolRegistry::default();
+        let cancel = CancelToken::new();
+
+        let run = turn.run(req(), &registry, &dispatch, &handler, &cancel, etx);
+        let ui = async {
+            rx.recv().await.expect("request surfaces").deny();
+        };
+        let (outcome, ()) = tokio::join!(run, ui);
+
+        assert_eq!(outcome.unwrap().stop_reason, StopReason::EndTurn);
+        assert_eq!(dispatch.count(), 0, "a denied command never runs");
+        assert!(has_tool_result(
+            &provider.requests()[1].messages,
+            Some(true)
+        ));
+    }
+
+    #[tokio::test]
     async fn safe_tool_auto_runs_without_consulting_the_approver() {
         let provider = MockProvider::scripted(vec![
             tool_round("toolu_s", "run_command", r#"{"command":["ls","-la"]}"#),
