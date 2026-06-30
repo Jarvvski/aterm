@@ -37,12 +37,14 @@ use aterm_core::Snapshot;
 use aterm_tokens::{type_scale, Theme};
 
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
-use crate::text::{build_grid_cells, FaceStyle, FontFamily, GlyphKey, GridCell};
+use crate::text::{build_grid_cells, FontFamily, GridCell};
 use crate::window::cell_px;
 
 /// Left/top inset of the grid from the surface origin, in LOGICAL px (scaled by the
-/// DPI factor at use). Matches the interim glyphon path's `(8, 8)` offset.
-const INSET_LOGICAL: f32 = 8.0;
+/// DPI factor at use). Matches the interim glyphon path's `(8, 8)` offset. `pub(crate)`
+/// so the timeline front-end shares the SAME coordinate origin as the grid (the two
+/// occupy one viewport).
+pub(crate) const INSET_LOGICAL: f32 = 8.0;
 
 /// The surface geometry for a frame: physical-pixel size + the DPI scale factor.
 /// Bundled so [`GridRenderer::prepare`] stays a tidy call.
@@ -160,7 +162,20 @@ impl GridRenderer {
         // Center the font's line box in the cell box, then baseline = ascent below
         // the box top.
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
-        let canvas = theme.colors.bg_canvas;
+        // Per-cell geometry shared with the timeline front-end (one emitter, identical
+        // sprite/constraint/baseline placement) - see `crate::cell_render`.
+        let ctx = crate::cell_render::CellCtx {
+            cw,
+            ch,
+            cw_i,
+            ch_i,
+            baseline_off,
+            descent: metrics.descent,
+            px,
+            px_key,
+            atlas_dim: atlas.atlas_dim(),
+            canvas: theme.colors.bg_canvas,
+        };
 
         build_grid_cells(snap, theme, &mut self.grid_cells);
         self.bg_instances.clear();
@@ -169,98 +184,19 @@ impl GridRenderer {
         // Take the cell list out to avoid borrowing `self` twice (cells + caches).
         let cells = std::mem::take(&mut self.grid_cells);
         for cell in &cells {
-            let cw_cell = if cell.wide { cw * 2.0 } else { cw };
-            let cell_x = inset + f32::from(cell.col) * cw;
-            let cell_y = inset + f32::from(cell.row) * ch;
-
-            // Background quad (skip canvas-colored cells; the clear covers them).
-            if cell.bg != canvas {
-                self.bg_instances.push(RectInstance {
-                    rect: [cell_x, cell_y, cw_cell, ch],
-                    color: cell.bg.to_linear_f32(),
-                });
-            }
-            // Underline: a thin quad just under the baseline.
-            if cell.underline {
-                let uy = cell_y + baseline_off + (metrics.descent * 0.3).max(1.0);
-                self.bg_instances.push(RectInstance {
-                    rect: [cell_x, uy, cw_cell, (ch * 0.06).max(1.0)],
-                    color: cell.fg.to_linear_f32(),
-                });
-            }
-
-            // Glyph quad. A sprite codepoint (box-drawing / blocks / braille /
-            // Powerline) is drawn procedurally into the cell box and bypasses the
-            // font; everything else is a font glyph keyed by its cmap glyph id.
-            let sprite = crate::sprite::is_sprite(cell.ch);
-            let face = if sprite {
-                FaceStyle::Regular
-            } else {
-                FaceStyle::from_flags(cell.bold, cell.italic)
-            };
-            let gkey = GlyphKey {
-                family: FontFamily::Grid,
-                glyph_id: if sprite {
-                    cell.ch as u32 as u16 // sprite codepoints are all in the BMP
-                } else {
-                    atlas.glyph_id(FontFamily::Grid, face, cell.ch)
-                },
-                face,
-                px: px_key,
-                sprite,
-            };
-            // Acquire the glyph from the shared atlas (a cache hit, or rasterize +
-            // upload once on a miss). The atlas owns the skip-memo and the once-only
-            // guarantee; a sprite codepoint is drawn procedurally into the cell box,
-            // everything else from the font's cmap glyph.
-            let slot = if sprite {
-                atlas.acquire_sprite(queue, gkey, cell.ch, cw_i, ch_i)
-            } else {
-                atlas.acquire_font(queue, gkey, FontFamily::Grid, face, gkey.glyph_id, px)
-            };
-            let Some((rect, (left, top))) = slot else {
-                continue;
-            };
-            // Snap the glyph quad to integer pixels so the hinted bitmap maps 1:1 to
-            // texels under the Nearest sampler (crisp, no inter-glyph bleed). The cell
-            // origin is fractional (cw is ~7.8px), so without this the quad would
-            // straddle pixel boundaries.
-            //
-            // Three placements:
-            //  - a sprite fills the cell box, placed at the cell origin (left/top 0);
-            //  - a Nerd Font icon (PUA) is scaled/centered/stretched into the cell per
-            //    its constraint (T-4.4), replacing the font's often small/off-cell
-            //    native placement;
-            //  - an ordinary font glyph is baseline-relative at its natural size.
-            let (gx, gy, gw, gh) = if sprite {
-                (cell_x.round(), cell_y.round(), rect.w as f32, rect.h as f32)
-            } else if let Some(con) = crate::constraint::lookup(cell.ch) {
-                let p = con.place(rect.w as f32, rect.h as f32, cw_cell, ch);
-                (
-                    (cell_x + p.x).round(),
-                    (cell_y + p.y).round(),
-                    p.w.round().max(1.0),
-                    p.h.round().max(1.0),
-                )
-            } else {
-                (
-                    (cell_x + left as f32).round(),
-                    (cell_y + baseline_off - top as f32).round(),
-                    rect.w as f32,
-                    rect.h as f32,
-                )
-            };
-            let inv = 1.0 / atlas.atlas_dim() as f32;
-            self.glyph_instances.push(GlyphInstance {
-                rect: [gx, gy, gw, gh],
-                uv: [
-                    rect.x as f32 * inv,
-                    rect.y as f32 * inv,
-                    (rect.x + rect.w) as f32 * inv,
-                    (rect.y + rect.h) as f32 * inv,
-                ],
-                color: cell.fg.to_linear_f32(),
-            });
+            let origin = (
+                inset + f32::from(cell.col) * cw,
+                inset + f32::from(cell.row) * ch,
+            );
+            crate::cell_render::emit_cell(
+                atlas,
+                queue,
+                cell,
+                origin,
+                &ctx,
+                &mut self.bg_instances,
+                &mut self.glyph_instances,
+            );
         }
         self.grid_cells = cells; // return the buffer for reuse
 

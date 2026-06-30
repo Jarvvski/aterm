@@ -21,6 +21,7 @@ pub mod app;
 // render path is driven only from within the crate until the atlas hoists up to the
 // live `GpuRenderer` (T-4.6).
 mod atlas;
+mod cell_render;
 pub mod components;
 pub mod constraint;
 pub mod fonts;
@@ -36,6 +37,7 @@ pub mod renderer;
 pub mod sprite;
 pub mod text;
 pub mod timeline;
+pub mod timeline_render;
 pub mod widgets;
 pub mod window;
 
@@ -65,6 +67,7 @@ pub use timeline::{
     layout as timeline_layout, visible_block_count, GutterMarker, Scroll, TimelineLayout,
     TimelineMode, TimelineRow, VisibleBlock,
 };
+pub use timeline_render::TimelineRenderer;
 
 // Re-export the winit key types the host app needs for input routing.
 pub use winit::keyboard::NamedKey;
