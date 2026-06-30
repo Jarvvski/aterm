@@ -482,6 +482,23 @@ impl Terminal {
         t.captured_rows()
     }
 
+    /// A throwaway off-screen terminal for INCREMENTAL capture of a running command's
+    /// output (ticket T-4.6): the engine feeds it the command's clean bytes as they
+    /// arrive and snapshots it each publish via [`Self::live_output_rows`], so the
+    /// running block carries its live output without re-replaying the whole buffer every
+    /// tick. Same width + generous scrollback as the one-shot [`Self::capture_output_rows`].
+    #[must_use]
+    pub fn new_capture(cols: usize) -> Self {
+        Terminal::with_scrollback(CAPTURE_VIEWPORT_ROWS, cols.max(1), CAPTURE_SCROLLBACK)
+    }
+
+    /// Snapshot this (incremental capture) terminal's current output rows - the live
+    /// analogue of [`Self::capture_output_rows`], reading whatever has been fed so far.
+    #[must_use]
+    pub fn live_output_rows(&self) -> Vec<RowSnapshot> {
+        self.captured_rows()
+    }
+
     /// Capture every retained row (top of history down through the viewport) of this
     /// terminal as owned [`RowSnapshot`]s, with each row trimmed to its last non-blank
     /// cell and trailing fully-blank rows dropped. Used by [`Self::capture_output_rows`]
@@ -822,5 +839,38 @@ mod tests {
     #[test]
     fn capture_output_rows_empty_input_is_empty() {
         assert!(Terminal::capture_output_rows(40, b"").is_empty());
+    }
+
+    #[test]
+    fn new_capture_accumulates_live_output_rows_incrementally() {
+        // T-4.6: the incremental live-capture terminal grows its rows as a running
+        // command's bytes arrive, so the running block can stream output (instead of
+        // re-replaying the whole buffer every publish).
+        let row_text = |r: &RowSnapshot| r.cells.iter().map(|c| c.c).collect::<String>();
+        let mut t = Terminal::new_capture(20);
+        assert!(
+            t.live_output_rows().is_empty(),
+            "a fresh capture terminal has no rows"
+        );
+        t.feed(b"first line\r\n");
+        let after_one = t.live_output_rows();
+        assert!(
+            after_one.iter().any(|r| row_text(r).contains("first line")),
+            "the first line is captured live"
+        );
+        t.feed(b"second line\r\n");
+        let after_two = t.live_output_rows();
+        assert!(
+            after_two.len() > after_one.len(),
+            "feeding more output grows the live rows ({} -> {})",
+            after_one.len(),
+            after_two.len()
+        );
+        assert!(
+            after_two
+                .iter()
+                .any(|r| row_text(r).contains("second line")),
+            "the second line is captured live alongside the first"
+        );
     }
 }

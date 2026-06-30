@@ -404,6 +404,7 @@ impl Engine {
             blocks_touched: false,
             capture_buf: Vec::new(),
             capturing: false,
+            live_capture: None,
             shell_version: Arc::clone(&shell_version),
             integration: monitor,
             integration_code: Arc::clone(&integration_code),
@@ -638,6 +639,14 @@ struct Model {
     /// `D`). Cleared - and the buffer discarded - if the command turns out to be a
     /// full-screen (alt-screen) app, which has no captured output.
     capturing: bool,
+    /// Incremental live-capture terminal for the RUNNING command (ticket T-4.6): created
+    /// at its `C`, fed the same clean bytes as `capture_buf` as they arrive, and
+    /// snapshotted each publish so the running block carries its LIVE output (the block
+    /// model is the source of truth for output, not the evicting grid). `None` unless a
+    /// command is running + capturing; dropped at `D`. The authoritative final capture at
+    /// `D` still comes from replaying `capture_buf` (unchanged), so this only ever
+    /// supplies the in-flight rows.
+    live_capture: Option<Terminal>,
     /// The handle's shell-version slot (ticket T-2.3 AC2); filled once from the first
     /// `aterm_ver=` mark.
     shell_version: Arc<Mutex<Option<String>>>,
@@ -740,6 +749,9 @@ impl Model {
                     Mark::Prompt(PromptKind::OutputStart) => {
                         self.capturing = true;
                         self.capture_buf.clear();
+                        // Open a fresh incremental live-capture terminal for this
+                        // command so its running block streams live output (T-4.6).
+                        self.live_capture = Some(Terminal::new_capture(self.terminal.cols()));
                     }
                     Mark::Prompt(PromptKind::CommandDone { .. }) => self.capture_finish(),
                     // Missing-`D` recovery: the segmenter just closed the orphan; capture
@@ -794,12 +806,18 @@ impl Model {
         if self.terminal.is_alt_screen() {
             self.capturing = false;
             self.capture_buf.clear();
+            self.live_capture = None; // a full-screen app has no captured output
             return;
         }
         let room = MAX_CAPTURE_BYTES.saturating_sub(self.capture_buf.len());
         if room > 0 {
             let take = room.min(bytes.len());
             self.capture_buf.extend_from_slice(&bytes[..take]);
+            // Feed the SAME bytes to the incremental live terminal (T-4.6) so the
+            // running block's live rows stay current without re-replaying the buffer.
+            if let Some(t) = self.live_capture.as_mut() {
+                t.feed(&bytes[..take]);
+            }
         }
     }
 
@@ -811,6 +829,9 @@ impl Model {
             return;
         }
         self.capturing = false;
+        // Drop the incremental live terminal; the authoritative final capture below
+        // comes from replaying the full byte buffer (unchanged from T-2.7).
+        self.live_capture = None;
         if !self.blocks.is_empty() {
             let idx = self.blocks.len() - 1;
             let rows = Terminal::capture_output_rows(self.terminal.cols(), &self.capture_buf);
@@ -973,6 +994,23 @@ impl Model {
             .snapshots_published
             .fetch_add(1, Ordering::Relaxed);
 
+        // Stream the running command's LIVE output into its block (ticket T-4.6): snapshot
+        // the incremental live-capture terminal and set it as the running (tail) block's
+        // output, so the timeline renders the in-flight command from the block model. The
+        // final, authoritative capture still lands at `D` (`capture_finish`). Gated on an
+        // actively-capturing command with a running tail block, so an idle session pays
+        // nothing here.
+        if self.capturing {
+            if let Some(t) = self.live_capture.as_ref() {
+                if let Some(idx) = self.blocks.len().checked_sub(1) {
+                    if self.blocks.get(idx).is_some_and(|b| b.is_running()) {
+                        self.blocks.set_block_output(idx, t.live_output_rows());
+                        self.blocks_touched = true;
+                    }
+                }
+            }
+        }
+
         // Publish the block list too, if it changed since the last publish (ticket
         // T-2.7). It rides the same publish() call as the snapshot but under its OWN
         // lock, so the (snapshot, blocks) pair is *eventually consistent*, not atomic:
@@ -1013,6 +1051,11 @@ impl Model {
                 pixel_height,
             } => {
                 self.terminal.resize(rows as usize, cols as usize);
+                // Reflow the incremental live-capture terminal too (T-4.6) so a running
+                // command's live rows re-wrap to the new width, like the main grid.
+                if let Some(t) = self.live_capture.as_mut() {
+                    t.resize(t.rows(), cols as usize);
+                }
                 let _ = self.pty.resize(PtyDimensions {
                     rows,
                     cols,
@@ -1731,6 +1774,60 @@ mod tests {
             status,
             crate::IntegrationStatus::Integrated,
             "a nonce-matched A must confirm Integrated"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn running_command_block_carries_live_output_before_it_finishes() {
+        // T-4.6 real fix, deterministic at the engine layer: while a command is still
+        // RUNNING (its `D` has not arrived), its block must already carry the command's
+        // LIVE output - the engine streams the incremental live-capture terminal into the
+        // running block each publish, so the timeline renders in-flight output from the
+        // block model (not the evicting grid). A nonced `A` then `C` open a running block;
+        // the marker row is printed; a long sleep keeps the block open while we observe.
+        let nonce = "ATERMLIVECAP00";
+        let script = format!(
+            "printf '\\033]133;A;aterm_nonce={nonce}\\007'; \
+             printf '\\033]133;C;aterm_nonce={nonce}\\007'; \
+             printf 'live-capture-row\\n'; sleep 5"
+        );
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", &script],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            Some(nonce),
+            Duration::from_millis(300),
+        )
+        .expect("spawn sh emitting live output before D");
+
+        // Poll until the last (running) block carries the marker row, well inside the 5s
+        // sleep - i.e. BEFORE the command finishes.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut found = false;
+        while Instant::now() < deadline {
+            let blocks = engine.latest_blocks();
+            if let Some(b) = blocks.iter().last() {
+                let has_row = b.output.iter().any(|r| {
+                    r.cells
+                        .iter()
+                        .map(|c| c.c)
+                        .collect::<String>()
+                        .contains("live-capture-row")
+                });
+                if b.is_running() && has_row {
+                    found = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            found,
+            "a still-running command's block must carry its live output before D (the \
+             incremental live capture streams into the block model)"
         );
         drop(engine);
     }
