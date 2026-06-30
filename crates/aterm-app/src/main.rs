@@ -28,7 +28,7 @@ fn main() {
     );
 
     // Spawn the login shell over a PTY. If this fails we still want to know.
-    let session = match Session::spawn(cfg.initial_cols, cfg.initial_rows) {
+    let session = match Session::spawn(cfg.initial_cols, cfg.initial_rows, cfg.toggle_mode) {
         Ok(s) => {
             log::info!("login shell PTY spawned ({} blocks)", s.block_count());
             s

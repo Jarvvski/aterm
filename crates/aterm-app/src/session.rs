@@ -16,22 +16,30 @@ use std::sync::Arc;
 use aterm_core::{
     BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
 };
-use aterm_ui::{NamedKey, UiCallbacks, Window};
+use aterm_ui::{KeyPress, NamedKey, UiCallbacks, Window};
 
 use aterm_core::{InputEvent, InputMode, InputModel, Motion};
 
-use crate::routing::{decide, Disposition, KeyInput, RoutingContext};
+use crate::routing::{classify, decide, Disposition, KeyBinding, RoutingContext};
 
 /// One terminal session.
 pub struct Session {
     engine: Engine,
     input: InputModel,
     window: Option<Arc<Window>>,
+    /// The configured mode-toggle hotkey (ticket T-3.3), consulted by
+    /// [`crate::routing::classify`] each keystroke. Default `Cmd-/`.
+    toggle_key: KeyBinding,
 }
 
 impl Session {
-    /// Spawn a login shell over the three-thread engine and build the session.
-    pub fn spawn(cols: u16, rows: u16) -> Result<Self, aterm_core::PtyError> {
+    /// Spawn a login shell over the three-thread engine and build the session with
+    /// the configured mode-toggle hotkey.
+    pub fn spawn(
+        cols: u16,
+        rows: u16,
+        toggle_key: KeyBinding,
+    ) -> Result<Self, aterm_core::PtyError> {
         let dims = PtyDimensions {
             cols,
             rows,
@@ -43,6 +51,7 @@ impl Session {
             engine,
             input: InputModel::new(),
             window: None,
+            toggle_key,
         })
     }
 
@@ -63,26 +72,6 @@ impl Session {
                 TerminalEvent::Bell => log::debug!("bell"),
                 other => log::trace!("terminal event: {other:?}"),
             }
-        }
-    }
-
-    /// Classify a winit key into the routing brain's [`KeyInput`] (ticket T-3.3).
-    ///
-    /// LIMITATION: the [`UiCallbacks::on_key`] seam does not yet carry keyboard
-    /// MODIFIERS, so the real toggle chord (`Cmd-/`) and `Opt-Enter` cannot be
-    /// detected here. `Tab` stands in for the toggle (as the prior scaffold did) and
-    /// Enter is always non-alt. Wiring the modifier seam (and thus the real chords)
-    /// is the remaining work; the brain already decides them correctly.
-    fn classify_key(named: Option<NamedKey>) -> KeyInput {
-        match named {
-            Some(NamedKey::Enter) => KeyInput::Enter { alt: false },
-            Some(NamedKey::Escape) => KeyInput::Escape,
-            // Placeholder toggle chord (real chord is `Cmd-/`, pending the modifier
-            // seam). NOTE: this means `Tab` toggles even inside a TUI - a known
-            // interim limitation carried from the scaffold, resolved once `Cmd-/`
-            // frees `Tab`.
-            Some(NamedKey::Tab) => KeyInput::ToggleHotkey,
-            _ => KeyInput::Other,
         }
     }
 
@@ -149,6 +138,11 @@ impl Session {
                 self.input.reduce(InputEvent::Insert(" ".to_string()));
                 false
             }
+            // Tab requests shell completion: it acts on the PTY (the shell's own
+            // completer), not the input line, so the model is left untouched here -
+            // the `\t` byte is sent by `raw_key_bytes` in the Shell-mode mirror.
+            // Freed from the toggle now that `Cmd-/` is the real chord (T-3.3).
+            Some(NamedKey::Tab) => false,
             // Esc with no agent turn (and integrated, not alt-screen) is ordinary
             // input; the input box has no Esc action yet, so it is a no-op.
             Some(NamedKey::Escape) => false,
@@ -170,6 +164,7 @@ impl Session {
             Some(NamedKey::Enter) => Some(b"\r".to_vec()),
             Some(NamedKey::Backspace) => erased.then(|| vec![0x7f]),
             Some(NamedKey::Space) => Some(b" ".to_vec()),
+            Some(NamedKey::Tab) => Some(b"\t".to_vec()),
             Some(
                 NamedKey::Delete
                 | NamedKey::ArrowLeft
@@ -230,17 +225,17 @@ impl UiCallbacks for Session {
         Some(&self.input)
     }
 
-    fn on_key(&mut self, text: Option<&str>, named: Option<NamedKey>) -> Option<Vec<u8>> {
+    fn on_key(&mut self, key: KeyPress<'_>) -> Option<Vec<u8>> {
         // T-3.3 routing brain. The pure `InputModel` reducer (T-3.1) owns the
         // in-progress line; this layer is the caller that decides where a key goes
-        // (the caller-owns-submit contract). `decide` (routing.rs) applies the
-        // disposition gates; we perform the result here. INTERACTIVITY: until the
-        // T-3.6 widget renders the `InputModel`, Shell-mode editing keys are still
-        // mirrored raw to the PTY so the shell's own line editor echoes them - the
-        // byte stream stays what the prior scaffold sent.
-        let key = Self::classify_key(named);
+        // (the caller-owns-submit contract). `classify` maps the modifier-carrying
+        // `KeyPress` to a neutral `KeyInput` (the real `Cmd-/` toggle / `Opt-Enter`),
+        // then `decide` applies the disposition gates; we perform the result here.
+        // INTERACTIVITY: until the T-3.6 widget is the source of truth, Shell-mode
+        // editing keys are still mirrored raw to the PTY so the shell's own line
+        // editor echoes them - the byte stream stays what the prior scaffold sent.
         let ctx = self.routing_context();
-        let bytes = match decide(key, &ctx) {
+        let bytes = match decide(classify(&key, &self.toggle_key), &ctx) {
             // The IME owns the key (T-3.2); nothing routes. Unreachable today
             // (`preedit_active` is false until T-3.2 lands).
             Disposition::ImeComposing => None,
@@ -269,14 +264,14 @@ impl UiCallbacks for Session {
             // Raw passthrough (alt-screen / foreground stdin / degraded): the keys
             // belong to the PTY (a TUI or a classic ZLE line editor), NOT the input
             // box, so we do not edit the `InputModel`. T-3.4 owns full encoding.
-            Disposition::PassthroughToPty => Self::raw_key_bytes(named, text, true),
+            Disposition::PassthroughToPty => Self::raw_key_bytes(key.named, key.text, true),
             // Ordinary editing: update the input line. In Shell mode ALSO mirror raw
             // to the PTY for the shell's echo (until the T-3.6 widget is the source
             // of truth). Agent mode edits the prompt only - no PTY bytes.
             Disposition::Edit => {
-                let erased = self.apply_edit_key(named, text);
+                let erased = self.apply_edit_key(key.named, key.text);
                 if ctx.mode == InputMode::Shell {
-                    Self::raw_key_bytes(named, text, erased)
+                    Self::raw_key_bytes(key.named, key.text, erased)
                 } else {
                     None
                 }

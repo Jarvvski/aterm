@@ -42,7 +42,9 @@ pub mod timeline_render;
 pub mod widgets;
 pub mod window;
 
-pub use app::{run, run_with, AtermApp, HeadlessCallbacks, RenderConfig, UiCallbacks};
+pub use app::{
+    run, run_with, AtermApp, HeadlessCallbacks, KeyPress, Mods, RenderConfig, UiCallbacks,
+};
 pub use atlas::GlyphAtlas;
 pub use components::{
     AgentCardStyle, Animation, ChipStyle, ChipVariant, CommandBlockStyle, GutterShape, GutterStyle,

@@ -24,16 +24,17 @@
 //!
 //! ## What this ticket wires vs. defers
 //!
-//! The DECISION is complete and tested here. The session wiring is honest about
-//! what is not yet sourced live: the real toggle chord (`Cmd-/`) and `Opt-Enter`
-//! need keyboard MODIFIERS, which the `aterm-ui` `on_key` seam does not yet pass
-//! (so session uses a `Tab` placeholder for the toggle and cannot see `alt`);
-//! `preedit_active` is always false until the IME lands (T-3.2); `agent_turn_active`
-//! is always false until the agent loop lands (EPIC-5); `foreground_reading_stdin`
-//! is not yet detected. `alt_screen` and the degraded/`None` integration state ARE
-//! sourced live. See session.rs and the ticket Notes.
+//! The DECISION is complete and tested here, and the live wiring now sources the
+//! real chords: [`classify`] maps a [`KeyPress`] (carrying keyboard MODIFIERS + the
+//! logical character) to a [`KeyInput`], so the configurable `Cmd-/` toggle (via
+//! [`KeyBinding`]) and `Opt-Enter` work and `Tab` is freed. `alt_screen`, the
+//! degraded/`None` integration state, and `foreground_reading_stdin` (a foreign
+//! foreground process group) are all sourced live. Still gated on other tickets:
+//! `preedit_active` (T-3.2 IME) and `agent_turn_active` (EPIC-5 agent loop) read
+//! `false` until those land. See session.rs and the ticket Notes.
 
 use aterm_core::InputMode;
+use aterm_ui::{KeyPress, Mods, NamedKey};
 
 /// The routing-relevant classification of a key event. The session maps a winit key
 /// to one of these; everything routing cares about is captured here.
@@ -125,6 +126,127 @@ pub fn decide(key: KeyInput, ctx: &RoutingContext) -> Disposition {
     }
     // 7. Ordinary editing of the input line.
     Disposition::Edit
+}
+
+/// The key half of a [`KeyBinding`]: either a logical character (matched against
+/// [`KeyPress::ch`], e.g. `/`) or a named key (matched against [`KeyPress::named`],
+/// e.g. Enter/Tab).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindKey {
+    /// A logical character; matched case-insensitively so a `cmd+k` spec fires on
+    /// the `k` the OS reports (it does not require the spec to predict the case).
+    Char(char),
+    /// A named key.
+    Named(NamedKey),
+}
+
+/// A configurable key chord - currently just the mode-toggle hotkey (ticket T-3.3),
+/// default `Cmd-/`. Rebindable via config: the `ATERM_TOGGLE_KEY` env override
+/// today (e.g. `ctrl+t`), the `config.toml` loader later (EPIC-8).
+///
+/// Matching is **exact on modifiers**: every required modifier must be held and no
+/// others, so `Cmd-/` does not also fire on `Cmd-Shift-/` (which is `Cmd-?`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyBinding {
+    pub key: BindKey,
+    pub mods: Mods,
+}
+
+impl KeyBinding {
+    /// The dossier default toggle chord: `Cmd-/` (rejecting `Ctrl-Space` = macOS
+    /// IME switch and `Cmd-.` = SIGINT muscle memory; see the ticket).
+    #[must_use]
+    pub fn default_toggle() -> Self {
+        Self {
+            key: BindKey::Char('/'),
+            mods: Mods {
+                cmd: true,
+                ..Mods::default()
+            },
+        }
+    }
+
+    /// Whether `key` is exactly this chord: the modifiers match exactly and the base
+    /// key matches (a character case-insensitively, a named key exactly).
+    #[must_use]
+    pub fn matches(&self, key: &KeyPress) -> bool {
+        self.mods == key.mods
+            && match self.key {
+                BindKey::Char(c) => key.ch.is_some_and(|k| k.eq_ignore_ascii_case(&c)),
+                BindKey::Named(n) => key.named == Some(n),
+            }
+    }
+
+    /// Parse a chord like `"cmd+/"`, `"ctrl+t"`, or `"alt+enter"`: case-insensitive,
+    /// `+`-separated. Modifier tokens: `cmd`/`super`/`meta`/`win`, `alt`/`opt`/
+    /// `option`, `ctrl`/`control`, `shift`. The one remaining token is the base key:
+    /// a named key (`enter`/`return`, `tab`, `escape`/`esc`, `space`) or a single
+    /// character. Returns `None` on an empty, ambiguous, or unrecognized spec. (The
+    /// full named-key vocabulary arrives with the EPIC-8 config loader; this covers
+    /// reasonable toggle chords + the env override.)
+    #[must_use]
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut mods = Mods::default();
+        let mut key: Option<BindKey> = None;
+        for tok in spec.split('+') {
+            let t = tok.trim();
+            if t.is_empty() {
+                return None;
+            }
+            match t.to_ascii_lowercase().as_str() {
+                "cmd" | "super" | "meta" | "win" => mods.cmd = true,
+                "alt" | "opt" | "option" => mods.alt = true,
+                "ctrl" | "control" => mods.ctrl = true,
+                "shift" => mods.shift = true,
+                lower => {
+                    if key.is_some() {
+                        return None; // more than one base key
+                    }
+                    key = Some(parse_bindkey(t, lower)?);
+                }
+            }
+        }
+        Some(Self { key: key?, mods })
+    }
+}
+
+/// Parse the base-key token of a [`KeyBinding`]: a known named key by word, else a
+/// single character (`orig` preserves the user's case for the char).
+fn parse_bindkey(orig: &str, lower: &str) -> Option<BindKey> {
+    let named = match lower {
+        "enter" | "return" => Some(NamedKey::Enter),
+        "tab" => Some(NamedKey::Tab),
+        "escape" | "esc" => Some(NamedKey::Escape),
+        "space" => Some(NamedKey::Space),
+        _ => None,
+    };
+    if let Some(n) = named {
+        return Some(BindKey::Named(n));
+    }
+    let mut chars = orig.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None; // multi-char token that is not a known key name
+    }
+    Some(BindKey::Char(c))
+}
+
+/// Classify a [`KeyPress`] into the neutral [`KeyInput`] the brain decides on, given
+/// the configured mode-toggle `binding`. The toggle binding wins first (so its chord
+/// is a toggle even though it carries a character); then Enter carries the Opt/Alt
+/// modifier (the one-shot-to-agent), Escape is itself, and everything else - now
+/// including a freed `Tab` - is `Other` (ordinary editing, or raw passthrough by
+/// context). This is the winit->routing boundary the modifier seam unblocks.
+#[must_use]
+pub fn classify(key: &KeyPress, binding: &KeyBinding) -> KeyInput {
+    if binding.matches(key) {
+        return KeyInput::ToggleHotkey;
+    }
+    match key.named {
+        Some(NamedKey::Enter) => KeyInput::Enter { alt: key.mods.alt },
+        Some(NamedKey::Escape) => KeyInput::Escape,
+        _ => KeyInput::Other,
+    }
 }
 
 #[cfg(test)]
@@ -306,5 +428,112 @@ mod tests {
             decide(KeyInput::Enter { alt: true }, &ctx),
             Disposition::SubmitAgent
         );
+    }
+
+    // --- The winit->routing classification (the modifier seam, T-3.3) ---
+
+    fn mods(cmd: bool, alt: bool, ctrl: bool, shift: bool) -> Mods {
+        Mods {
+            cmd,
+            alt,
+            ctrl,
+            shift,
+        }
+    }
+
+    fn kp(named: Option<NamedKey>, ch: Option<char>, mods: Mods) -> KeyPress<'static> {
+        KeyPress {
+            named,
+            ch,
+            text: None,
+            mods,
+        }
+    }
+
+    #[test]
+    fn default_toggle_chord_is_cmd_slash() {
+        // AC1: the dossier default toggle is `Cmd-/` and classifies as ToggleHotkey.
+        let binding = KeyBinding::default_toggle();
+        let cmd_slash = kp(None, Some('/'), mods(true, false, false, false));
+        assert!(binding.matches(&cmd_slash));
+        assert_eq!(classify(&cmd_slash, &binding), KeyInput::ToggleHotkey);
+        // A bare `/` (no Cmd) is ordinary input, never the toggle.
+        let bare_slash = kp(None, Some('/'), mods(false, false, false, false));
+        assert_eq!(classify(&bare_slash, &binding), KeyInput::Other);
+    }
+
+    #[test]
+    fn toggle_match_is_exact_on_modifiers() {
+        // `Cmd-Shift-/` (= `Cmd-?`) must NOT fire the `Cmd-/` toggle - exact mods.
+        let binding = KeyBinding::default_toggle();
+        let cmd_shift_slash = kp(None, Some('/'), mods(true, false, false, true));
+        assert!(!binding.matches(&cmd_shift_slash));
+        assert_eq!(classify(&cmd_shift_slash, &binding), KeyInput::Other);
+    }
+
+    #[test]
+    fn classify_reads_opt_enter_and_plain_enter() {
+        // AC3: Opt-Enter carries alt=true (one-shot to agent); plain Enter alt=false.
+        let binding = KeyBinding::default_toggle();
+        let opt_enter = kp(Some(NamedKey::Enter), None, mods(false, true, false, false));
+        assert_eq!(
+            classify(&opt_enter, &binding),
+            KeyInput::Enter { alt: true }
+        );
+        let enter = kp(
+            Some(NamedKey::Enter),
+            None,
+            mods(false, false, false, false),
+        );
+        assert_eq!(classify(&enter, &binding), KeyInput::Enter { alt: false });
+    }
+
+    #[test]
+    fn classify_frees_tab_and_passes_escape() {
+        // `Tab` is freed (no longer the placeholder toggle): it is ordinary `Other`.
+        let binding = KeyBinding::default_toggle();
+        let tab = kp(Some(NamedKey::Tab), None, mods(false, false, false, false));
+        assert_eq!(classify(&tab, &binding), KeyInput::Other);
+        let esc = kp(
+            Some(NamedKey::Escape),
+            None,
+            mods(false, false, false, false),
+        );
+        assert_eq!(classify(&esc, &binding), KeyInput::Escape);
+    }
+
+    #[test]
+    fn rebinding_the_toggle_changes_the_chord() {
+        // AC: the toggle is rebindable. With `ctrl+t` bound, Ctrl-T toggles and the
+        // old `Cmd-/` no longer does.
+        let binding = KeyBinding::parse("ctrl+t").expect("ctrl+t parses");
+        let ctrl_t = kp(None, Some('t'), mods(false, false, true, false));
+        assert_eq!(classify(&ctrl_t, &binding), KeyInput::ToggleHotkey);
+        let cmd_slash = kp(None, Some('/'), mods(true, false, false, false));
+        assert_eq!(classify(&cmd_slash, &binding), KeyInput::Other);
+    }
+
+    #[test]
+    fn binding_parse_round_trips_and_rejects_junk() {
+        assert_eq!(
+            KeyBinding::parse("cmd+/"),
+            Some(KeyBinding::default_toggle())
+        );
+        // Modifier order is irrelevant; a named base key is recognized.
+        assert_eq!(
+            KeyBinding::parse("alt+enter"),
+            Some(KeyBinding {
+                key: BindKey::Named(NamedKey::Enter),
+                mods: mods(false, true, false, false),
+            })
+        );
+        // Char match is case-insensitive, so `cmd+k` fires on the OS's lowercase `k`.
+        let k_binding = KeyBinding::parse("cmd+k").expect("cmd+k parses");
+        assert!(k_binding.matches(&kp(None, Some('k'), mods(true, false, false, false))));
+        // Rejections: empty, no base key, two base keys, dangling separators.
+        assert_eq!(KeyBinding::parse(""), None);
+        assert_eq!(KeyBinding::parse("cmd"), None);
+        assert_eq!(KeyBinding::parse("a+b"), None);
+        assert_eq!(KeyBinding::parse("cmd+"), None);
     }
 }

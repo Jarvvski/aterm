@@ -13,6 +13,15 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The mode-toggle hotkey and `Opt-Enter` work for real.** Pressing `Cmd-/` now flips the
+  input between Shell and Agent routing with the typed text preserved (the prompt glyph +
+  SHELL/AGENT chip change; the caret stays accent-blue) - it is the real chord now, not the
+  old `Tab` stand-in, so `Tab` is freed and again requests shell completion. `Opt-Enter`
+  sends the current line to the agent regardless of mode (the one-shot-to-agent). The toggle
+  chord is rebindable without a rebuild via the `ATERM_TOGGLE_KEY` env var (e.g.
+  `ATERM_TOGGLE_KEY=ctrl+t`); the full `config.toml` keybinding loader lands later. This is
+  carried by a new modifier-aware key seam, so the app finally sees Cmd/Opt/Ctrl/Shift on a
+  keystroke. (Ticket T-3.3.)
 - **The unified input box is drawn (the live command line + iA mode indicator).** aterm's
   single shell-first input field now renders as a persistent bottom footer: a hairline
   separates it from the timeline, a mode-carrying prompt glyph (a `❯` chevron for Shell, a

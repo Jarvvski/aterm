@@ -3,6 +3,8 @@
 
 use aterm_ui::ThemeKind;
 
+use crate::routing::KeyBinding;
+
 /// App configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -14,6 +16,10 @@ pub struct Config {
     /// default; the proven winit-driven present loop drives presentation until the
     /// link path is validated on real ProMotion hardware (ticket T-1.5 AC3).
     pub display_link: bool,
+    /// The mode-toggle hotkey (ticket T-3.3). Default `Cmd-/`; rebindable - via the
+    /// `ATERM_TOGGLE_KEY` env override today (e.g. `ctrl+t`), the `config.toml`
+    /// loader later (EPIC-8).
+    pub toggle_mode: KeyBinding,
 }
 
 impl Default for Config {
@@ -23,14 +29,17 @@ impl Default for Config {
             initial_cols: 120,
             initial_rows: 32,
             display_link: false,
+            toggle_mode: KeyBinding::default_toggle(),
         }
     }
 }
 
 impl Config {
-    /// Load configuration. Currently defaults, with one env override:
-    /// `ATERM_DISPLAY_LINK=1` opts into the CADisplayLink vsync clock so the
-    /// owner can validate it on hardware without a code change.
+    /// Load configuration. Currently defaults, with two env overrides:
+    /// `ATERM_DISPLAY_LINK=1` opts into the CADisplayLink vsync clock, and
+    /// `ATERM_TOGGLE_KEY` (e.g. `ctrl+t`) rebinds the mode-toggle hotkey - so the
+    /// owner can change either without a code change (the full `config.toml` loader
+    /// is EPIC-8).
     pub fn load() -> Self {
         let mut cfg = Self::default();
         if matches!(
@@ -38,6 +47,14 @@ impl Config {
             Ok("1") | Ok("true")
         ) {
             cfg.display_link = true;
+        }
+        if let Ok(spec) = std::env::var("ATERM_TOGGLE_KEY") {
+            match KeyBinding::parse(&spec) {
+                Some(binding) => cfg.toggle_mode = binding,
+                None => log::warn!(
+                    "ignoring invalid ATERM_TOGGLE_KEY={spec:?}; keeping the default toggle (Cmd-/)"
+                ),
+            }
         }
         cfg
     }

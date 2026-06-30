@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use aterm_core::{BlockList, Snapshot};
@@ -49,6 +49,35 @@ const WARM_WAKE: Duration = Duration::from_millis(4);
 /// beat. Drawn frames stay at zero while idle; this is a few cheap version reads a
 /// second, not a render. A true model→render wake mailbox is a clean follow-up.
 const IDLE_WAKE: Duration = Duration::from_millis(100);
+
+/// Keyboard modifier state at the time of a key press, in a renderer-neutral form
+/// so the host routes on plain bools rather than winit's `ModifiersState`. `cmd`
+/// is the macOS Command key (winit `SUPER`); `alt` is Option/Alt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Mods {
+    pub cmd: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+}
+
+/// One key press handed to [`UiCallbacks::on_key`]. The UI crate builds it from the
+/// winit `KeyEvent` plus the tracked modifier state, so the host routes input
+/// without depending on winit beyond the [`NamedKey`] re-export (ticket T-3.3).
+///
+/// - `named`: `Some` for a named key (Enter, Escape, Tab, arrows, ...).
+/// - `ch`: the logical character of a `Character` key (e.g. `/`), present
+///   regardless of whether the OS produced insertion `text` - macOS suppresses
+///   `text` under Command, so a `Cmd-/` chord is only visible via `ch` + `mods`.
+/// - `text`: the OS insertion string (`None` under command modifiers on macOS).
+/// - `mods`: the active modifier state.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyPress<'a> {
+    pub named: Option<NamedKey>,
+    pub ch: Option<char>,
+    pub text: Option<&'a str>,
+    pub mods: Mods,
+}
 
 /// Hooks the host app implements to drive the UI. All are optional-ish: the UI
 /// crate can run standalone with a no-op implementation ([`HeadlessCallbacks`]).
@@ -100,7 +129,10 @@ pub trait UiCallbacks {
     }
 
     /// A key was pressed; return bytes to forward to the PTY (Shell mode), if any.
-    fn on_key(&mut self, _text: Option<&str>, _named: Option<NamedKey>) -> Option<Vec<u8>> {
+    /// `key` carries the named key / logical character / insertion text and the
+    /// live modifier state, so the host can route the real `Cmd-/` toggle chord and
+    /// `Opt-Enter` (ticket T-3.3).
+    fn on_key(&mut self, _key: KeyPress<'_>) -> Option<Vec<u8>> {
         None
     }
 
@@ -196,6 +228,11 @@ pub struct AtermApp<C: UiCallbacks> {
     /// Instant of the previous present, for the recorder's `present_interval`
     /// (vsync-to-vsync delta). `None` until the first present.
     last_present_at: Option<Instant>,
+    /// The live keyboard modifier state, tracked from winit `ModifiersChanged` and
+    /// folded into each [`KeyPress`] (so the host sees `Cmd-/` / `Opt-Enter`;
+    /// ticket T-3.3). winit reports modifier transitions separately from key
+    /// presses, so we hold the latest here.
+    mods: ModifiersState,
 }
 
 impl<C: UiCallbacks> AtermApp<C> {
@@ -213,6 +250,7 @@ impl<C: UiCallbacks> AtermApp<C> {
             display_link: None,
             recorder: None,
             last_present_at: None,
+            mods: ModifiersState::empty(),
         }
     }
 
@@ -441,6 +479,13 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                // winit reports modifier transitions separately from key presses;
+                // hold the latest so the next `KeyPress` carries Cmd/Opt/Ctrl/Shift
+                // (ticket T-3.3). Not activity on its own - a bare modifier press
+                // never needs a repaint.
+                self.mods = modifiers.state();
+            }
             WindowEvent::ThemeChanged(t) => {
                 // The OS appearance changed: follow it live (re-resolves grid colors
                 // with no realloc, repaints) when in follow-system mode; otherwise
@@ -481,8 +526,25 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     Key::Named(n) => Some(*n),
                     _ => None,
                 };
+                // The logical character of a Character key (e.g. `/`), needed for
+                // the `Cmd-/` chord since macOS suppresses `text` under Command.
+                let ch = match &logical_key {
+                    Key::Character(s) => s.chars().next(),
+                    _ => None,
+                };
                 let txt = text.as_ref().map(|t| t.as_str());
-                if let Some(bytes) = self.callbacks.on_key(txt, named) {
+                let mods = Mods {
+                    cmd: self.mods.super_key(),
+                    alt: self.mods.alt_key(),
+                    ctrl: self.mods.control_key(),
+                    shift: self.mods.shift_key(),
+                };
+                if let Some(bytes) = self.callbacks.on_key(KeyPress {
+                    named,
+                    ch,
+                    text: txt,
+                    mods,
+                }) {
                     // Forwarding happens inside the callback (it owns the PTY);
                     // the returned bytes let a headless host observe input.
                     let _ = bytes;
