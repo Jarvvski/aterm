@@ -1,11 +1,24 @@
 //! The wgpu implementation of the [`Renderer`] seam.
 //!
-//! `GpuRenderer` owns the wgpu device/queue/surface and the instanced terminal-grid
-//! pipeline ([`crate::grid_render::GridRenderer`]). It clears every frame to the
-//! active theme's canvas color (the hard requirement) and draws the terminal grid
-//! snapshot through the atlas + instanced pipeline when one is supplied - the
-//! per-cell glyph fast-path that replaced the interim glyphon whole-buffer reshape
-//! (ticket T-1.8, the GPU half of T-1.6; the typing-lag cure).
+//! `GpuRenderer` owns the wgpu device/queue/surface and the shared [`GlyphAtlas`] (the
+//! T-4.6 hoist), and clears every frame to the active theme's canvas color (the hard
+//! requirement). It then draws ONE primary view through the atlas:
+//!
+//! - **The block timeline** ([`crate::timeline_render::TimelineRenderer`]) in normal
+//!   mode - finished + running command blocks from the published block model, styled to
+//!   the iA component spec (ticket T-4.6). The running block carries its live output
+//!   (the engine's incremental capture), so a streaming command shows in the timeline.
+//! - **The raw terminal grid** ([`crate::grid_render::GridRenderer`]) when a full-screen
+//!   app owns the screen (alt-screen, ADR-0007) or there is no engine (the headless
+//!   stand-in) - the per-cell instanced glyph fast-path (ticket T-1.8 / T-1.6).
+//!
+//! Both share one atlas + one rect/glyph pipeline pair; the timeline path is gated so an
+//! idle present allocates nothing (the 60fps floor, T-1.8).
+//!
+//! NOTE (T-3.6): the unified input box is a separate widget; the shell's pre-submit line
+//! echo lives there, not in the timeline. Until it lands, a command's typed text appears
+//! in the timeline once submitted (its block's command line), and the on-hardware iA
+//! visual review (AC5) is the owner-watched acceptance step for this render path.
 
 use std::sync::Arc;
 
@@ -30,8 +43,19 @@ pub struct GpuRenderer {
     /// draw through one atlas and one pair of pipelines.
     atlas: GlyphAtlas,
     /// The instanced terminal-grid front-end (bg/glyph instance build + version-gated
-    /// rebuild, ticket T-1.8); draws through the shared `atlas`.
+    /// rebuild, ticket T-1.8); draws through the shared `atlas`. The PRIMARY view in
+    /// `alt_screen` mode (a full-screen app owns the screen); the block timeline is the
+    /// primary view otherwise (T-4.6).
     grid: GridRenderer,
+    /// The block-timeline front-end (ticket T-4.6): the primary on-screen view in normal
+    /// (non-alt-screen) mode, drawing finished + running blocks from the block model
+    /// through the shared `atlas`.
+    timeline: crate::timeline_render::TimelineRenderer,
+    /// Idle gate for the timeline path: the `(snapshot version, scroll, viewport, theme,
+    /// alt)` signature last laid out + prepared. When unchanged, the per-frame
+    /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
+    /// instances are redrawn - so an idle present allocates nothing (the T-1.8 floor).
+    timeline_sig: Option<(u64, u64, u32, u32, u8, bool)>,
     /// Virtualized-timeline scroll position (ticket T-2.7). Auto-follows the bottom
     /// (the live-terminal default) until scroll input lands (EPIC-3).
     scroll: crate::timeline::Scroll,
@@ -40,6 +64,9 @@ pub struct GpuRenderer {
     /// [`GpuRenderer::visible_block_count`] for tests / a future status line. `0`
     /// until a block list is published.
     last_visible_blocks: usize,
+    /// Which front-end drew the last frame - so [`Self::last_glyph_draw_calls`] reports
+    /// the active path's counter (the timeline in normal mode, the grid in alt-screen).
+    drew_timeline: bool,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -103,6 +130,7 @@ impl GpuRenderer {
 
         let atlas = GlyphAtlas::new(&device, format);
         let grid = GridRenderer::new(&device);
+        let timeline = crate::timeline_render::TimelineRenderer::new(&device);
 
         Ok(Self {
             surface,
@@ -111,8 +139,11 @@ impl GpuRenderer {
             config,
             atlas,
             grid,
+            timeline,
+            timeline_sig: None,
             scroll: crate::timeline::Scroll::default(),
             last_visible_blocks: 0,
+            drew_timeline: false,
             _window: window,
             scale_factor,
         })
@@ -134,11 +165,16 @@ impl GpuRenderer {
         self.last_visible_blocks
     }
 
-    /// Glyph-layer draw calls from the last frame (ticket T-1.6 AC c: exactly 1 when
-    /// the grid has text). Exposed for tests / instrumentation.
+    /// Glyph-layer draw calls from the last frame (T-1.6 AC c: exactly 1 when the active
+    /// front-end has text). Reports whichever front-end drew last - the timeline in
+    /// normal mode, the grid in alt-screen. Exposed for tests / instrumentation.
     #[must_use]
     pub fn last_glyph_draw_calls(&self) -> u32 {
-        self.grid.last_glyph_draw_calls()
+        if self.drew_timeline {
+            self.timeline.last_glyph_draw_calls()
+        } else {
+            self.grid.last_glyph_draw_calls()
+        }
     }
 
     /// Render the snapshot grid (and always clear). Split out so `render` reads
@@ -154,41 +190,72 @@ impl GpuRenderer {
         let _indicator =
             crate::indicator::IntegrationIndicator::resolve(frame.integration, frame.theme);
 
-        // Virtualized-timeline bookkeeping (ticket T-2.7): count the blocks
-        // intersecting the viewport via the SumTree (O(log n), no allocation). The
-        // on-screen view stays the raw grid for now; drawing the timeline cards is
-        // T-4.6 (it consumes this geometry + the captured block output).
+        // Choose the primary view (ticket T-4.6). Normally the BLOCK TIMELINE is drawn
+        // (finished + running blocks from the block model - the running block carries
+        // its live output via the engine's incremental capture). The RAW GRID is drawn
+        // only when a full-screen app owns the screen (alt-screen, ADR-0007) or there is
+        // no engine (the headless / no-blocks stand-in).
         let alt_screen = frame.snapshot.is_some_and(|s| s.alt_screen);
         let viewport_rows = self.viewport_rows();
-        self.last_visible_blocks = match frame.blocks {
-            Some(blocks) => {
-                if !alt_screen {
-                    self.scroll
-                        .to_bottom(blocks.total_height_rows(), viewport_rows);
-                }
-                crate::timeline::visible_block_count(blocks, alt_screen, self.scroll, viewport_rows)
-            }
-            None => 0,
+        let draw_timeline = !alt_screen && frame.blocks.is_some();
+        self.drew_timeline = draw_timeline;
+        let size = crate::grid_render::FrameSize {
+            width: self.config.width,
+            height: self.config.height,
+            scale: self.scale_factor,
         };
 
-        // Build the grid instances BEFORE acquiring the surface texture - rebuilds
-        // only when the snapshot version / size / theme changed (the damage gate),
-        // and reuses the buffers with zero work + zero allocation otherwise.
+        // Build instances BEFORE acquiring the surface texture. Each front-end's rebuild
+        // is damage-gated and reuses its buffers with zero allocation when nothing
+        // changed (the steady-state present floor, T-1.8).
         {
             let _build = tracing::trace_span!("build").entered();
-            if let Some(snap) = frame.snapshot {
-                self.grid.prepare(
-                    &self.device,
-                    &self.queue,
-                    &mut self.atlas,
-                    snap,
-                    frame.theme,
-                    crate::grid_render::FrameSize {
-                        width: self.config.width,
-                        height: self.config.height,
-                        scale: self.scale_factor,
-                    },
+            if draw_timeline {
+                let blocks = frame.blocks.expect("draw_timeline implies blocks");
+                // Pin to the bottom (the live-terminal default) until scroll input lands
+                // (EPIC-3); the latest blocks + the running command's tail stay on screen.
+                self.scroll
+                    .to_bottom(blocks.total_height_rows(), viewport_rows);
+                self.last_visible_blocks =
+                    crate::timeline::visible_block_count(blocks, false, self.scroll, viewport_rows);
+                // Idle gate: `timeline::layout` allocates, so skip it (and the rebuild)
+                // when nothing drawn changed - an idle present then allocates nothing and
+                // simply redraws the prior timeline instances.
+                let sig = (
+                    frame.snapshot.map_or(0, |s| s.version),
+                    self.scroll.offset_rows,
+                    self.config.width,
+                    self.config.height,
+                    theme_kind_code(frame.theme),
+                    false,
                 );
+                if self.timeline_sig != Some(sig) {
+                    let layout = crate::timeline::layout(blocks, false, self.scroll, viewport_rows);
+                    self.timeline.prepare(
+                        &self.device,
+                        &self.queue,
+                        &mut self.atlas,
+                        &layout,
+                        frame.theme,
+                        size,
+                    );
+                    self.timeline_sig = Some(sig);
+                }
+            } else {
+                // Alt-screen surface or no-engine stand-in: the grid is the view.
+                self.last_visible_blocks = 0;
+                if let Some(snap) = frame.snapshot {
+                    self.grid.prepare(
+                        &self.device,
+                        &self.queue,
+                        &mut self.atlas,
+                        snap,
+                        frame.theme,
+                        size,
+                    );
+                }
+                // Force a timeline rebuild the next time we re-enter timeline mode.
+                self.timeline_sig = None;
             }
         }
 
@@ -236,10 +303,14 @@ impl GpuRenderer {
                     multiview_mask: None,
                 });
 
-                // Always call draw: it internally no-ops (and resets the
-                // glyph-draw-call counter to 0) when there are no instances, so the
-                // counter stays honest after a text frame is followed by a blank one.
-                self.grid.draw(&mut pass, &self.atlas);
+                // Draw the chosen front-end through the shared atlas. Each draw no-ops
+                // (and zeroes its own glyph-draw-call counter) when it has no instances,
+                // so the counter stays honest across mode switches and blank frames.
+                if draw_timeline {
+                    self.timeline.draw(&mut pass, &self.atlas);
+                } else {
+                    self.grid.draw(&mut pass, &self.atlas);
+                }
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -271,6 +342,16 @@ impl Renderer for GpuRenderer {
             }
             other => other,
         }
+    }
+}
+
+/// A 1-byte discriminant for the active theme, folded into the timeline idle-gate
+/// signature so a light<->dark switch forces a timeline rebuild (the two themes are the
+/// only palettes, and the rendered/effective palette is a pure function of the kind).
+fn theme_kind_code(theme: &aterm_tokens::Theme) -> u8 {
+    match theme.kind {
+        aterm_tokens::ThemeKind::Light => 0,
+        aterm_tokens::ThemeKind::Dark => 1,
     }
 }
 

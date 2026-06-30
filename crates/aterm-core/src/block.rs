@@ -134,27 +134,43 @@ impl Block {
     }
 
     /// The number of output rows actually shown when this block is rendered: capped
-    /// at [`COLLAPSED_OUTPUT_ROWS`] for a long block, else all of them (ticket T-2.7).
+    /// at [`COLLAPSED_OUTPUT_ROWS`] for a long FINISHED block, else all of them.
+    ///
+    /// The currently-RUNNING (active) block is never collapsed - it shows all of its
+    /// live output, like a live terminal, and the timeline pins to the bottom so the
+    /// latest output stays on screen (ticket T-4.6). Collapse is only for SETTLED
+    /// scrollback, so one finished `cargo build` cannot dominate the timeline (T-2.7).
     #[must_use]
     pub fn shown_output_rows(&self) -> u64 {
-        (self.output.len() as u64).min(COLLAPSED_OUTPUT_ROWS)
+        let n = self.output.len() as u64;
+        if self.is_running() {
+            n
+        } else {
+            n.min(COLLAPSED_OUTPUT_ROWS)
+        }
     }
 
-    /// `Some(hidden_row_count)` when this block's output is collapsed (more than
-    /// [`COLLAPSED_OUTPUT_ROWS`] rows captured), else `None`. Drives the
-    /// "... +N lines" affordance the timeline draws (ticket T-2.7, AC4).
+    /// `Some(hidden_row_count)` when this (FINISHED) block's output is collapsed (more
+    /// than [`COLLAPSED_OUTPUT_ROWS`] rows captured), else `None`. The running block is
+    /// never collapsed (it shows its live tail), so this is always `None` while running.
+    /// Drives the "... +N lines" affordance the timeline draws (ticket T-2.7, AC4).
     #[must_use]
     pub fn collapsed_hidden_rows(&self) -> Option<u64> {
+        if self.is_running() {
+            return None;
+        }
         let n = self.output.len() as u64;
         (n > COLLAPSED_OUTPUT_ROWS).then(|| n - COLLAPSED_OUTPUT_ROWS)
     }
 
     /// This block's height in *display* rows - what the timeline reserves and what
     /// the [`HeightIndex`] tracks, so the virtualized renderer's scroll geometry
-    /// matches what is drawn (ticket T-2.7). Equal to [`Self::height_rows`] until the
-    /// output exceeds [`COLLAPSED_OUTPUT_ROWS`], after which the block collapses to:
-    /// the command line + `COLLAPSED_OUTPUT_ROWS` shown rows + one "... +N lines"
-    /// affordance row. Collapsing HERE (not only in the renderer) keeps a single
+    /// matches what is drawn (ticket T-2.7). Equal to [`Self::height_rows`] until a
+    /// FINISHED block's output exceeds [`COLLAPSED_OUTPUT_ROWS`], after which it
+    /// collapses to: the command line + `COLLAPSED_OUTPUT_ROWS` shown rows + one
+    /// "... +N lines" affordance row. A RUNNING block never collapses (it shows its
+    /// full live output; ticket T-4.6), so its display height is always
+    /// [`Self::height_rows`]. Collapsing HERE (not only in the renderer) keeps a single
     /// coordinate space: `block_at` / `blocks_in_viewport` / scroll-to-block all agree
     /// with the drawn layout.
     #[must_use]
@@ -1072,6 +1088,52 @@ mod tests {
         // command + CAP shown + 1 affordance row, NOT 1 + long_rows.
         assert_eq!(long.display_height_rows(), 1 + COLLAPSED_OUTPUT_ROWS + 1);
         assert!(long.display_height_rows() < long.height_rows());
+    }
+
+    #[test]
+    fn running_block_shows_full_live_output_without_collapsing() {
+        // T-4.6: the RUNNING (active) block is never collapsed - it shows all of its
+        // live output so the bottom-pinned timeline keeps the latest output on screen
+        // (watching `cargo build` shows the tail, not a frozen head + a growing counter).
+        // The SAME output on a FINISHED block collapses (settled scrollback).
+        let long_rows = (COLLAPSED_OUTPUT_ROWS + 50) as usize;
+
+        // A running block: prompt + output start, NO command-done.
+        let mut running = BlockList::new();
+        let mut rs = BlockSegmenter::new();
+        rs.apply(&a(), 0, &mut running);
+        rs.apply(&c(), 4, &mut running);
+        running.set_block_output(0, vec![row(80); long_rows]);
+        let rb = running.get(0).unwrap();
+        assert!(rb.is_running(), "no command-done -> still running");
+        assert_eq!(
+            rb.collapsed_hidden_rows(),
+            None,
+            "a running block never collapses"
+        );
+        assert_eq!(
+            rb.shown_output_rows(),
+            long_rows as u64,
+            "a running block shows ALL its live output"
+        );
+        assert_eq!(
+            rb.display_height_rows(),
+            rb.height_rows(),
+            "a running block's display height is its full height"
+        );
+
+        // The same output on a finished block collapses to the cap + affordance.
+        let mut finished = BlockList::new();
+        let mut fs = BlockSegmenter::new();
+        fs.apply(&a(), 0, &mut finished);
+        fs.apply(&c(), 4, &mut finished);
+        fs.apply(&d(0), 40, &mut finished);
+        finished.set_block_output(0, vec![row(80); long_rows]);
+        let fb = finished.get(0).unwrap();
+        assert!(!fb.is_running());
+        assert_eq!(fb.shown_output_rows(), COLLAPSED_OUTPUT_ROWS);
+        assert_eq!(fb.collapsed_hidden_rows(), Some(50));
+        assert_eq!(fb.display_height_rows(), 1 + COLLAPSED_OUTPUT_ROWS + 1);
     }
 
     #[test]
