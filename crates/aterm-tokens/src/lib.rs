@@ -5,12 +5,23 @@
 //! identical to that file; the doc owns intent, the toml owns values, this crate
 //! owns the typed surface the renderer consumes.
 //!
-//! OWNER CONFIRMATION REQUIRED: `accent_primary` (#1A93E8 light / #4DA6F0 dark)
-//! is DERIVED + WCAG-checked, NOT sampled from the live iA Writer app. Treat the
-//! accent blue (and all contrast claims) as provisional until reconciled against
-//! a final palette with a real WCAG library. When `docs/design/tokens.toml`
-//! changes, re-sync these consts (ideally via a future `build.rs` codegen pass —
-//! TODO(ticket EPIC-4): generate this module from tokens.toml at build time).
+//! The palette is the warm two-theme set from the vision mock adopted as the UI
+//! north star in ADR-0011 (`docs/design/vision-mock/AtermWindow.dc.html`): a warm
+//! near-black dark and a warm "paper" light. It carries a two-accent mode model —
+//! shell blue (`accent_primary`) plus agent purple (`accent_agent`), resolved by
+//! [`SemanticColors::mode_accent`] — an elevated-surface tone (`bg_elev`) for
+//! popovers/menus, and surface tints (`hairline`, `selection_bg`, the weak fills)
+//! that the mock defines as alpha over the canvas and this crate stores
+//! pre-composited to opaque (they only ever sit on canvas, and opaque keeps the
+//! WCAG/legibility math and the renderer's background rects correct). The old
+//! "derived accent, owner-confirm" note is resolved by ADR-0011: the accent is
+//! now the mock's blue by owner decision.
+//!
+//! Every contrast claim is recomputed against these hexes by the `wcag_*` tests;
+//! the one intentional sub-AA pair (`fg_muted`, the faint meta tone) is annotated
+//! there with its permitted use. When `docs/design/tokens.toml` changes, re-sync
+//! these consts (a future `build.rs` codegen pass could generate this module from
+//! the toml).
 
 #![allow(clippy::unreadable_literal)]
 
@@ -211,12 +222,23 @@ pub struct SemanticColors {
     pub bg_canvas: Rgba,
     pub bg_surface: Rgba,
     pub bg_surface_alt: Rgba,
+    /// Elevated surface — popovers, the gate approve-menu, the completion menu
+    /// (the mock's `--bg-elev`). The mock has a single tone above canvas, so
+    /// `bg_surface` shares this value; they stay distinct tokens so downstream
+    /// surfaces can diverge without another token migration.
+    pub bg_elev: Rgba,
     pub fg_primary: Rgba,
     pub fg_secondary: Rgba,
+    /// The faint meta tone (the mock's `ink-faint`): timestamps, exit captions,
+    /// placeholder text, the "+N lines" affordance. Intentionally sub-AA — see
+    /// the `fg_muted_is_intentionally_sub_aa` test.
     pub fg_muted: Rgba,
     pub fg_faint: Rgba,
-    /// DERIVED accent blue — owner confirmation pending (see crate docs).
+    /// Shell-mode accent (blue). Pair with `accent_agent` via
+    /// [`SemanticColors::mode_accent`].
     pub accent_primary: Rgba,
+    /// Agent-mode accent (purple) — the mock's `--agent`, sanctioned by ADR-0011.
+    pub accent_agent: Rgba,
     pub accent_primary_text: Rgba,
     pub accent_primary_weak: Rgba,
     pub hairline: Rgba,
@@ -224,8 +246,38 @@ pub struct SemanticColors {
     pub selection_bg: Rgba,
     pub success: Rgba,
     pub caution: Rgba,
+    /// Low-emphasis caution fill — the gate card background (the mock's
+    /// `--warn-bg`). Stored with alpha; composited over the canvas.
+    pub caution_weak: Rgba,
     pub danger: Rgba,
     pub info: Rgba,
+}
+
+/// Which input mode an accent resolves for. Mirrors the domain `Mode (Shell |
+/// Agent)` (`docs/agents/domain.md`); defined here rather than imported from
+/// `aterm-core` because `aterm-tokens` is a leaf crate. The app maps its
+/// `InputModel` mode onto this to ask a theme for "the current mode color".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Mode {
+    /// Enter routes to the live shell — accent is `accent_primary` (blue).
+    Shell,
+    /// Enter routes to the agent loop — accent is `accent_agent` (purple).
+    Agent,
+}
+
+impl SemanticColors {
+    /// The accent for the current input mode: `Shell -> accent_primary` (blue),
+    /// `Agent -> accent_agent` (purple). This is the mock's `--mode` custom
+    /// property: the prompt glyph, caret tint, and mode chip ask for the resolved
+    /// mode color instead of branching on the mode themselves. The two-accent
+    /// model is sanctioned by ADR-0011 (relaxing the old one-accent rule).
+    #[must_use]
+    pub const fn mode_accent(&self, mode: Mode) -> Rgba {
+        match mode {
+            Mode::Shell => self.accent_primary,
+            Mode::Agent => self.accent_agent,
+        }
+    }
 }
 
 /// ANSI 16-color palette, index 0..=15. Mirrors `[ansi.*]` in tokens.toml.
@@ -375,41 +427,51 @@ pub struct Theme {
 pub const LIGHT: Theme = Theme {
     kind: ThemeKind::Light,
     colors: SemanticColors {
-        bg_canvas: Rgba::hex(0xFAF9F6),
-        bg_surface: Rgba::hex(0xF1F0EC),
-        bg_surface_alt: Rgba::hex(0xE9E7E1),
-        fg_primary: Rgba::hex(0x2A2A28),
-        fg_secondary: Rgba::hex(0x5C5B57),
-        fg_muted: Rgba::hex(0x8A8984),
-        fg_faint: Rgba::hex(0xB5B4AE),
-        accent_primary: Rgba::hex(0x1A93E8), // DERIVED — owner confirm
-        accent_primary_text: Rgba::hex(0x1577C2),
-        accent_primary_weak: Rgba::hex(0xD6EAFB),
-        hairline: Rgba::hex(0xE0DED8),
-        hairline_strong: Rgba::hex(0xC9C7C0),
-        selection_bg: Rgba::hex(0xCFE3F7),
-        success: Rgba::hex(0x1E8E5A),
-        caution: Rgba::hex(0xB0820E),
-        danger: Rgba::hex(0xC2185B),
-        info: Rgba::hex(0x1A93E8),
+        bg_canvas: Rgba::hex(0xFAF7EF),           // --bg
+        bg_surface: Rgba::hex(0xF2EDE1),          // = bg_elev (the mock's one raise)
+        bg_surface_alt: Rgba::hex(0xE9E2D1),      // derived further raise (hover/output)
+        bg_elev: Rgba::hex(0xF2EDE1),             // --bg-elev
+        fg_primary: Rgba::hex(0x26231B),          // --ink
+        fg_secondary: Rgba::hex(0x6C6555),        // --ink-dim
+        fg_muted: Rgba::hex(0xA89F8C),            // --ink-faint (faint meta; sub-AA)
+        fg_faint: Rgba::hex(0xBCB4A3),            // derived fainter step (disabled)
+        accent_primary: Rgba::hex(0x2F7DC2),      // --accent
+        accent_agent: Rgba::hex(0x7458BD),        // --agent
+        accent_primary_text: Rgba::hex(0x2B73B4), // darker accent, 4.65:1 (AA body)
+        // The mock's alpha tints, pre-composited over the canvas (they only ever
+        // sit on canvas). Opaque so contrast/legibility math and the renderer's
+        // background rects behave exactly as the pre-reskin tokens did.
+        accent_primary_weak: Rgba::hex(0xE2E8EA), // accent @ 12% over canvas
+        hairline: Rgba::hex(0xE5E2DA),            // ink @ 10% over canvas (--hairline)
+        hairline_strong: Rgba::hex(0xD4D1C9),     // ink @ 18% (section dividers)
+        selection_bg: Rgba::hex(0xC5D7E3),        // accent @ 26% over canvas
+        success: Rgba::hex(0x5C8A56),             // --ok
+        caution: Rgba::hex(0xB57D2C),             // --warn
+        caution_weak: Rgba::hex(0xF4EDDF),        // warn @ 8% over canvas (--warn-bg)
+        danger: Rgba::hex(0xBF5A40),              // --err
+        info: Rgba::hex(0x2F7DC2),                // = accent_primary
     },
+    // ANSI re-tuned to the warm family (structure per T-4.2; hues warmed). On light
+    // "paper" the base colors carry (index 7/15 are dark foregrounds), and the light
+    // brights (cyan/yellow/green) sit sub-3:1 by design — the renderer's light
+    // legibility remap lifts them. Eyeball vs real output is deferred to EPIC-7.
     ansi: AnsiPalette {
-        black: Rgba::hex(0x2A2A28),
-        red: Rgba::hex(0xC30771),
-        green: Rgba::hex(0x10A778),
-        yellow: Rgba::hex(0xA8800E),
-        blue: Rgba::hex(0x1A6FB0),
-        magenta: Rgba::hex(0x7C3F9E),
-        cyan: Rgba::hex(0x138D9E),
-        white: Rgba::hex(0x5C5B57),
-        bright_black: Rgba::hex(0x5C5B57),
-        bright_red: Rgba::hex(0xE0306F),
-        bright_green: Rgba::hex(0x1EB886),
-        bright_yellow: Rgba::hex(0xC39A14),
-        bright_blue: Rgba::hex(0x1A93E8),
-        bright_magenta: Rgba::hex(0x9B5BC0),
-        bright_cyan: Rgba::hex(0x20A5BA),
-        bright_white: Rgba::hex(0x2A2A28),
+        black: Rgba::hex(0x26231B),
+        red: Rgba::hex(0xB0502F),
+        green: Rgba::hex(0x4E7D48),
+        yellow: Rgba::hex(0x9C6A22),
+        blue: Rgba::hex(0x2C6EA9),
+        magenta: Rgba::hex(0x63499F),
+        cyan: Rgba::hex(0x2F7D74),
+        white: Rgba::hex(0x6C6555),
+        bright_black: Rgba::hex(0xA89F8C),
+        bright_red: Rgba::hex(0xC96A44),
+        bright_green: Rgba::hex(0x77A56A),
+        bright_yellow: Rgba::hex(0xDCB45A),
+        bright_blue: Rgba::hex(0x3D88CC),
+        bright_magenta: Rgba::hex(0x8F74CF),
+        bright_cyan: Rgba::hex(0x57C3B6),
+        bright_white: Rgba::hex(0x26231B),
     },
 };
 
@@ -417,41 +479,50 @@ pub const LIGHT: Theme = Theme {
 pub const DARK: Theme = Theme {
     kind: ThemeKind::Dark,
     colors: SemanticColors {
-        bg_canvas: Rgba::hex(0x1C1C1C),
-        bg_surface: Rgba::hex(0x262626),
-        bg_surface_alt: Rgba::hex(0x303030),
-        fg_primary: Rgba::hex(0xE6E5E1),
-        fg_secondary: Rgba::hex(0xB8B7B2),
-        fg_muted: Rgba::hex(0x7A7A75),
-        fg_faint: Rgba::hex(0x4A4A46),
-        accent_primary: Rgba::hex(0x4DA6F0), // DERIVED — owner confirm
-        accent_primary_text: Rgba::hex(0x4DA6F0),
-        accent_primary_weak: Rgba::hex(0x1E3A52),
-        hairline: Rgba::hex(0x343433),
-        hairline_strong: Rgba::hex(0x454544),
-        selection_bg: Rgba::hex(0x34465A),
-        success: Rgba::hex(0x5FD7A7),
-        caution: Rgba::hex(0xE0B341),
-        danger: Rgba::hex(0xE85A95),
-        info: Rgba::hex(0x4DA6F0),
+        bg_canvas: Rgba::hex(0x1B1915),           // --bg
+        bg_surface: Rgba::hex(0x221F19),          // = bg_elev (the mock's one raise)
+        bg_surface_alt: Rgba::hex(0x2B2820),      // derived further raise (hover/output)
+        bg_elev: Rgba::hex(0x221F19),             // --bg-elev
+        fg_primary: Rgba::hex(0xECE6D8),          // --ink
+        fg_secondary: Rgba::hex(0x9A9382),        // --ink-dim
+        fg_muted: Rgba::hex(0x5E584B),            // --ink-faint (faint meta; sub-AA)
+        fg_faint: Rgba::hex(0x4A453B),            // derived fainter step (disabled)
+        accent_primary: Rgba::hex(0x3D88CC),      // --accent
+        accent_agent: Rgba::hex(0x9D86D6),        // --agent
+        accent_primary_text: Rgba::hex(0x3D88CC), // = accent_primary, 4.67:1 (AA body)
+        // The mock's alpha tints, pre-composited over the canvas (they only ever
+        // sit on canvas). Opaque so contrast/legibility math and the renderer's
+        // background rects behave exactly as the pre-reskin tokens did.
+        accent_primary_weak: Rgba::hex(0x1F262B), // accent @ 12% over canvas
+        hairline: Rgba::hex(0x2D2A26),            // ink @ 8.5% over canvas (--hairline)
+        hairline_strong: Rgba::hex(0x3C3A34),     // ink @ 16% (section dividers)
+        selection_bg: Rgba::hex(0x243645),        // accent @ 26% over canvas
+        success: Rgba::hex(0x82AC79),             // --ok
+        caution: Rgba::hex(0xD59A4A),             // --warn
+        caution_weak: Rgba::hex(0x2C251A),        // warn @ 9% over canvas (--warn-bg)
+        danger: Rgba::hex(0xD47257),              // --err
+        info: Rgba::hex(0x3D88CC),                // = accent_primary
     },
+    // ANSI re-tuned to the warm family (structure per T-4.2; hues warmed). On the
+    // warm near-black canvas every entry is comfortably legible; brights are the
+    // lighter/more-saturated siblings. Eyeball vs real output is deferred to EPIC-7.
     ansi: AnsiPalette {
-        black: Rgba::hex(0x1C1C1C),
-        red: Rgba::hex(0xE85A95),
-        green: Rgba::hex(0x5FD7A7),
-        yellow: Rgba::hex(0xE0B341),
-        blue: Rgba::hex(0x4DA6F0),
-        magenta: Rgba::hex(0xB893BE),
-        cyan: Rgba::hex(0x4FB8CC),
-        white: Rgba::hex(0xE6E5E1),
-        bright_black: Rgba::hex(0x5A5A55),
-        bright_red: Rgba::hex(0xF277A8),
-        bright_green: Rgba::hex(0x7DE6BC),
-        bright_yellow: Rgba::hex(0xF3E430),
-        bright_blue: Rgba::hex(0x74BFF7),
-        bright_magenta: Rgba::hex(0xCBAAD0),
-        bright_cyan: Rgba::hex(0x6FCFE0),
-        bright_white: Rgba::hex(0xFFFFFF),
+        black: Rgba::hex(0x1B1915),
+        red: Rgba::hex(0xD06E54),
+        green: Rgba::hex(0x85B078),
+        yellow: Rgba::hex(0xD2A15A),
+        blue: Rgba::hex(0x4D8FCA),
+        magenta: Rgba::hex(0xA98FD6),
+        cyan: Rgba::hex(0x6BB0A6),
+        white: Rgba::hex(0xCFC8B8),
+        bright_black: Rgba::hex(0x5E584B),
+        bright_red: Rgba::hex(0xE08A70),
+        bright_green: Rgba::hex(0x9CC590),
+        bright_yellow: Rgba::hex(0xE6B56A),
+        bright_blue: Rgba::hex(0x6BA6DD),
+        bright_magenta: Rgba::hex(0xBBA6E6),
+        bright_cyan: Rgba::hex(0x8FC9BF),
+        bright_white: Rgba::hex(0xECE6D8),
     },
 };
 
@@ -462,6 +533,13 @@ impl Theme {
             ThemeKind::Light => &LIGHT,
             ThemeKind::Dark => &DARK,
         }
+    }
+
+    /// The resolved mode accent for this theme (see
+    /// [`SemanticColors::mode_accent`]).
+    #[must_use]
+    pub const fn mode_accent(&self, mode: Mode) -> Rgba {
+        self.colors.mode_accent(mode)
     }
 }
 
@@ -622,7 +700,7 @@ mod tests {
         assert_eq!(Theme::for_kind(ThemeKind::Dark).kind, ThemeKind::Dark);
         assert_eq!(
             Theme::for_kind(ThemeKind::Light).colors.bg_canvas,
-            Rgba::hex(0xFAF9F6)
+            Rgba::hex(0xFAF7EF)
         );
     }
 
@@ -634,8 +712,8 @@ mod tests {
         let dark = Theme::for_kind(ThemeKind::Dark);
         assert_ne!(light.colors.bg_canvas, dark.colors.bg_canvas);
         assert_ne!(light.colors.fg_primary, dark.colors.fg_primary);
-        assert_eq!(light.colors.fg_primary, Rgba::hex(0x2A2A28));
-        assert_eq!(dark.colors.fg_primary, Rgba::hex(0xE6E5E1));
+        assert_eq!(light.colors.fg_primary, Rgba::hex(0x26231B));
+        assert_eq!(dark.colors.fg_primary, Rgba::hex(0xECE6D8));
     }
 
     #[test]
@@ -656,34 +734,103 @@ mod tests {
 
     #[test]
     fn wcag_contrast_key_pairs_meet_thresholds() {
-        // AC: assert WCAG contrast for key pairs using a REAL contrast computation
-        // (the dossier ratios were estimates). For BOTH themes:
-        //   - fg.primary on bg.canvas   >= 7:1  (WCAG AAA body text)
-        //   - fg.secondary on bg.canvas >= 4.5:1 (WCAG AA body text)
-        //   - accent.primary on bg.canvas >= 3:1 (WCAG AA large-text / UI)
-        // The accent is the tightest pair (the derived blue is provisional, owner
-        // confirm pending) and is exactly why the >=3:1 UI bar is the one asserted
-        // for it; `accent_primary_text` is the separate AA-small-text variant.
+        // AC: recompute WCAG contrast for the warm-palette key pairs with a REAL
+        // computation (the pre-reskin ratios were estimates). For BOTH themes,
+        // every ratio below is measured against the new mock hexes:
+        //   - fg.primary on canvas          >= 7:1   (AAA body)
+        //   - fg.secondary on canvas        >= 4.5:1 (AA body)
+        //   - accent.primary_text on canvas >= 4.5:1 (AA small text — its whole job)
+        //   - accent.primary / accent.agent >= 3:1   (AA large/UI: caret, glyph, chip)
+        //   - success / caution / danger    >= 3:1   (AA large/UI: gutter, gate, chip)
+        // The one intentional exception (fg_muted, sub-AA) is asserted separately in
+        // `fg_muted_is_intentionally_sub_aa`.
         for theme in [&LIGHT, &DARK] {
             let c = &theme.colors;
-            let fg_primary = contrast_ratio(c.fg_primary, c.bg_canvas);
-            let fg_secondary = contrast_ratio(c.fg_secondary, c.bg_canvas);
-            let accent = contrast_ratio(c.accent_primary, c.bg_canvas);
+            let bg = c.bg_canvas;
+            let aaa_body = [("fg_primary", c.fg_primary)];
+            let aa_body = [
+                ("fg_secondary", c.fg_secondary),
+                ("accent_primary_text", c.accent_primary_text),
+            ];
+            let aa_ui = [
+                ("accent_primary", c.accent_primary),
+                ("accent_agent", c.accent_agent),
+                ("success", c.success),
+                ("caution", c.caution),
+                ("danger", c.danger),
+            ];
+            for (name, col) in aaa_body {
+                let r = contrast_ratio(col, bg);
+                assert!(
+                    r >= 7.0,
+                    "{:?}: {name} on canvas is {r:.2}:1, want >= 7:1 (AAA)",
+                    theme.kind
+                );
+            }
+            for (name, col) in aa_body {
+                let r = contrast_ratio(col, bg);
+                assert!(
+                    r >= 4.5,
+                    "{:?}: {name} on canvas is {r:.2}:1, want >= 4.5:1 (AA body)",
+                    theme.kind
+                );
+            }
+            for (name, col) in aa_ui {
+                let r = contrast_ratio(col, bg);
+                assert!(
+                    r >= 3.0,
+                    "{:?}: {name} on canvas is {r:.2}:1, want >= 3:1 (AA large/UI)",
+                    theme.kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fg_muted_is_intentionally_sub_aa() {
+        // The mock's faint ink tone (`--ink-faint`) is deliberately below the 3:1
+        // UI floor: it carries only de-emphasized, non-essential meta — timestamps,
+        // exit captions, placeholder text, the "+N lines" affordance — never text
+        // that is the sole carrier of essential information. Recorded here so the
+        // sub-AA choice is explicit and reviewed, not accidental (ADR-0011 / T-9.1).
+        // If a future palette lifts it past 3:1, promote it and delete this guard.
+        for theme in [&LIGHT, &DARK] {
+            let r = contrast_ratio(theme.colors.fg_muted, theme.colors.bg_canvas);
             assert!(
-                fg_primary >= 7.0,
-                "{:?}: fg_primary on bg_canvas is {fg_primary:.2}:1, want >= 7:1 (AAA)",
+                r < 3.0,
+                "{:?}: fg_muted on canvas is {r:.2}:1 — it now clears 3:1; promote it \
+                 and drop this annotation",
                 theme.kind
             );
-            assert!(
-                fg_secondary >= 4.5,
-                "{:?}: fg_secondary on bg_canvas is {fg_secondary:.2}:1, want >= 4.5:1 (AA)",
+        }
+    }
+
+    #[test]
+    fn mode_accent_resolves_per_mode_and_theme() {
+        // AC: the "current mode accent" resolver returns shell->primary,
+        // agent->agent, for both modes and both themes, and the two accents differ.
+        for theme in [&LIGHT, &DARK] {
+            let c = &theme.colors;
+            assert_eq!(
+                c.mode_accent(Mode::Shell),
+                c.accent_primary,
+                "{:?} shell",
                 theme.kind
             );
-            assert!(
-                accent >= 3.0,
-                "{:?}: accent_primary on bg_canvas is {accent:.2}:1, want >= 3:1 (AA large/UI)",
+            assert_eq!(
+                c.mode_accent(Mode::Agent),
+                c.accent_agent,
+                "{:?} agent",
                 theme.kind
             );
+            assert_ne!(
+                c.accent_primary, c.accent_agent,
+                "{:?}: the two accents differ",
+                theme.kind
+            );
+            // The Theme wrapper delegates to the same resolver.
+            assert_eq!(theme.mode_accent(Mode::Shell), c.accent_primary);
+            assert_eq!(theme.mode_accent(Mode::Agent), c.accent_agent);
         }
     }
 
@@ -699,10 +846,10 @@ mod tests {
         // Anchor the low-16 path through the public `indexed` entry to ground-truth
         // dossier hex (NOT to `by_index`, which would be tautological), so a
         // mis-wired theme slot is actually caught.
-        assert_eq!(LIGHT.ansi.indexed(2), Rgba::hex(0x10A778)); // light green
-        assert_eq!(LIGHT.ansi.indexed(12), Rgba::hex(0x1A93E8)); // light bright_blue
-        assert_eq!(DARK.ansi.indexed(1), Rgba::hex(0xE85A95)); // dark red
-        assert_eq!(DARK.ansi.indexed(11), Rgba::hex(0xF3E430)); // dark bright_yellow
+        assert_eq!(LIGHT.ansi.indexed(2), Rgba::hex(0x4E7D48)); // light green
+        assert_eq!(LIGHT.ansi.indexed(12), Rgba::hex(0x3D88CC)); // light bright_blue
+        assert_eq!(DARK.ansi.indexed(1), Rgba::hex(0xD06E54)); // dark red
+        assert_eq!(DARK.ansi.indexed(11), Rgba::hex(0xE6B56A)); // dark bright_yellow
                                                                 // Contract: 0..=15 delegate to the 16-color accessor (not the cube formula).
         for i in 0u8..=15 {
             assert_eq!(DARK.ansi.indexed(i), DARK.ansi.by_index(i));

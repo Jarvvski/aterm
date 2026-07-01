@@ -495,8 +495,8 @@ mod tests {
         // Ground-truth anchor (NOT `by_index`, which would be tautological): the
         // render-side entry resolves a low ANSI index to the dark palette hex.
         let t = theme(); // dark
-        assert_eq!(resolve_indexed(2, &t), Rgba::hex(0x5FD7A7)); // dark green
-        assert_eq!(resolve_indexed(7, &t), Rgba::hex(0xE6E5E1)); // dark white
+        assert_eq!(resolve_indexed(2, &t), Rgba::hex(0x85B078)); // dark green
+        assert_eq!(resolve_indexed(7, &t), Rgba::hex(0xCFC8B8)); // dark white
     }
 
     #[test]

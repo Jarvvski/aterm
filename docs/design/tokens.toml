@@ -4,14 +4,18 @@
 # no internal deps). Values here MUST stay identical to design-system.md; that
 # doc owns intent, this file owns values.
 #
-# Derived from 07-ia-design-language.md (iA visual language) and
-# 08-text-glyph-rendering.md (text pipeline). Two themes ship day one:
-# "paper" light + dark, from one hue family so ANSI output and UI never clash.
+# Palette source of record: the vision mock adopted as the UI north star in
+# ADR-0011 (docs/design/vision-mock/AtermWindow.dc.html). Two themes ship day one:
+# a warm "paper" light and a warm near-black dark, one hue family so ANSI output
+# and UI never clash. Two mode accents (shell blue + agent purple), an elevated
+# surface (bg_elev) for popovers/menus, and surface tints (hairline, selection,
+# weak fills) - defined as alpha over the canvas in the mock, stored here
+# pre-composited to opaque (they only ever sit on canvas).
 #
-# OWNER CONFIRMATION REQUIRED: accent.primary (#1A93E8 light / #4DA6F0 dark) is
-# DERIVED and WCAG-checked, NOT sampled from the live iA Writer app. All
-# contrast ratios are computed estimates; re-validate against final hexes with a
-# real WCAG library before locking.
+# The prior "OWNER CONFIRMATION REQUIRED / derived accent" note is resolved by
+# ADR-0011: the accent is the mock's blue by owner decision. All contrast ratios
+# below are recomputed against the new hexes by aterm-tokens' wcag_* tests; the
+# one intentional sub-AA tone (fg_muted) is annotated inline.
 
 schema_version = 1
 
@@ -64,91 +68,104 @@ line_height = 1.30
 font = "ui"
 
 # ---------------------------------------------------------------------------
-# Semantic colors — light "paper". sRGB hex.
+# Semantic colors — light "paper". sRGB hex. Tints (hairline/selection/*_weak)
+# are the mock's alpha-over-canvas values pre-composited to opaque. Mock source:
+# .aw[data-theme="light"] custom properties.
 # ---------------------------------------------------------------------------
 [color.light]
-bg_canvas           = "#FAF9F6"
-bg_surface          = "#F1F0EC"
-bg_surface_alt      = "#E9E7E1"
-fg_primary          = "#2A2A28"
-fg_secondary        = "#5C5B57"
-fg_muted            = "#8A8984"
-fg_faint            = "#B5B4AE"
-accent_primary      = "#1A93E8"   # DERIVED — owner confirm
-accent_primary_text = "#1577C2"   # accent for small body text (AA on canvas)
-accent_primary_weak = "#D6EAFB"
-hairline            = "#E0DED8"
-hairline_strong     = "#C9C7C0"
-selection_bg        = "#CFE3F7"
-success             = "#1E8E5A"
-caution             = "#B0820E"
-danger              = "#C2185B"
-info                = "#1A93E8"   # = accent_primary (one blue, reused)
+bg_canvas           = "#FAF7EF"     # --bg
+bg_surface          = "#F2EDE1"     # = bg_elev (the mock's single raise)
+bg_surface_alt      = "#E9E2D1"     # derived further raise (hover rows / output)
+bg_elev             = "#F2EDE1"     # --bg-elev: popovers, gate menu, completion
+fg_primary          = "#26231B"     # --ink       (14.65:1 on canvas, AAA)
+fg_secondary        = "#6C6555"     # --ink-dim   (5.40:1, AA body)
+fg_muted            = "#A89F8C"     # --ink-faint (2.45:1 — faint meta; sub-AA, see doc)
+fg_faint            = "#BCB4A3"     # derived fainter step (disabled)
+accent_primary      = "#2F7DC2"     # --accent    (4.06:1, AA large/UI)
+accent_agent        = "#7458BD"     # --agent     (5.06:1, AA large/UI)
+accent_primary_text = "#2B73B4"     # darker accent for small text (4.65:1, AA body)
+accent_primary_weak = "#E2E8EA"     # accent @ 12% over canvas (chip/target fill)
+hairline            = "#E5E2DA"     # ink @ 10% over canvas (--hairline)
+hairline_strong     = "#D4D1C9"     # ink @ 18% (section dividers)
+selection_bg        = "#C5D7E3"     # accent @ 26% over canvas
+success             = "#5C8A56"     # --ok
+caution             = "#B57D2C"     # --warn
+caution_weak        = "#F4EDDF"     # warn @ 8% over canvas (--warn-bg): gate card fill
+danger              = "#BF5A40"     # --err
+info                = "#2F7DC2"     # = accent_primary
 
 # ---------------------------------------------------------------------------
-# Semantic colors — dark. sRGB hex.
+# Semantic colors — dark. Mock source: .aw[data-theme="dark"] custom properties.
 # ---------------------------------------------------------------------------
 [color.dark]
-bg_canvas           = "#1C1C1C"
-bg_surface          = "#262626"
-bg_surface_alt      = "#303030"
-fg_primary          = "#E6E5E1"
-fg_secondary        = "#B8B7B2"
-fg_muted            = "#7A7A75"
-fg_faint            = "#4A4A46"
-accent_primary      = "#4DA6F0"   # DERIVED — owner confirm
-accent_primary_text = "#4DA6F0"   # same as accent_primary (AA body on dark canvas)
-accent_primary_weak = "#1E3A52"
-hairline            = "#343433"
-hairline_strong     = "#454544"
-selection_bg        = "#34465A"
-success             = "#5FD7A7"
-caution             = "#E0B341"
-danger              = "#E85A95"
-info                = "#4DA6F0"
+bg_canvas           = "#1B1915"     # --bg
+bg_surface          = "#221F19"     # = bg_elev (the mock's single raise)
+bg_surface_alt      = "#2B2820"     # derived further raise (hover rows / output)
+bg_elev             = "#221F19"     # --bg-elev: popovers, gate menu, completion
+fg_primary          = "#ECE6D8"     # --ink       (14.11:1 on canvas, AAA)
+fg_secondary        = "#9A9382"     # --ink-dim   (5.74:1, AA body)
+fg_muted            = "#5E584B"     # --ink-faint (2.49:1 — faint meta; sub-AA, see doc)
+fg_faint            = "#4A453B"     # derived fainter step (disabled)
+accent_primary      = "#3D88CC"     # --accent    (4.67:1, AA body)
+accent_agent        = "#9D86D6"     # --agent     (5.70:1, AA body)
+accent_primary_text = "#3D88CC"     # = accent_primary (4.67:1, AA body)
+accent_primary_weak = "#1F262B"     # accent @ 12% over canvas (chip/target fill)
+hairline            = "#2D2A26"     # ink @ 8.5% over canvas (--hairline)
+hairline_strong     = "#3C3A34"     # ink @ 16% (section dividers)
+selection_bg        = "#243645"     # accent @ 26% over canvas
+success             = "#82AC79"     # --ok
+caution             = "#D59A4A"     # --warn
+caution_weak        = "#2C251A"     # warn @ 9% over canvas (--warn-bg): gate card fill
+danger              = "#D47257"     # --err
+info                = "#3D88CC"     # = accent_primary
 
 # ---------------------------------------------------------------------------
-# ANSI 16-color palette — light "paper". Index 0..15.
-# On light bg, index 7 (white) is dark text, index 0 (black) is darkest.
+# ANSI 16-color palette — light "paper". Index 0..15. Warm family (T-4.2
+# structure; hues warmed to match the mock). On light bg, index 7/15 are dark
+# foregrounds, index 0 is darkest. Light brights (cyan/yellow/green) sit sub-3:1
+# by design — the renderer's light legibility remap lifts them. Eyeball vs real
+# output (ls --color, vim, htop, git diff) is deferred to EPIC-7's shell-matrix.
 # ---------------------------------------------------------------------------
 [ansi.light]
-black          = "#2A2A28"
-red            = "#C30771"
-green          = "#10A778"
-yellow         = "#A8800E"
-blue           = "#1A6FB0"
-magenta        = "#7C3F9E"
-cyan           = "#138D9E"
-white          = "#5C5B57"
-bright_black   = "#5C5B57"
-bright_red     = "#E0306F"
-bright_green   = "#1EB886"
-bright_yellow  = "#C39A14"
-bright_blue    = "#1A93E8"
-bright_magenta = "#9B5BC0"
-bright_cyan    = "#20A5BA"
-bright_white   = "#2A2A28"
+black          = "#26231B"
+red            = "#B0502F"
+green          = "#4E7D48"
+yellow         = "#9C6A22"
+blue           = "#2C6EA9"
+magenta        = "#63499F"
+cyan           = "#2F7D74"
+white          = "#6C6555"
+bright_black   = "#A89F8C"
+bright_red     = "#C96A44"
+bright_green   = "#77A56A"
+bright_yellow  = "#DCB45A"
+bright_blue    = "#3D88CC"
+bright_magenta = "#8F74CF"
+bright_cyan    = "#57C3B6"
+bright_white   = "#26231B"
 
 # ---------------------------------------------------------------------------
-# ANSI 16-color palette — dark. Index 0..15.
+# ANSI 16-color palette — dark. Index 0..15. Warm family; every entry is
+# comfortably legible on the warm near-black canvas, brights are the lighter
+# siblings. Eyeball vs real output is deferred to EPIC-7's shell-matrix.
 # ---------------------------------------------------------------------------
 [ansi.dark]
-black          = "#1C1C1C"
-red            = "#E85A95"
-green          = "#5FD7A7"
-yellow         = "#E0B341"
-blue           = "#4DA6F0"
-magenta        = "#B893BE"
-cyan           = "#4FB8CC"
-white          = "#E6E5E1"
-bright_black   = "#5A5A55"
-bright_red     = "#F277A8"
-bright_green   = "#7DE6BC"
-bright_yellow  = "#F3E430"
-bright_blue    = "#74BFF7"
-bright_magenta = "#CBAAD0"
-bright_cyan    = "#6FCFE0"
-bright_white   = "#FFFFFF"
+black          = "#1B1915"
+red            = "#D06E54"
+green          = "#85B078"
+yellow         = "#D2A15A"
+blue           = "#4D8FCA"
+magenta        = "#A98FD6"
+cyan           = "#6BB0A6"
+white          = "#CFC8B8"
+bright_black   = "#5E584B"
+bright_red     = "#E08A70"
+bright_green   = "#9CC590"
+bright_yellow  = "#E6B56A"
+bright_blue    = "#6BA6DD"
+bright_magenta = "#BBA6E6"
+bright_cyan    = "#8FC9BF"
+bright_white   = "#ECE6D8"
 
 # ---------------------------------------------------------------------------
 # Spacing scale (px, 4px base) + radii. Borders are hairline (1px), never >=2px.
@@ -177,12 +194,14 @@ slow = 220   # focus-mode dim ramp
 easing = "cubic-bezier(0.2, 0, 0, 1)"
 
 # ---------------------------------------------------------------------------
-# Caret. Default = thin blue bar; honor DECSCUSR block/underline in raw apps.
+# Caret. Default = thin bar tinted to the current mode accent (ADR-0011: shell ->
+# accent_primary, agent -> accent_agent, via SemanticColors::mode_accent). Honor
+# DECSCUSR block/underline in raw apps.
 # ---------------------------------------------------------------------------
 [caret]
 default_style = "bar"          # bar | block | underline
 bar_width_px = 2
-color = "accent_primary"        # token name, resolved per theme
+color = "mode_accent"           # resolved per theme AND per input mode (shell/agent)
 block_opacity = 0.70            # block caret fill; glyph drawn in bg_canvas (inverse)
 blink_soft = true               # opacity ramp, not hard toggle
 blink_suppress_while_typing = true

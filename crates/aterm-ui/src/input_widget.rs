@@ -957,12 +957,17 @@ fn signature(view: &InputView, w: u32, h: u32, px_key: u32, theme: &Theme) -> u6
         c.fg_secondary,
         c.fg_muted,
         c.accent_primary,
+        c.accent_agent,
         c.accent_primary_text,
         c.accent_primary_weak,
         c.bg_surface,
         c.selection_bg,
         c.hairline,
         c.danger,
+        // The autonomy chip resolves Success/Caution tints, so a theme that moved
+        // only those (with the folded colors unchanged) must still invalidate.
+        c.success,
+        c.caution,
     ] {
         s = fold_color(s, color);
     }
@@ -1617,10 +1622,14 @@ mod gpu_tests {
                     ),
                     "{kind:?}/{mode:?}: the prompt glyph inks"
                 );
-                // The command text inks in the content region.
+                // The command text inks in the content region. Threshold 30 (not 40):
+                // the input box draws no fill behind itself, so on the black-cleared
+                // target the light `fg.primary` ink (#26231B, max channel 38 - the warm
+                // ADR-0011 palette) must still register; 30 clears it with margin while
+                // staying well above the black clear.
                 let tx = (inset + 2.0 * cw) as u32;
                 assert!(
-                    rb.any_ink(tx, row_y, tx + (7.0 * cw) as u32, row_y + ch as u32, 40),
+                    rb.any_ink(tx, row_y, tx + (7.0 * cw) as u32, row_y + ch as u32, 30),
                     "{kind:?}/{mode:?}: the command text inks"
                 );
                 // The hairline inks at the zone top, far right (clear of any glyph).

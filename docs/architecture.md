@@ -280,8 +280,8 @@ completion-accept (fixes the Zed #23003 Enter-eats-candidate bug). Subsequent ga
 agent-holds-shell, `Opt-Enter` one-shot send-to-agent, degraded/heuristic, alt-screen
 pass-through, in-flight stdin, then plain Enter routed by `mode`.
 
-Mode is shown by **caret tint + prompt glyph** (Shell = ink/blue caret + `❯`; Agent =
-amber caret + `✦`), no banner. The accent is the only moving color. All
+Mode is shown by **mode-accent caret tint + prompt glyph** (Shell = blue caret + `❯`;
+Agent = purple caret + `◇`; the two mode accents per ADR-0011), no banner. All
 highlight/parse/ghost/completion work runs async and debounced (long idle debounce,
 short-circuit on space/paste/selection), applied as non-inheritable style spans; the
 render loop reads the last-good overlay and never blocks - protecting the frame floor.

@@ -11,6 +11,22 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ## Unreleased
 
+### Changed
+
+- **New warm color palette - aterm now matches its vision-mock look.** Both themes are
+  reskinned to the warm two-theme palette adopted as the UI north star in ADR-0011: a warm
+  "paper" light (`#FAF7EF`) and a warm near-black dark (`#1B1915`), with warmer semantic
+  colors (success/caution/danger) and a warmer ANSI-16 set - visible today anywhere the
+  grid, timeline, and input already draw. Agent mode gains its own second accent - a purple
+  (`#7458BD` light / `#9D86D6` dark) alongside the shell blue - and a `mode_accent` resolver
+  so widgets can ask for "the current mode color"; the always-blue-caret rule is superseded
+  by ADR-0011. A new elevated-surface tone (`bg.elev`) backs popovers, the gate approve-menu,
+  and the completion menu. Contrast was re-validated against a real WCAG computation; the one
+  intentionally faint tone (meta/placeholder text) is documented with its permitted use. This
+  is the token layer only: wiring the caret, prompt glyph, and mode chip to the mode accent -
+  and the other surfaces to the new tokens - lands in the follow-up tickets (T-9.2+). (Ticket
+  T-9.1.)
+
 ### Added
 
 - **aterm now auto-discovers your MCP servers.** On startup it reads the standard `mcpServers`
