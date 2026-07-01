@@ -206,9 +206,11 @@ pub struct InputModel {
     redo: Vec<Snapshot>,
     /// Active IME composition (T-3.2); a transient overlay, never part of the buffer.
     preedit: Option<Preedit>,
-    /// Reserved for T-3.5 (async highlight overlay); empty here.
+    /// Async syntax-highlight overlay (T-3.5), applied by the off-thread worker via
+    /// [`Self::set_highlight`]; the render path only reads it. Empty until computed.
     overlay: Highlight,
-    /// Reserved for T-3.5 (ghost text); not populated here.
+    /// Async ghost-text suggestion (T-3.5), applied via [`Self::set_ghost`]; the visible
+    /// tail is derived live by [`Self::ghost_tail`].
     ghost: Option<GhostText>,
 }
 
@@ -279,13 +281,18 @@ impl InputModel {
     }
 
     /// The visible ghost tail: the suggestion with the current text stripped as a
-    /// prefix, or `None` when there is no ghost, the line is empty, or the buffer has
-    /// diverged from the suggestion (so it is no longer a prefix). This is what the
-    /// widget renders after the caret, and the single source of truth for whether a
-    /// suggestion is still live - a debounced worker can lag without ever showing a
-    /// stale tail.
+    /// prefix, or `None`. This is the SINGLE source of truth for whether a suggestion is
+    /// live - both what the widget renders after the caret and what [`Self::accept_ghost`]
+    /// accepts - so display and acceptance can never disagree. It returns `None` unless,
+    /// matching zsh-autosuggestions:
+    /// - there is a ghost and the line is non-empty;
+    /// - the selection is collapsed (a region is being selected -> no suggestion);
+    /// - the caret is at the END of the text (a mid-line caret hides it - the suggestion
+    ///   only extends the tail, so showing it away from the end would be unacceptable);
+    /// - the suggestion still strict-prefixes the current text (a debounced worker can
+    ///   lag; a diverged buffer neither shows nor accepts a stale tail).
     pub fn ghost_tail(&self) -> Option<&str> {
-        if self.text.is_empty() {
+        if self.text.is_empty() || !self.sel.is_empty() || self.sel.caret != self.char_len() {
             return None;
         }
         let tail = self
@@ -302,17 +309,13 @@ impl InputModel {
 
     /// Accept the ghost-text suggestion (zsh-autosuggestions semantics: `Right`/`End`
     /// at end of line). Inserts the live tail as one undo unit and clears the ghost;
-    /// returns whether anything was accepted. It is a no-op unless the selection is
-    /// collapsed, the caret is at the end of the text, AND a live tail exists
-    /// ([`Self::ghost_tail`]) - so it never fires mid-line, over a selection, or for a
-    /// stale suggestion the buffer has typed past. The widget (T-3.6) binds the keys;
-    /// this is the pure operation they invoke.
+    /// returns whether anything was accepted. Delegates the "is a suggestion live?"
+    /// decision entirely to [`Self::ghost_tail`] (end-of-line + collapsed selection +
+    /// strict-prefix), so acceptance can never fire where the tail is not shown. The
+    /// widget (T-3.6) binds the keys; this is the pure operation they invoke.
     pub fn accept_ghost(&mut self) -> bool {
-        if !(self.sel.is_empty() && self.sel.caret == self.char_len()) {
-            return false;
-        }
-        // Re-derive the tail against the live buffer, so a stale ghost (the worker is
-        // debounced; the text may have advanced past it) is never appended verbatim.
+        // `ghost_tail` already enforces collapsed-selection + caret-at-end + live-prefix,
+        // so it is the sole gate: no separate caret check can drift out of sync with it.
         let tail = match self.ghost_tail() {
             Some(t) => t.to_string(),
             None => return false,
@@ -385,9 +388,12 @@ impl InputModel {
         self.undo.clear();
         self.redo.clear();
         self.preedit = None;
-        // The suggestion was for the now-submitted line; drop it so it cannot carry
-        // onto the fresh empty buffer (the worker recomputes for the new line).
+        // The suggestion + highlight were for the now-submitted line; drop them so they
+        // cannot carry onto the fresh empty buffer (the worker recomputes for the new
+        // line). Without clearing `overlay` a stale span set would linger on the next
+        // line's first characters until the debounced worker catches up.
         self.ghost = None;
+        self.overlay = Highlight::default();
         line
     }
 
@@ -933,6 +939,34 @@ mod tests {
     }
 
     #[test]
+    fn ghost_tail_hides_when_the_caret_is_not_at_end_or_a_selection_is_active() {
+        // Review finding: the ghost is only acceptable at end-of-line, so it must not be
+        // SHOWN elsewhere (display and acceptance share `ghost_tail`). Moving the caret
+        // off the end (or opening a selection) hides it, even though the text is unchanged
+        // and the suggestion is still a prefix.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("git st".to_string()));
+        m.set_ghost(Some(GhostText {
+            suggestion: "git status".to_string(),
+        }));
+        assert_eq!(m.ghost_tail(), Some("atus"), "shown at end of line");
+        // Caret moved off the end -> hidden (and unacceptable).
+        m.reduce(InputEvent::Move(Motion::Left, false));
+        assert_eq!(m.ghost_tail(), None, "hidden when the caret is mid-line");
+        assert!(!m.accept_ghost(), "and cannot be accepted mid-line");
+        assert!(
+            m.ghost().is_some(),
+            "the ghost itself is retained for later"
+        );
+        // Back to the end -> shown again.
+        m.reduce(InputEvent::Move(Motion::End, false));
+        assert_eq!(m.ghost_tail(), Some("atus"), "shown again at end of line");
+        // A selection (even with the caret at the end) hides it too.
+        m.reduce(InputEvent::Move(Motion::Left, true));
+        assert_eq!(m.ghost_tail(), None, "hidden while a selection is active");
+    }
+
+    #[test]
     fn accept_ghost_inserts_the_live_tail_at_end_of_line_and_clears_it() {
         // AC2: the suggestion is accepted (the live tail is inserted) at end of line.
         let mut m = InputModel::new();
@@ -1020,6 +1054,26 @@ mod tests {
         assert_eq!(m.take(), "ls");
         assert!(m.ghost().is_none(), "take() drops the stale ghost");
         assert_eq!(m.ghost_tail(), None);
+    }
+
+    #[test]
+    fn take_clears_the_highlight_overlay() {
+        // T-3.5: a submitted line's spans must not linger over the fresh empty buffer.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("ls -la".to_string()));
+        m.set_highlight(Highlight {
+            spans: vec![StyleSpan {
+                start: 0,
+                end: 2,
+                kind: SpanKind::Command,
+            }],
+        });
+        assert_eq!(m.take(), "ls -la");
+        assert_eq!(
+            m.highlight(),
+            &Highlight::default(),
+            "take() drops the stale highlight overlay"
+        );
     }
 
     // --- T-3.2 IME mutators -------------------------------------------------

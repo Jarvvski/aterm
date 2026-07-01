@@ -31,6 +31,7 @@ pub mod grid_render;
 pub mod ime;
 pub mod indicator;
 pub mod input_widget;
+pub mod overlay;
 pub mod present;
 pub mod profiling;
 pub mod prose;
@@ -59,6 +60,7 @@ pub use grid_render::{FrameSize, GridRenderer};
 pub use ime::{ImeEvent, NativeTextInput};
 pub use indicator::IntegrationIndicator;
 pub use input_widget::InputWidgetRenderer;
+pub use overlay::{OverlayRequest, OverlayResult, OverlayWorker, DEFAULT_DEBOUNCE};
 pub use present::{DisplayLink, FrameDecision, PresentScheduler, DEFAULT_KEEP_WARM};
 pub use prose::{measure_px, PositionedGlyph, ProseLayout, ProseRenderer, ProseShaper, MEASURE_CH};
 pub use recorder::{

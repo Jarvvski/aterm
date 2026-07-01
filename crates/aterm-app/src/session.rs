@@ -15,14 +15,18 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use aterm_agent::{AutonomyState, Secrets};
 use aterm_core::{
     keys, BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
 };
-use aterm_ui::{ImeEvent, KeyPress, NamedKey, UiCallbacks, Window};
+use aterm_ui::{
+    ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker, UiCallbacks, Window,
+    DEFAULT_DEBOUNCE,
+};
 
-use aterm_core::{InputEvent, InputMode, InputModel, Motion, Preedit};
+use aterm_core::{HistoryRing, HistoryScope, InputEvent, InputMode, InputModel, Motion, Preedit};
 
 use crate::agent_runtime::{AgentRuntime, TurnHandle};
 use crate::config::Config;
@@ -62,6 +66,24 @@ pub struct Session {
     /// into a new session (AC5); the cycle hotkey mutates it (AC4), the always-visible
     /// indicator reads it, and its `policy()` gates each live turn (ticket T-5.11).
     autonomy: AutonomyState,
+    /// The shared input-history ring (ticket T-3.7): every submitted line is pushed here
+    /// (tagged with the mode it was submitted in), and the T-3.5 ghost-text worker draws
+    /// its fish-style suggestions from it. `Arc` so a snapshot is a cheap refcount bump
+    /// into each overlay request; `Arc::make_mut` copies-on-write only when the worker is
+    /// mid-read. In-memory only (persistence is T-8.3), so it starts empty each session.
+    history: Arc<HistoryRing>,
+    /// The async, debounced highlight + ghost-text worker (ticket T-3.5). Runs off the
+    /// render thread; the input line's overlay is recomputed here after each edit and the
+    /// last-good result applied to `input` in [`Self::apply_overlay`], so the render path
+    /// never blocks on the highlighter.
+    overlay: OverlayWorker,
+    /// Monotonic id bumped per overlay request so the freshest result is identifiable
+    /// (ticket T-3.5); echoed back on each `OverlayResult`.
+    overlay_gen: u64,
+    /// Whether the history lens is widened to "all" (both Shell + Agent) for ghost
+    /// suggestions (ticket T-3.7 `HistoryScope`). Default off (per-mode lens); no runtime
+    /// toggle yet (a later setting).
+    widen_history: bool,
 }
 
 /// Apply a T-3.2 IME event to the input model. Pure (no engine / no window), so the
@@ -126,6 +148,10 @@ impl Session {
             autonomy: AutonomyState::new(cfg.default_autonomy),
             agent,
             turn: None,
+            history: Arc::new(HistoryRing::new()),
+            overlay: OverlayWorker::new(DEFAULT_DEBOUNCE),
+            overlay_gen: 0,
+            widen_history: false,
         })
     }
 
@@ -171,62 +197,87 @@ impl Session {
         }
     }
 
-    /// Apply an editing key to the [`InputModel`]; returns whether a backspace
-    /// actually erased a character (so the Shell-echo mirror only sends DEL when
-    /// something was deleted - the scaffold's guard). Enter/Tab/Escape never reach
-    /// here (the routing brain dispatches them).
-    fn apply_edit_key(&mut self, named: Option<NamedKey>, text: Option<&str>) -> bool {
+    /// Apply an editing key to the [`InputModel`], reporting an [`EditOutcome`]:
+    /// `erased` (a backspace actually removed a char, so the Shell-echo mirror only
+    /// sends DEL when something was deleted) and `text_changed` (the buffer TEXT changed,
+    /// as opposed to a pure caret motion). Enter/Tab/Escape never reach here (the routing
+    /// brain dispatches them). `text_changed` gates the async overlay recompute: a pure
+    /// caret motion cannot change the highlight or the ghost prefix, so it must NOT fire a
+    /// request - otherwise a held motion key (OS key-repeat) would keep resetting the
+    /// debounce and starve a pending recompute (review finding).
+    fn apply_edit_key(&mut self, named: Option<NamedKey>, text: Option<&str>) -> EditOutcome {
         match named {
             Some(NamedKey::Backspace) => {
                 let erases = self.input.caret() > 0 || !self.input.selection().is_empty();
                 self.input.reduce(InputEvent::Backspace);
-                erases
+                // Backspace changes the text iff it actually erased something.
+                EditOutcome {
+                    erased: erases,
+                    text_changed: erases,
+                }
             }
             Some(NamedKey::Delete) => {
+                // Delete is a no-op only at end-of-buffer with no selection.
+                let deletes = !self.input.selection().is_empty()
+                    || self.input.caret() < self.input.text().chars().count();
                 self.input.reduce(InputEvent::Delete);
-                false
+                EditOutcome::changed(deletes)
             }
             Some(NamedKey::ArrowLeft) => {
                 self.input.reduce(InputEvent::Move(Motion::Left, false));
-                false
+                EditOutcome::motion()
             }
             Some(NamedKey::ArrowRight) => {
-                self.input.reduce(InputEvent::Move(Motion::Right, false));
-                false
+                // zsh-autosuggestions semantics (ticket T-3.5): Right at end-of-line
+                // accepts the ghost tail (a TEXT change); otherwise it is a plain caret
+                // move. `accept_ghost` is a no-op unless the caret is at the end with a
+                // live suggestion, so this also correctly no-ops when Right at the end has
+                // nothing to accept.
+                let accepted = self.input.accept_ghost();
+                if !accepted {
+                    self.input.reduce(InputEvent::Move(Motion::Right, false));
+                }
+                EditOutcome::changed(accepted)
             }
             Some(NamedKey::ArrowUp) => {
                 self.input.reduce(InputEvent::Move(Motion::Up, false));
-                false
+                EditOutcome::motion()
             }
             Some(NamedKey::ArrowDown) => {
                 self.input.reduce(InputEvent::Move(Motion::Down, false));
-                false
+                EditOutcome::motion()
             }
             Some(NamedKey::Home) => {
                 self.input.reduce(InputEvent::Move(Motion::Home, false));
-                false
+                EditOutcome::motion()
             }
             Some(NamedKey::End) => {
-                self.input.reduce(InputEvent::Move(Motion::End, false));
-                false
+                // End at end-of-line accepts the ghost (T-3.5, a TEXT change); else it is
+                // a plain end-of-line motion (see the `ArrowRight` note).
+                let accepted = self.input.accept_ghost();
+                if !accepted {
+                    self.input.reduce(InputEvent::Move(Motion::End, false));
+                }
+                EditOutcome::changed(accepted)
             }
             Some(NamedKey::Space) => {
                 self.input.reduce(InputEvent::Insert(" ".to_string()));
-                false
+                EditOutcome::changed(true)
             }
             // Tab requests shell completion: it acts on the PTY (the shell's own
             // completer), not the input line, so the model is left untouched here -
             // the `\t` byte is sent by `raw_key_bytes` in the Shell-mode mirror.
             // Freed from the toggle now that `Cmd-/` is the real chord (T-3.3).
-            Some(NamedKey::Tab) => false,
+            Some(NamedKey::Tab) => EditOutcome::motion(),
             // Esc with no agent turn (and integrated, not alt-screen) is ordinary
             // input; the input box has no Esc action yet, so it is a no-op.
-            Some(NamedKey::Escape) => false,
+            Some(NamedKey::Escape) => EditOutcome::motion(),
             _ => {
-                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                let inserted = text.filter(|t| !t.is_empty());
+                if let Some(t) = inserted {
                     self.input.reduce(InputEvent::Insert(t.to_string()));
                 }
-                false
+                EditOutcome::changed(inserted.is_some())
             }
         }
     }
@@ -258,6 +309,84 @@ impl Session {
                 .map(|t| t.as_bytes().to_vec()),
         }
     }
+
+    /// Queue an async recompute of the input overlay (highlight + ghost) for the current
+    /// line (ticket T-3.5). `immediate` short-circuits the worker's debounce for instant
+    /// feedback (space / paste / mode toggle / IME commit / ghost accept). This never
+    /// computes here - it sends a single request to the off-thread worker, so the key
+    /// path stays free of the highlighter.
+    fn request_overlay(&mut self, immediate: bool) {
+        self.overlay_gen = self.overlay_gen.wrapping_add(1);
+        let mode = self.input.mode();
+        self.overlay.request(OverlayRequest {
+            generation: self.overlay_gen,
+            text: self.input.text().to_string(),
+            mode,
+            scope: HistoryScope::for_mode(mode, self.widen_history),
+            history: Arc::clone(&self.history),
+            immediate,
+        });
+    }
+
+    /// Drain the overlay worker and apply the freshest result to the input model (ticket
+    /// T-3.5), called each wake via [`UiCallbacks::tick`]. The model self-guards
+    /// staleness - [`InputModel::ghost_tail`] re-derives the tail against the live text,
+    /// and the highlight self-corrects on the next result - so applying the latest
+    /// available overlay is always safe even if the buffer advanced since the request.
+    fn apply_overlay(&mut self) {
+        if let Some(res) = self.overlay.poll() {
+            self.input.set_highlight(res.highlight);
+            self.input.set_ghost(res.ghost);
+        }
+    }
+
+    /// Record a submitted line in the shared history ring (ticket T-3.7), tagged with the
+    /// mode it was submitted in, so the T-3.5 ghost worker can suggest it later. The ring
+    /// drops blank lines itself. Copy-on-write via `Arc::make_mut`: it clones the ring
+    /// only if the worker is mid-read of a prior snapshot.
+    fn record_history(&mut self, line: &str, mode: InputMode) {
+        Arc::make_mut(&mut self.history).push(line, mode, SystemTime::now());
+    }
+}
+
+/// The result of applying one editing key ([`Session::apply_edit_key`]).
+#[derive(Debug, Clone, Copy)]
+struct EditOutcome {
+    /// A backspace actually removed a character (gates the Shell-echo DEL).
+    erased: bool,
+    /// The buffer TEXT changed (insert / delete / ghost-accept), as opposed to a pure
+    /// caret motion. Gates the async overlay recompute (T-3.5) so motion keys never fire.
+    text_changed: bool,
+}
+
+impl EditOutcome {
+    /// A pure caret motion: nothing erased, no text change.
+    fn motion() -> Self {
+        Self {
+            erased: false,
+            text_changed: false,
+        }
+    }
+
+    /// A non-backspace edit that changed the text iff `changed`.
+    fn changed(changed: bool) -> Self {
+        Self {
+            erased: false,
+            text_changed: changed,
+        }
+    }
+}
+
+/// Whether an editing key warrants an IMMEDIATE overlay recompute (short-circuiting the
+/// T-3.5 debounce) rather than the debounced default (ticket T-3.5 AC1). Space and paste
+/// (a multi-char insertion) want instant feedback; accepting a ghost (`Right`/`End` at
+/// end of line) changes the buffer and should reflect at once. Ordinary single-char
+/// typing, backspace, and caret motion stay debounced.
+fn edit_is_immediate(named: Option<NamedKey>, text: Option<&str>) -> bool {
+    matches!(
+        named,
+        Some(NamedKey::Space | NamedKey::ArrowRight | NamedKey::End)
+    ) || (named.is_none() && text.is_some_and(|t| t.chars().count() > 1))
 }
 
 impl Drop for Session {
@@ -381,6 +510,10 @@ impl UiCallbacks for Session {
             // The hotkey flips ONLY the mode; text/selection/undo preserved (T-3.1).
             Disposition::ToggleMode => {
                 self.input.reduce(InputEvent::ToggleMode);
+                // The overlay is mode-aware (Shell highlights + suggests; Agent is prose):
+                // recompute at once so the toggle re-styles without a debounce lag or a
+                // flicker of the old mode's overlay (ticket T-3.5 AC4).
+                self.request_overlay(true);
                 None
             }
             // Interrupt the in-flight turn (Esc): cancel it and fail-closed deny any
@@ -405,23 +538,32 @@ impl UiCallbacks for Session {
                     log::info!("agent busy; keeping the typed line (resubmit ignored)");
                 } else {
                     // No turn active: now it is safe to consume the line and submit it.
+                    // `take()` also clears the overlay/ghost for the now-empty buffer.
                     let line = self.input.take();
                     if line.trim().is_empty() {
                         log::debug!("agent submit: empty line ignored");
-                    } else if let Some(injector) = self.engine.agent_injector() {
-                        let policy = self.autonomy.policy();
-                        log::info!("agent submit ({}): {line}", self.autonomy.mode().label());
-                        self.turn = Some(self.agent.start_turn(line, policy, injector));
                     } else {
-                        log::warn!("agent submit dropped: the engine is shutting down");
+                        // Record the prompt in shared history (as an Agent submission, even
+                        // when Opt-Enter fired it from Shell mode) so ghost text can suggest
+                        // it later (tickets T-3.7 / T-3.5).
+                        self.record_history(&line, InputMode::Agent);
+                        if let Some(injector) = self.engine.agent_injector() {
+                            let policy = self.autonomy.policy();
+                            log::info!("agent submit ({}): {line}", self.autonomy.mode().label());
+                            self.turn = Some(self.agent.start_turn(line, policy, injector));
+                        } else {
+                            log::warn!("agent submit dropped: the engine is shutting down");
+                        }
                     }
                 }
                 None
             }
             // Shell submit: the shell already received the chars via the Edit mirror
-            // below, so submitting is just the carriage return; reset the model.
+            // below, so submitting is just the carriage return; reset the model (which
+            // also clears the overlay/ghost) and record the command in shared history.
             Disposition::SubmitShell => {
-                let _ = self.input.take();
+                let line = self.input.take();
+                self.record_history(&line, InputMode::Shell);
                 Some(b"\r".to_vec())
             }
             // Raw passthrough (alt-screen / a running foreground command / degraded
@@ -443,9 +585,17 @@ impl UiCallbacks for Session {
             // to the PTY for the shell's echo (until the T-3.6 widget is the source
             // of truth). Agent mode edits the prompt only - no PTY bytes.
             Disposition::Edit => {
-                let erased = self.apply_edit_key(key.named, key.text);
+                let outcome = self.apply_edit_key(key.named, key.text);
+                // Recompute the async highlight/ghost overlay for the edited line off the
+                // render thread (ticket T-3.5) - but ONLY when the TEXT changed. A pure
+                // caret motion cannot change the highlight or the ghost prefix, and firing
+                // on it would reset the worker's debounce (starving a pending recompute) for
+                // no benefit. Space/paste/ghost-accept are immediate; typing/delete debounced.
+                if outcome.text_changed {
+                    self.request_overlay(edit_is_immediate(key.named, key.text));
+                }
                 if ctx.mode == InputMode::Shell {
-                    Self::raw_key_bytes(key.named, key.text, erased)
+                    Self::raw_key_bytes(key.named, key.text, outcome.erased)
                 } else {
                     None
                 }
@@ -466,7 +616,36 @@ impl UiCallbacks for Session {
         // the routing brain (T-3.3) gives the IME Enter/Tab/Esc and never submits mid-
         // composition (the Zed #23003 trap). No PTY bytes flow here - even in Shell mode
         // the composed text only becomes shell input when the line is submitted.
+
+        // While a turn is parked on an approval the keyboard is locked (see `on_key`) so a
+        // pending safety decision cannot be bypassed by stray input; hold IME to the same
+        // bar - do not let a composition compose/commit into the buffer during a park. A
+        // `Disabled` still passes through so a dangling composition is always cleared
+        // (review finding: this closes the IME path around the approval lock).
+        if self
+            .turn
+            .as_ref()
+            .is_some_and(|t| t.is_active() && t.has_pending_approval())
+            && !matches!(event, ImeEvent::Disabled)
+        {
+            return;
+        }
+
+        let committed = matches!(event, ImeEvent::Commit(_));
         apply_ime(&mut self.input, event);
+        // A commit changed the committed buffer; recompute the overlay at once. A bare
+        // preedit does not change the buffer (and the renderer hides the ghost while a
+        // composition shows), so it needs no recompute.
+        if committed {
+            self.request_overlay(true);
+        }
+    }
+
+    fn tick(&mut self) {
+        // Apply any off-thread overlay result that landed since the last wake (ticket
+        // T-3.5), before the frame is built - so the render path only reads the last-good
+        // overlay and never blocks on the highlighter.
+        self.apply_overlay();
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) {
@@ -548,5 +727,28 @@ mod tests {
             input.preedit().is_none(),
             "blur/disable drops the composition so it cannot wedge the routing gate"
         );
+    }
+
+    // --- T-3.5 overlay-immediacy classification ------------------------------
+
+    #[test]
+    fn edit_immediacy_short_circuits_space_paste_and_ghost_accept_only() {
+        // Space, a multi-char paste, and a ghost accept (Right/End) recompute immediately
+        // (AC1); ordinary single-char typing, backspace, and plain motion are debounced.
+        assert!(edit_is_immediate(Some(NamedKey::Space), Some(" ")));
+        assert!(edit_is_immediate(Some(NamedKey::ArrowRight), None));
+        assert!(edit_is_immediate(Some(NamedKey::End), None));
+        assert!(
+            edit_is_immediate(None, Some("pasted text")),
+            "a multi-char insertion is a paste -> immediate"
+        );
+        // Debounced cases:
+        assert!(
+            !edit_is_immediate(None, Some("a")),
+            "a single typed char is debounced"
+        );
+        assert!(!edit_is_immediate(Some(NamedKey::Backspace), None));
+        assert!(!edit_is_immediate(Some(NamedKey::ArrowLeft), None));
+        assert!(!edit_is_immediate(Some(NamedKey::ArrowUp), None));
     }
 }

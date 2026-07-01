@@ -2,7 +2,7 @@
 id: T-3.5
 epic: EPIC-3-unified-input
 title: Async/debounced highlight + ghost text overlay
-status: ready-for-agent
+status: done
 labels: [ui, input, perf]
 depends_on: [T-3.1]
 ---
@@ -78,3 +78,53 @@ surface yet).
 
 **Remaining to reach `done`:** the aterm-ui debounced worker + overlay render
 (AC1, AC3) and the `Right`/`End` accept binding in the T-3.6 widget.
+
+# Notes (landed 2026-07-01)
+
+The remaining half landed: the off-thread debounced worker, the host wiring, and the
+`Right`/`End` accept binding. All ACs met. (The render itself was already there - the T-3.6
+input widget renders whatever `highlight`/`ghost_tail`/`preedit` the model carries - so this
+was about computing the overlay off-thread and feeding it in, plus wiring the accept keys and
+history.)
+
+- **The async worker (`aterm-ui::overlay`).** A dedicated `OverlayWorker` thread with an
+  unbounded request channel + a result channel. `request()` (the only keystroke-path call) is
+  a single non-blocking send; `poll()` drains the latest result. The worker debounces with
+  `recv_timeout(DEFAULT_DEBOUNCE=90ms)`, coalescing a burst to the newest request; an
+  `immediate` request (space / paste / mode toggle / IME commit / ghost accept) short-circuits
+  the wait (AC1). It computes via the pure `highlight_for` / `ghost_for` and posts the result;
+  `Drop` disconnects the sender then joins (no deadlock, no hang). Seven `overlay::tests`
+  including a 10k-burst non-blocking assertion (AC3) and the immediate-mid-debounce branch.
+- **Host wiring (`aterm-app::Session`).** New `UiCallbacks::tick` (called at the top of every
+  wake) drains the worker and applies the freshest result to the `InputModel`
+  (`set_highlight`/`set_ghost`), so the render path only ever reads the last-good overlay and
+  never blocks (AC3). An edit fires `request_overlay` ONLY when the buffer text actually
+  changed (a pure caret motion does not, so a held arrow can't reset the debounce), with
+  `immediate` chosen by `edit_is_immediate`. A mode toggle fires an immediate recompute (AC4);
+  the worker's `highlight_for` drops shell spans + ghost in Agent mode, and `take()` clears the
+  overlay on submit, so the switch re-styles with no stale flash and no text flicker.
+- **Ghost + history (AC2).** Submitted lines are pushed into the shared `HistoryRing` (T-3.7),
+  tagged with the submit mode (Opt-Enter-from-Shell is tagged Agent), via `Arc::make_mut`
+  copy-on-write; the worker draws suggestions from an `Arc` snapshot under the mode's
+  `HistoryScope` lens. `Right`/`End` at end-of-line accept the ghost (`accept_ghost`), else
+  they are plain motions. `ghost_tail` is the single source of truth for "is a suggestion
+  live" - it now gates on collapsed-selection + caret-at-end + strict-prefix, so a suggestion
+  is only ever SHOWN where it can be ACCEPTED (display and acceptance can't disagree).
+- **AC5 (non-inheritable spans)** was already met by the pure `highlight_command_line` (T-3.5
+  first half) and is unchanged.
+- **Adversarial review fixes folded in (this commit).** A multi-lens review flagged and this
+  fixes: (1) held caret-motion keys resetting the debounce and starving a pending recompute -
+  fixed by gating `request_overlay` on an actual text change (`EditOutcome.text_changed`);
+  (2) a ghost shown mid-line where it could not be accepted - fixed by tightening
+  `ghost_tail`'s visibility to match `accept_ghost`; (3) IME compose/commit slipping past the
+  approval-park keyboard lock - `on_ime` now ignores buffer-mutating IME events while a turn is
+  parked on an approval (a `Disabled` still passes to clear a dangling preedit); plus the two
+  missing worker tests above. (The companion review fix to T-3.2 - clearing the preedit on
+  window blur, since macOS emits no `Ime::Disabled` on focus loss - landed in the T-3.2 commit.)
+- **Residual:** the toggle-recompute wiring (the trivial `request_overlay(true)` in the toggle
+  arm) is not covered end-to-end because `Session` needs a live `Engine`/PTY to construct (no
+  headless harness); its component behaviors ARE tested (`highlight_for_is_mode_aware`,
+  `agent_mode_has_no_highlight_or_ghost`, `immediate_request_short_circuits_a_long_debounce`).
+  `mise run fmt && lint && build && test` green at `-D warnings` (the sole red is the
+  pre-existing `flood_publishes_track_ticks_not_bytes` load-flake, which passes in isolation and
+  is untouched here). No version bump (accumulating under Unreleased).

@@ -13,6 +13,15 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The input box now highlights your command as you type and suggests completions from your
+  history.** In shell mode the command line gets restrained, near-monochrome syntax tinting
+  (command vs argument vs flag) plus an error underline for mistakes like an unterminated quote -
+  computed off the render thread and applied after a short (~90ms) debounce, and instantly on
+  space or paste, so a burst of typing never stutters the frame. A fish-style ghost-text
+  suggestion drawn from what you have run this session appears in muted gray after the caret and
+  is accepted with Right or End at the end of the line. Switching between shell and agent mode
+  re-styles the line at once (agent prose gets no shell highlight) without disturbing the text.
+  (Tickets T-3.5, T-3.7.)
 - **The input box now handles IME composition (Japanese, Pinyin, and other input methods).**
   Composing text shows the in-progress candidate inline under the caret, with the OS candidate
   window positioned there, and pressing Enter to confirm a candidate no longer submits the line

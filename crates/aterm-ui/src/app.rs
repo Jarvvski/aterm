@@ -153,6 +153,13 @@ pub trait UiCallbacks {
     /// input box).
     fn on_ime(&mut self, _event: crate::ime::ImeEvent) {}
 
+    /// Called once per wake, before the frame decision, so the host can apply off-thread
+    /// state that arrived since the last tick - notably the T-3.5 async highlight/ghost
+    /// overlay results, which the host drains here and applies to its `InputModel` so the
+    /// render path only ever reads the last-good overlay and never blocks on the worker.
+    /// Cheap and non-blocking (a channel drain); default no-op.
+    fn tick(&mut self) {}
+
     /// The window resized to `cols` x `rows` (cells), `width` x `height` (px).
     fn on_resize(&mut self, _cols: u16, _rows: u16, _width: u32, _height: u32) {}
 }
@@ -627,6 +634,11 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
+                // Apply any off-thread state that landed since the last wake - notably
+                // the T-3.5 async overlay results (highlight/ghost), drained and applied
+                // to the host's `InputModel` before we build the frame, so the render
+                // path only ever reads the last-good overlay. Cheap (a channel drain).
+                self.callbacks.tick();
                 // Cheaply notice newly published output and (re)arm keep-warm
                 // before deciding - so a frame produced by the model thread keeps
                 // the panel warm without a keystroke.
