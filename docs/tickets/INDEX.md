@@ -113,7 +113,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-5.4 | Typed tool definitions (run_command/read_file/edit_file/...) | done | T-5.1 |
 | T-5.5 | Deterministic risk gate (zsh-aware argv parse) | done | - |
 | T-5.6 | Single Secrets source + OutputSanitizer | done | - |
-| T-5.7 | Seatbelt sandbox (sandbox-exec) + setrlimit + timeout-kill | ready-for-agent | T-5.4 |
+| T-5.7 | Seatbelt sandbox (sandbox-exec) + setrlimit + timeout-kill | done | T-5.4 |
 | T-5.8 | Agentic turn loop (shared, provider-neutral) | done | T-5.2, T-5.4, T-5.5 |
 | T-5.9 | Command-execution sinks (no-shell runner + gated PTY inject) | done | T-5.5, T-5.7, T-1.1 |
 | T-5.10 | Timeline transcript model (AgentTurn/AgentStep, tool_use_id join) | done | T-5.8, T-2.4 |
