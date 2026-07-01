@@ -122,7 +122,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 ### EPIC-6 - MCP + interop
 | id | title | status | depends_on |
 |---|---|---|---|
-| T-6.1 | Messages-API MCP connector (remote HTTP servers) | ready-for-agent | T-5.2, T-5.5 |
+| T-6.1 | Messages-API MCP connector (remote HTTP servers) | done | T-5.2, T-5.5 |
 | T-6.2 | Local stdio MCP client | ready-for-agent | T-5.4, T-5.5 |
 | T-6.3 | MCP config auto-discovery | ready-for-agent | T-6.2 |
 

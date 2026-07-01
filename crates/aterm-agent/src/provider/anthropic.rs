@@ -31,6 +31,9 @@ use super::sse::SseDecoder;
 use super::{
     ContentBlock, LlmProvider, ProviderError, ProviderEvent, Role, StopReason, TurnRequest, Usage,
 };
+use crate::mcp::connector::{
+    validate_connector_body, validate_servers, McpServer, MCP_CONNECTOR_BETA,
+};
 
 /// The production Messages-API base URL.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -48,6 +51,12 @@ pub struct AnthropicProvider {
     base_url: String,
     client: reqwest::Client,
     max_resumes: u32,
+    /// Remote MCP servers consumed via the connector (T-6.1). Empty by default;
+    /// when non-empty the request carries `mcp_servers` + a matching `mcp_toolset`
+    /// per server and the `mcp-client-2025-11-20` beta header. This is an
+    /// Anthropic-specific feature, so it lives on the provider - `TurnRequest`
+    /// stays provider-neutral.
+    mcp_servers: Vec<McpServer>,
 }
 
 // Manual Debug so the API key never lands in logs or panic output.
@@ -57,6 +66,7 @@ impl std::fmt::Debug for AnthropicProvider {
             .field("api_key", &"<redacted>")
             .field("base_url", &self.base_url)
             .field("max_resumes", &self.max_resumes)
+            .field("mcp_servers", &self.mcp_servers.len())
             .finish()
     }
 }
@@ -69,6 +79,7 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             client: reqwest::Client::new(),
             max_resumes: DEFAULT_MAX_RESUMES,
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -76,6 +87,16 @@ impl AnthropicProvider {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Consume the given remote MCP servers via the connector (T-6.1). Each turn
+    /// then carries `mcp_servers` + a matching `mcp_toolset` per server, gated by
+    /// each server's deny-by-default [`McpToolPolicy`](crate::mcp::connector::McpToolPolicy),
+    /// plus the `mcp-client-2025-11-20` beta header. NOT ZDR-eligible.
+    #[must_use]
+    pub fn with_mcp_servers(mut self, servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = servers;
         self
     }
 
@@ -108,21 +129,32 @@ impl AnthropicProvider {
         if let Some(system) = &request.system {
             body["system"] = json!(system);
         }
-        if !request.tools.is_empty() {
-            let tools: Vec<Value> = request
-                .tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.input_schema,
-                        "strict": t.strict,
-                    })
+        // Native custom tools + one `mcp_toolset` per connector server (T-6.1)
+        // share the single `tools` array. The connector references each server by
+        // exactly one toolset; `mcp_servers` declares them.
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                    "strict": t.strict,
                 })
-                .collect();
+            })
+            .collect();
+        tools.extend(self.mcp_servers.iter().map(McpServer::toolset_json));
+        if !tools.is_empty() {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!({ "type": "auto" });
+        }
+        if !self.mcp_servers.is_empty() {
+            body["mcp_servers"] = json!(self
+                .mcp_servers
+                .iter()
+                .map(McpServer::server_json)
+                .collect::<Vec<_>>());
         }
         body
     }
@@ -176,6 +208,12 @@ impl LlmProvider for AnthropicProvider {
         sink: mpsc::Sender<ProviderEvent>,
     ) -> Result<(), ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
+        // Validate the connector config up front so a malformed toolset becomes a
+        // local error, never a wasted round-trip that 400s (T-6.1 AC).
+        if !self.mcp_servers.is_empty() {
+            validate_servers(&self.mcp_servers)
+                .map_err(|e| ProviderError::Invalid(e.to_string()))?;
+        }
         // Cumulative assistant content across pause/resume hops (so a re-send
         // carries everything the model produced so far, not just the last hop).
         let mut accumulated: Vec<Value> = Vec::new();
@@ -192,12 +230,23 @@ impl LlmProvider for AnthropicProvider {
             let extra = (!accumulated.is_empty()).then_some(accumulated.as_slice());
             let body = self.build_body(&request, extra);
 
-            let mut response = self
+            // Belt-and-suspenders: assert the 1:1 mcp_servers<->mcp_toolset
+            // invariant on the assembled body before send (the API 400s otherwise).
+            if !self.mcp_servers.is_empty() {
+                validate_connector_body(&body)
+                    .map_err(|e| ProviderError::Invalid(e.to_string()))?;
+            }
+
+            let mut builder = self
                 .client
                 .post(&url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+            if !self.mcp_servers.is_empty() {
+                builder = builder.header("anthropic-beta", MCP_CONNECTOR_BETA);
+            }
+            let mut response = builder
                 .json(&body)
                 .send()
                 .await
@@ -305,6 +354,13 @@ enum BlockKind {
     Text,
     Thinking,
     ToolUse,
+    /// A connector `mcp_tool_use` block (T-6.1): its input JSON streams in like a
+    /// tool_use, but it is assembled into one [`ProviderEvent::McpToolUse`] at
+    /// close and NEVER dispatched locally.
+    McpToolUse,
+    /// A connector `mcp_tool_result` block (server-side result, delivered whole at
+    /// `content_block_start`).
+    McpToolResult,
     Other,
 }
 
@@ -314,6 +370,8 @@ struct BlockAccum {
     kind: BlockKind,
     id: String,
     name: String,
+    /// Connector `server_name` for an `mcp_tool_use` block; empty otherwise.
+    server: String,
     text: String,
     signature: String,
     json: String,
@@ -353,6 +411,8 @@ impl StreamState {
                     "text" => BlockKind::Text,
                     "thinking" => BlockKind::Thinking,
                     "tool_use" => BlockKind::ToolUse,
+                    "mcp_tool_use" => BlockKind::McpToolUse,
+                    "mcp_tool_result" => BlockKind::McpToolResult,
                     _ => BlockKind::Other,
                 };
                 let id = block
@@ -365,12 +425,51 @@ impl StreamState {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                // Connector `server_name` (on mcp_tool_use blocks only).
+                let server = block
+                    .and_then(|b| b.get("server_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                // A connector result carries its content inline at start (the
+                // server already executed it) - emit it whole and keep no open
+                // block (close is a no-op).
+                if kind == BlockKind::McpToolResult {
+                    let tool_use_id = block
+                        .and_then(|b| b.get("tool_use_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let is_error = block
+                        .and_then(|b| b.get("is_error"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let output = mcp_result_text(block.and_then(|b| b.get("content")));
+                    self.blocks.insert(
+                        index,
+                        BlockAccum {
+                            kind,
+                            id: tool_use_id.clone(),
+                            name: String::new(),
+                            server: String::new(),
+                            text: String::new(),
+                            signature: String::new(),
+                            json: String::new(),
+                        },
+                    );
+                    return vec![ProviderEvent::McpToolResult {
+                        id: tool_use_id,
+                        output,
+                        is_error,
+                    }];
+                }
                 self.blocks.insert(
                     index,
                     BlockAccum {
                         kind,
                         id: id.clone(),
                         name: name.clone(),
+                        server: server.clone(),
                         text: String::new(),
                         signature: String::new(),
                         json: String::new(),
@@ -379,6 +478,7 @@ impl StreamState {
                 if kind == BlockKind::ToolUse {
                     vec![ProviderEvent::ToolUseStart { id, name }]
                 } else {
+                    // mcp_tool_use assembles at close; other kinds emit nothing.
                     Vec::new()
                 }
             }
@@ -413,20 +513,41 @@ impl StreamState {
                     }
                     "input_json_delta" => {
                         let j = delta_str(delta, "partial_json");
+                        let is_mcp =
+                            self.blocks.get(&index).map(|b| b.kind) == Some(BlockKind::McpToolUse);
                         if let Some(b) = self.blocks.get_mut(&index) {
                             b.json.push_str(&j);
                         }
-                        vec![ProviderEvent::ToolUseInputDelta { json: j }]
+                        // A connector mcp_tool_use assembles at close; do not leak a
+                        // ToolUseInputDelta that the mapper would misroute.
+                        if is_mcp {
+                            Vec::new()
+                        } else {
+                            vec![ProviderEvent::ToolUseInputDelta { json: j }]
+                        }
                     }
                     _ => Vec::new(),
                 }
             }
             Some("content_block_stop") => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
-                if self.blocks.get(&index).map(|b| b.kind) == Some(BlockKind::ToolUse) {
-                    vec![ProviderEvent::ToolUseStop]
-                } else {
-                    Vec::new()
+                match self.blocks.get(&index).map(|b| b.kind) {
+                    Some(BlockKind::ToolUse) => vec![ProviderEvent::ToolUseStop],
+                    Some(BlockKind::McpToolUse) => {
+                        let b = &self.blocks[&index];
+                        let input: Value = if b.json.trim().is_empty() {
+                            json!({})
+                        } else {
+                            serde_json::from_str(&b.json).unwrap_or_else(|_| json!({}))
+                        };
+                        vec![ProviderEvent::McpToolUse {
+                            id: b.id.clone(),
+                            name: b.name.clone(),
+                            server: b.server.clone(),
+                            input,
+                        }]
+                    }
+                    _ => Vec::new(),
                 }
             }
             Some("message_delta") => {
@@ -487,7 +608,10 @@ impl StreamState {
                         "input": input,
                     }))
                 }
-                BlockKind::Other => None,
+                // Connector blocks execute server-side and are not echoed back on a
+                // pause_turn resume (v1 limitation; connector turns rarely pause,
+                // and re-sending a half-formed mcp pair risks a 400).
+                BlockKind::McpToolUse | BlockKind::McpToolResult | BlockKind::Other => None,
             })
             .collect()
     }
@@ -506,6 +630,22 @@ fn delta_str(delta: Option<&Value>, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// Flatten an `mcp_tool_result` block's `content` into a single string. The
+/// Messages API delivers it as an array of `{type:"text", text}` blocks (a bare
+/// string is tolerated for forward-compat). The text is UNTRUSTED - the turn loop
+/// sanitizes it before it reaches the timeline.
+fn mcp_result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -570,6 +710,51 @@ mod tests {
         let body = p.build_body(&req_with(vec![Message::user("hi")], vec![]), None);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn connector_body_carries_mcp_servers_and_matching_toolset() {
+        // T-6.1 AC: a remote MCP server's tools are listed/callable through a
+        // Messages request; the toolset rides in `tools` next to native tools and
+        // `mcp_servers` declares the server 1:1.
+        use crate::mcp::connector::{McpServer, McpToolPolicy};
+        let server = McpServer::new("docs", "https://mcp.example.com")
+            .with_tool_policy(McpToolPolicy::allow_only(["search"]).deny(["delete"]));
+        let p = AnthropicProvider::new("sk-test").with_mcp_servers(vec![server]);
+        let native = ToolSpec {
+            name: "read_file".into(),
+            description: "read a file".into(),
+            input_schema: json!({ "type": "object" }),
+            strict: true,
+        };
+        let body = p.build_body(&req_with(vec![Message::user("go")], vec![native]), None);
+
+        // mcp_servers declared, url-typed.
+        assert_eq!(body["mcp_servers"][0]["type"], "url");
+        assert_eq!(body["mcp_servers"][0]["name"], "docs");
+
+        // The tools array holds the native tool AND the mcp_toolset.
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "read_file"));
+        let toolset = tools
+            .iter()
+            .find(|t| t["type"] == "mcp_toolset")
+            .expect("mcp_toolset present");
+        assert_eq!(toolset["mcp_server_name"], "docs");
+        // Deny-by-default: search enabled, delete disabled - "gated, not run".
+        assert_eq!(toolset["default_config"]["enabled"], false);
+        assert_eq!(toolset["configs"]["search"]["enabled"], true);
+        assert_eq!(toolset["configs"]["delete"]["enabled"], false);
+
+        // The assembled body passes the 1:1 invariant guard.
+        assert!(crate::mcp::connector::validate_connector_body(&body).is_ok());
+    }
+
+    #[test]
+    fn no_connector_omits_mcp_servers() {
+        let p = AnthropicProvider::new("sk-test");
+        let body = p.build_body(&req_with(vec![Message::user("hi")], vec![]), None);
+        assert!(body.get("mcp_servers").is_none());
     }
 
     #[test]
@@ -789,6 +974,55 @@ mod tests {
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["thinking"], "reason");
         assert_eq!(content[0]["signature"], "sig123");
+    }
+
+    #[test]
+    fn connector_mcp_blocks_map_to_neutral_events() {
+        // T-6.1 AC: mcp_tool_use / mcp_tool_result blocks map into the neutral
+        // stream. mcp_tool_use assembles at close (its input streams like tool_use,
+        // but emits no ToolUseInputDelta); mcp_tool_result is delivered whole at
+        // start with its content flattened.
+        let mut state = StreamState::default();
+        let mut d = SseDecoder::default();
+        let raw = sse(&[
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"mcp_tool_use","id":"mcp_1","name":"search","server_name":"docs","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"rust\"}"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"mcp_tool_result","tool_use_id":"mcp_1","is_error":false,"content":[{"type":"text","text":"a doc"},{"type":"text","text":"another"}]}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":1}),
+            ),
+        ]);
+        let out = drain(&mut state, &mut d, &raw);
+        assert_eq!(
+            out,
+            vec![
+                ProviderEvent::McpToolUse {
+                    id: "mcp_1".into(),
+                    name: "search".into(),
+                    server: "docs".into(),
+                    input: json!({ "q": "rust" }),
+                },
+                ProviderEvent::McpToolResult {
+                    id: "mcp_1".into(),
+                    output: "a doc\nanother".into(),
+                    is_error: false,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -62,6 +62,11 @@ pub enum RiskReason {
     FileWrite,
     /// Runs on a remote host over SSH (a [`RemoteContext`] was supplied).
     RemoteExecution,
+    /// Calls an MCP server tool (T-6.1/T-6.2) whose local effects we cannot
+    /// statically classify - it may run a command or write files on the machine
+    /// (local stdio) or execute server-side (the remote connector). Over-
+    /// approximated to a Caution baseline that can never auto-run.
+    McpTool,
 }
 
 impl RiskReason {
@@ -392,6 +397,7 @@ pub fn gloss_for(reason: RiskReason) -> &'static str {
         RiskReason::CodeExecution => "runs arbitrary code",
         RiskReason::FileWrite => "writes a file to disk",
         RiskReason::RemoteExecution => "runs on the remote host over SSH",
+        RiskReason::McpTool => "calls an MCP server tool with unverifiable effects",
     }
 }
 
@@ -1201,6 +1207,7 @@ mod tests {
             RiskReason::CodeExecution,
             RiskReason::FileWrite,
             RiskReason::RemoteExecution,
+            RiskReason::McpTool,
         ] {
             assert!(!gloss_for(r).is_empty(), "missing gloss for {r:?}");
         }

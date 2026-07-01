@@ -166,6 +166,35 @@ impl<S: BlockSink> StreamProjector<S> {
                     .with_error(true),
                 );
             }
+            // A remote (connector) MCP tool call the model made (T-6.1). It ran
+            // SERVER-SIDE under the deny-by-default allow policy, so there is no
+            // local gate badge to show; the label makes the remote execution
+            // explicit. Render-only - the loop never dispatches it.
+            AgentEvent::McpToolUse {
+                id, name, server, ..
+            } => {
+                self.open = None;
+                self.sink.push_block(
+                    AgentBlock::new(
+                        AgentBlockKind::ToolCall,
+                        format!("{name} (MCP {server}, ran remotely)"),
+                        Instant::now(),
+                    )
+                    .with_tool_use_id(id),
+                );
+            }
+            AgentEvent::McpToolResult {
+                id,
+                output,
+                is_error,
+            } => {
+                self.open = None;
+                self.sink.push_block(
+                    AgentBlock::new(AgentBlockKind::ToolResult, output, Instant::now())
+                        .with_tool_use_id(id)
+                        .with_error(is_error),
+                );
+            }
             // Token accounting and the turn boundary are not timeline steps; the
             // `active` flag (not a block) reflects turn completion.
             AgentEvent::Usage(_) | AgentEvent::TurnComplete { .. } => {}
@@ -690,6 +719,39 @@ mod tests {
         assert_eq!(blocks[2].kind, AgentBlockKind::ToolResult);
         assert_eq!(blocks[2].tool_use_id.as_deref(), Some("t1"));
         assert!(!blocks[2].is_error);
+    }
+
+    #[test]
+    fn connector_mcp_blocks_render_in_the_timeline() {
+        // T-6.1 AC: mcp_tool_use / mcp_tool_result render in the timeline. The
+        // use block notes remote execution; the result carries its (sanitized)
+        // output joined by tool_use_id.
+        let sink = RecordingSink::default();
+        let mut p = projector(&sink);
+        p.apply(AgentEvent::McpToolUse {
+            id: "mcp_1".into(),
+            name: "search".into(),
+            server: "docs".into(),
+            input: json!({ "q": "rust" }),
+        });
+        p.apply(AgentEvent::McpToolResult {
+            id: "mcp_1".into(),
+            output: "a doc".into(),
+            is_error: false,
+        });
+        let blocks = sink.blocks.borrow();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].kind, AgentBlockKind::ToolCall);
+        assert_eq!(blocks[0].tool_use_id.as_deref(), Some("mcp_1"));
+        assert!(
+            blocks[0].text.contains("MCP docs") && blocks[0].text.contains("remotely"),
+            "text: {}",
+            blocks[0].text
+        );
+        assert_eq!(blocks[1].kind, AgentBlockKind::ToolResult);
+        assert_eq!(blocks[1].tool_use_id.as_deref(), Some("mcp_1"));
+        assert_eq!(blocks[1].text, "a doc");
+        assert!(!blocks[1].is_error);
     }
 
     #[test]

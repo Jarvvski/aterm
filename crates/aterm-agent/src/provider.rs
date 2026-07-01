@@ -303,6 +303,24 @@ pub enum ProviderEvent {
     ToolUseInputDelta { json: String },
     /// The currently-open tool-use block closed (`content_block_stop`).
     ToolUseStop,
+    /// A REMOTE MCP tool call the model made via the connector (T-6.1), assembled
+    /// whole at `content_block_stop`. Executed SERVER-SIDE by Anthropic - it is
+    /// NOT dispatched locally and never enters the risk-gate/execute path; it is
+    /// render-only. `server` is the connector `server_name`.
+    McpToolUse {
+        id: String,
+        name: String,
+        server: String,
+        input: serde_json::Value,
+    },
+    /// The result of a connector MCP tool call (server-side), keyed by `id`. The
+    /// content is UNTRUSTED (a prompt-injection vector) and MUST be sanitized
+    /// before it is rendered or re-used.
+    McpToolResult {
+        id: String,
+        output: String,
+        is_error: bool,
+    },
     /// The turn's stop reason and final usage (`message_delta`).
     MessageDelta {
         stop_reason: StopReason,
@@ -345,6 +363,22 @@ pub enum AgentEvent {
         id: String,
         name: String,
         error: String,
+    },
+    /// A REMOTE MCP tool call the model made via the connector (T-6.1), executed
+    /// SERVER-SIDE. Render-only: the turn loop forwards it to the timeline but
+    /// never dispatches it (contrast [`ToolProposed`](AgentEvent::ToolProposed),
+    /// which is gated + run locally). `server` is the connector `server_name`.
+    McpToolUse {
+        id: String,
+        name: String,
+        server: String,
+        input: serde_json::Value,
+    },
+    /// The (already-sanitized) result of a connector MCP tool call, keyed by `id`.
+    McpToolResult {
+        id: String,
+        output: String,
+        is_error: bool,
     },
     /// Final token usage for the turn.
     Usage(Usage),
@@ -413,6 +447,29 @@ impl AgentEventMapper {
                 Vec::new()
             }
             ProviderEvent::ToolUseStop => self.open_tool.take().map(flush_tool).unwrap_or_default(),
+            // Connector MCP blocks bypass the open-tool buffer entirely: they are
+            // assembled whole by the provider and never become a locally-run
+            // `ToolProposed`. Pass them straight through to the timeline.
+            ProviderEvent::McpToolUse {
+                id,
+                name,
+                server,
+                input,
+            } => vec![AgentEvent::McpToolUse {
+                id,
+                name,
+                server,
+                input,
+            }],
+            ProviderEvent::McpToolResult {
+                id,
+                output,
+                is_error,
+            } => vec![AgentEvent::McpToolResult {
+                id,
+                output,
+                is_error,
+            }],
             ProviderEvent::MessageDelta { stop_reason, usage } => {
                 self.stop_reason = Some(stop_reason);
                 vec![AgentEvent::Usage(usage)]
@@ -481,6 +538,10 @@ pub enum ProviderError {
     NotImplemented(&'static str),
     #[error("authentication failed")]
     Auth,
+    /// The request was rejected locally before sending (e.g. an invalid MCP
+    /// connector config that would otherwise 400). See T-6.1.
+    #[error("invalid request: {0}")]
+    Invalid(String),
     #[error("http error: {0}")]
     Http(String),
     #[error("decode error: {0}")]
@@ -718,6 +779,47 @@ mod tests {
         let mut m = AgentEventMapper::new();
         let out = m.accept(ProviderEvent::ThinkingDelta("hmm".into()));
         assert_eq!(out, vec![AgentEvent::Thinking("hmm".into())]);
+    }
+
+    #[test]
+    fn connector_mcp_events_pass_through_and_never_become_tool_proposed() {
+        // T-6.1: connector blocks map 1:1 to render-only AgentEvents; they never
+        // enter the open-tool buffer, so they can never surface as ToolProposed
+        // (which the loop would try to dispatch locally).
+        let mut m = AgentEventMapper::new();
+        let out = drive(
+            &mut m,
+            vec![
+                ProviderEvent::McpToolUse {
+                    id: "mcp_1".into(),
+                    name: "search".into(),
+                    server: "docs".into(),
+                    input: serde_json::json!({ "q": "rust" }),
+                },
+                ProviderEvent::McpToolResult {
+                    id: "mcp_1".into(),
+                    output: "a doc".into(),
+                    is_error: false,
+                },
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![
+                AgentEvent::McpToolUse {
+                    id: "mcp_1".into(),
+                    name: "search".into(),
+                    server: "docs".into(),
+                    input: serde_json::json!({ "q": "rust" }),
+                },
+                AgentEvent::McpToolResult {
+                    id: "mcp_1".into(),
+                    output: "a doc".into(),
+                    is_error: false,
+                },
+            ]
+        );
+        assert!(!out.iter().any(|e| matches!(e, AgentEvent::ToolProposed(_))));
     }
 
     #[test]

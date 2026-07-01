@@ -413,7 +413,28 @@ impl<'a, P: LlmProvider> AgentTurn<'a, P> {
                                 true,
                             ));
                         }
+                        AgentEvent::McpToolResult {
+                            id,
+                            output,
+                            is_error,
+                        } => {
+                            // Connector results ran server-side and are UNTRUSTED;
+                            // sanitize against the same Secrets before the timeline
+                            // sees them, then forward. Never dispatched locally.
+                            let clean = self.sanitize_observation(output, None);
+                            let _ = events
+                                .send(AgentEvent::McpToolResult {
+                                    id: id.clone(),
+                                    output: clean,
+                                    is_error: *is_error,
+                                })
+                                .await;
+                            continue;
+                        }
                         AgentEvent::TurnComplete { stop_reason } => stop = stop_reason.clone(),
+                        // `McpToolUse` (render-only) and streamed text/thinking fall
+                        // through to the generic forward below; they never enter the
+                        // gate/execute path.
                         _ => {}
                     }
                     // Swallow the per-round TurnComplete; `run` emits one final.

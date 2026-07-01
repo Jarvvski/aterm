@@ -14,6 +14,7 @@
 
 pub mod approval;
 pub mod command;
+pub mod mcp;
 pub mod policy;
 pub mod provider;
 pub mod risk;
@@ -28,6 +29,10 @@ pub mod turn;
 // Root re-exports for the load-bearing public surface.
 pub use approval::{ApprovalRequest, ChannelConfirmHandler};
 pub use command::ShellCommand;
+pub use mcp::connector::{
+    classify_mcp_tool, validate_connector_body, validate_servers, McpConfigError, McpServer,
+    McpToolPolicy, MCP_CONNECTOR_BETA,
+};
 pub use policy::{Approval, ApprovalPolicy, AutonomyMode, AutonomyState};
 pub use provider::{
     AgentEvent, AgentEventMapper, AnthropicProvider, ContentBlock, Effort, LlmProvider, Message,

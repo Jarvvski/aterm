@@ -13,6 +13,18 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The agent can now use remote MCP servers.** Point the Anthropic provider at a public
+  HTTPS MCP server and its tools become available to the agent through the Messages-API MCP
+  connector - Anthropic brokers the connection and runs the tools server-side (beta
+  `mcp-client-2025-11-20`), so there is no local client to babysit. Each server is scoped by a
+  **deny-by-default** per-tool policy: nothing is callable until you allow it by name, and a
+  denylisted or unlisted tool is disabled in the request itself, so a destructive tool is
+  gated off - never silently run. The connector's `mcp_tool_use`/`mcp_tool_result` blocks land
+  in the same timeline as native tool calls (the result sanitized against your `Secrets`
+  before it is shown, since a remote result is untrusted), and a malformed request (a server
+  without its matching toolset) is caught locally instead of round-tripping to a 400. Note
+  this path routes data through Anthropic and is NOT ZDR-eligible; privacy-sensitive users
+  should prefer a local stdio server (T-6.2). (Ticket T-6.1.)
 - **The agent actually runs now: ask it something and watch it work in the timeline.**
   Submitting a prompt to the agent (Enter in Agent mode, or Opt-Enter from anywhere) now
   starts a real client-side agentic turn on a background runtime - off the render thread, so
