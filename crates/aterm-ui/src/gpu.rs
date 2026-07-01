@@ -174,6 +174,19 @@ impl GpuRenderer {
         self.last_visible_blocks
     }
 
+    /// The input caret's rect in PHYSICAL px `[x, y, w, h]` when the input box drew on
+    /// the last frame, else `None` (alt-screen, or a host with no input). [`crate::app`]
+    /// feeds this to `Window::set_ime_cursor_area` so the IME candidate window sits under
+    /// the caret (ticket T-3.2).
+    #[must_use]
+    pub fn ime_cursor_area(&self) -> Option<[f32; 4]> {
+        if self.drew_input {
+            self.input.caret_area_px()
+        } else {
+            None
+        }
+    }
+
     /// Glyph-layer draw calls from the last frame: the PRIMARY front-end's (the timeline
     /// in normal mode, the grid in alt-screen - each exactly 1 when it has text, T-1.6
     /// AC c) plus the input box's one draw when it is shown (T-3.6). So a normal frame

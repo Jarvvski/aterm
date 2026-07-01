@@ -451,6 +451,13 @@ pub struct InputWidgetRenderer {
     built: Option<u64>,
     /// Glyph-layer draw calls issued by the last [`Self::draw`] (1 when anything inked).
     last_glyph_draw_calls: u32,
+    /// The caret's rect in PHYSICAL px `[x, y, w, h]` from the last [`Self::prepare`]
+    /// that rebuilt, or `None` before the first build. Used by [`crate::app`] to place
+    /// the IME candidate window under the caret via `Window::set_ime_cursor_area`
+    /// (ticket T-3.2). Held across an unchanged-signature early-out because the caret is
+    /// part of the signature, so a stale value only survives while the caret has not
+    /// moved.
+    last_caret_px: Option<[f32; 4]>,
 }
 
 impl InputWidgetRenderer {
@@ -470,6 +477,7 @@ impl InputWidgetRenderer {
             shaper: ProseShaper::new(),
             built: None,
             last_glyph_draw_calls: 0,
+            last_caret_px: None,
         }
     }
 
@@ -477,6 +485,15 @@ impl InputWidgetRenderer {
     #[must_use]
     pub fn last_glyph_draw_calls(&self) -> u32 {
         self.last_glyph_draw_calls
+    }
+
+    /// The caret's rect in PHYSICAL px `[x, y, w, h]` as of the last built frame, or
+    /// `None` before the first build. [`crate::app`] feeds this to
+    /// `Window::set_ime_cursor_area` so the IME candidate window sits under the caret
+    /// (ticket T-3.2).
+    #[must_use]
+    pub fn caret_area_px(&self) -> Option<[f32; 4]> {
+        self.last_caret_px
     }
 
     /// Build the frame's instances for `input` through the shared `atlas`, reusing the
@@ -798,15 +815,15 @@ impl InputWidgetRenderer {
         let caret_w = (CARET_WIDTH_LOGICAL * scale).round().max(1.0);
         let caret_x = text_x + f32::from(laid.caret_col) * cw;
         let caret_y = first_row_y + f32::from(laid.caret_row) * ch + ch * 0.1;
+        let caret_h = (ch * 0.8).round().max(1.0);
         self.bg_instances.push(RectInstance {
-            rect: [
-                caret_x.round(),
-                caret_y.round(),
-                caret_w,
-                (ch * 0.8).round().max(1.0),
-            ],
+            rect: [caret_x.round(), caret_y.round(), caret_w, caret_h],
             color: theme.colors.accent_primary.to_linear_f32(),
         });
+        // Record the caret rect (physical px) so the host can position the IME candidate
+        // window under it (ticket T-3.2). Kept until the next rebuild; the caret is part
+        // of the damage signature, so this is only stale while the caret has not moved.
+        self.last_caret_px = Some([caret_x.round(), caret_y.round(), caret_w, caret_h]);
 
         if !self.bg_instances.is_empty() {
             self.bg_buf.ensure(

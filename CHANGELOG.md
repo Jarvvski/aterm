@@ -13,6 +13,12 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The input box now handles IME composition (Japanese, Pinyin, and other input methods).**
+  Composing text shows the in-progress candidate inline under the caret, with the OS candidate
+  window positioned there, and pressing Enter to confirm a candidate no longer submits the line
+  or fires the agent - it just accepts the candidate (the classic terminal trap where Enter
+  during composition inserted a newline). Committed text is inserted as ordinary characters, and
+  losing focus mid-composition cleanly drops the half-composed text. (Ticket T-3.2.)
 - **The agent can now use local MCP servers, fully on-device.** Point aterm at a local stdio
   MCP server (a filesystem server, a git server, your own project server) and its tools
   become tools the agent can call, no matter which model backend you run. aterm speaks the

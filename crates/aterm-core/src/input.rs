@@ -114,8 +114,10 @@ pub enum InputEvent {
     ToggleMode,
 }
 
-/// Active IME composition. Reserved for ticket T-3.2 (IME via winit `Ime` events);
-/// the cursor range uses winit's byte indices. Not populated by this ticket.
+/// Active IME composition (ticket T-3.2, via winit `Ime` events). A transient overlay
+/// the renderer splices inline under the caret; the cursor range uses winit's byte
+/// indices. Populated/cleared through [`InputModel::set_preedit`] /
+/// [`InputModel::commit_ime`], never part of the committed buffer until it commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preedit {
     /// The in-progress composition string.
@@ -202,7 +204,7 @@ pub struct InputModel {
     undo: Vec<Snapshot>,
     /// Redo stack; cleared by any new edit.
     redo: Vec<Snapshot>,
-    /// Reserved for T-3.2 (IME); not populated here.
+    /// Active IME composition (T-3.2); a transient overlay, never part of the buffer.
     preedit: Option<Preedit>,
     /// Reserved for T-3.5 (async highlight overlay); empty here.
     overlay: Highlight,
@@ -318,6 +320,33 @@ impl InputModel {
         self.ghost = None;
         self.insert(&tail);
         true
+    }
+
+    // --- T-3.2 IME mutators (driven by the winit `Ime` event feed) ----------
+
+    /// Set (or clear) the active IME composition (ticket T-3.2). The preedit is a
+    /// **transient overlay**: it does NOT touch the committed text, selection, or undo
+    /// history (the composition is not part of the buffer until it commits). The aterm-ui
+    /// IME feed maps a winit `Ime::Preedit(text, cursor)` to `Some(Preedit { text, cursor })`
+    /// here; `None` clears it (winit `Ime::Disabled`, a focus loss, or an empty
+    /// `Ime::Preedit` - winit sends an empty preedit to signal "composition cleared").
+    /// The routing brain (T-3.3) reads [`Self::preedit`] first, so while this is `Some`
+    /// the IME owns Enter/Tab/Esc and nothing submits or routes.
+    pub fn set_preedit(&mut self, preedit: Option<Preedit>) {
+        self.preedit = preedit;
+    }
+
+    /// Commit an IME composition (ticket T-3.2): clear any active preedit, then insert
+    /// `text` as inert literal characters through the ordinary [`Self::insert`] path -
+    /// so it is ONE undo unit, replaces an active selection, and is never interpreted
+    /// (T-3.1 semantics). Called on winit `Ime::Commit`. An empty `text` only clears the
+    /// preedit (no insert, no undo entry), matching the empty-preedit winit sends just
+    /// before a commit.
+    pub fn commit_ime(&mut self, text: &str) {
+        self.preedit = None;
+        if !text.is_empty() {
+            self.insert(text);
+        }
     }
 
     // --- the reducer --------------------------------------------------------
@@ -991,5 +1020,114 @@ mod tests {
         assert_eq!(m.take(), "ls");
         assert!(m.ghost().is_none(), "take() drops the stale ghost");
         assert_eq!(m.ghost_tail(), None);
+    }
+
+    // --- T-3.2 IME mutators -------------------------------------------------
+
+    #[test]
+    fn set_preedit_is_a_transient_overlay_that_never_touches_the_buffer() {
+        // A preedit is the in-progress composition, NOT committed text: setting or
+        // clearing it must leave text/selection/undo untouched.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("ko".to_string()));
+        let text_before = m.text().to_string();
+        let sel_before = m.selection();
+        m.set_preedit(Some(Preedit {
+            text: "ni".to_string(),
+            cursor: Some((2, 2)),
+        }));
+        assert_eq!(
+            m.preedit(),
+            Some(&Preedit {
+                text: "ni".to_string(),
+                cursor: Some((2, 2)),
+            })
+        );
+        assert_eq!(m.text(), text_before, "preedit does not change the buffer");
+        assert_eq!(m.selection(), sel_before, "preedit does not move the caret");
+        // Undo is untouched: undoing pops the "ko" insert, not the preedit.
+        m.set_preedit(None);
+        assert!(m.preedit().is_none());
+        m.reduce(InputEvent::Undo);
+        assert_eq!(
+            m.text(),
+            "",
+            "undo history is intact across preedit set/clear"
+        );
+    }
+
+    #[test]
+    fn commit_ime_inserts_inert_text_clears_preedit_and_is_one_undo_unit() {
+        // AC (T-3.2): Commit inserts the final text as inert characters (T-3.1 Insert
+        // semantics) and clears the preedit.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("ko".to_string()));
+        m.set_preedit(Some(Preedit {
+            text: "ni".to_string(),
+            cursor: None,
+        }));
+        m.commit_ime("に");
+        assert_eq!(m.text(), "koに", "committed text is appended at the caret");
+        assert!(m.preedit().is_none(), "commit clears the preedit");
+        // Inert + one undo unit: undoing the commit removes exactly the committed run.
+        m.reduce(InputEvent::Undo);
+        assert_eq!(m.text(), "ko");
+    }
+
+    #[test]
+    fn commit_ime_replaces_an_active_selection() {
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("abc".to_string()));
+        m.reduce(InputEvent::Move(Motion::Home, false));
+        m.reduce(InputEvent::Move(Motion::Right, true));
+        m.reduce(InputEvent::Move(Motion::Right, true)); // select [0,2) = "ab"
+        m.commit_ime("X");
+        assert_eq!(m.text(), "Xc", "commit replaces the selection as one edit");
+        m.reduce(InputEvent::Undo);
+        assert_eq!(m.text(), "abc");
+    }
+
+    #[test]
+    fn commit_ime_with_empty_text_only_clears_the_preedit() {
+        // winit sends an empty Preedit right before a Commit; an empty Commit must not
+        // push an undo entry or change the buffer - just drop the composition.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("ls".to_string()));
+        m.set_preedit(Some(Preedit {
+            text: "x".to_string(),
+            cursor: None,
+        }));
+        m.commit_ime("");
+        assert_eq!(m.text(), "ls");
+        assert!(m.preedit().is_none());
+        // No spurious undo unit was pushed by the empty commit.
+        m.reduce(InputEvent::Undo);
+        assert_eq!(
+            m.text(),
+            "",
+            "undo pops the original insert, not an empty commit"
+        );
+    }
+
+    #[test]
+    fn commit_ime_embedded_control_chars_are_literal_and_inert() {
+        // Defensive: a commit string is stored verbatim, never interpreted.
+        let mut m = InputModel::new();
+        m.commit_ime("a\nb");
+        assert_eq!(m.text(), "a\nb");
+        assert!(m.text().contains('\n'));
+    }
+
+    #[test]
+    fn take_clears_a_dangling_preedit() {
+        // A submit must not carry a half-composed preedit onto the fresh buffer.
+        let mut m = InputModel::new();
+        m.reduce(InputEvent::Insert("ls".to_string()));
+        m.set_preedit(Some(Preedit {
+            text: "x".to_string(),
+            cursor: None,
+        }));
+        assert_eq!(m.take(), "ls");
+        assert!(m.preedit().is_none(), "take() drops the dangling preedit");
     }
 }

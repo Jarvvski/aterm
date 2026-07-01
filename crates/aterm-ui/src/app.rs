@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -145,6 +146,13 @@ pub trait UiCallbacks {
         None
     }
 
+    /// An IME composition event (ticket T-3.2), mapped from winit's `Ime` events to the
+    /// neutral [`crate::ime::ImeEvent`]. The host drives its `InputModel` preedit/commit
+    /// from these; the `preedit-active` routing gate (T-3.3) then guarantees Enter
+    /// confirms a candidate and never submits. Default no-op (a headless host has no
+    /// input box).
+    fn on_ime(&mut self, _event: crate::ime::ImeEvent) {}
+
     /// The window resized to `cols` x `rows` (cells), `width` x `height` (px).
     fn on_resize(&mut self, _cols: u16, _rows: u16, _width: u32, _height: u32) {}
 }
@@ -242,6 +250,10 @@ pub struct AtermApp<C: UiCallbacks> {
     /// ticket T-3.3). winit reports modifier transitions separately from key
     /// presses, so we hold the latest here.
     mods: ModifiersState,
+    /// The caret rect (physical px) last handed to `Window::set_ime_cursor_area`, so the
+    /// IME candidate window is only repositioned when the caret actually moves (ticket
+    /// T-3.2). `None` until the first position is set.
+    last_ime_area: Option<[f32; 4]>,
 }
 
 impl<C: UiCallbacks> AtermApp<C> {
@@ -260,6 +272,7 @@ impl<C: UiCallbacks> AtermApp<C> {
             recorder: None,
             last_present_at: None,
             mods: ModifiersState::empty(),
+            last_ime_area: None,
         }
     }
 
@@ -396,6 +409,23 @@ impl<C: UiCallbacks> AtermApp<C> {
             });
             self.last_present_at = Some(started);
         }
+
+        // Position the IME candidate window under the caret (ticket T-3.2). The input
+        // front-end records the caret rect (physical px) each build; hand it to winit
+        // only when it changed so a stationary caret does not re-issue the request every
+        // frame. `None` (alt-screen / no input box) leaves the last position untouched.
+        if let (Some(renderer), Some(window)) = (self.renderer.as_ref(), self.window.as_ref()) {
+            let area = renderer.ime_cursor_area();
+            if area != self.last_ime_area {
+                self.last_ime_area = area;
+                if let Some([x, y, w, h]) = area {
+                    window.set_ime_cursor_area(
+                        PhysicalPosition::new(f64::from(x), f64::from(y)),
+                        PhysicalSize::new(f64::from(w), f64::from(h)),
+                    );
+                }
+            }
+        }
     }
 
     /// Set the control flow for the next wait based on the scheduler state and the
@@ -451,6 +481,11 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
             }
         }
         self.callbacks.on_ready(window.clone());
+
+        // Enable IME so the platform delivers `WindowEvent::Ime` composition events for
+        // the self-drawn input box (ticket T-3.2). The candidate window is positioned
+        // under the caret via `set_ime_cursor_area` once the box has a caret to report.
+        window.set_ime_allowed(true);
 
         // Follow the OS appearance at launch if asked (later changes arrive as
         // `WindowEvent::ThemeChanged`). When off, the configured theme stays.
@@ -560,6 +595,31 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     let _ = bytes;
                 }
                 // A keystroke is activity: re-arm keep-warm and repaint.
+                self.scheduler.note_activity(Instant::now());
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::Ime(ime) => {
+                // IME composition (ticket T-3.2): hand the host the neutral event so it
+                // populates/clears its `InputModel` preedit (or commits). Composition is
+                // activity - re-arm keep-warm and repaint so the inline preedit shows and
+                // the caret rect (which positions the candidate window) stays current.
+                self.callbacks.on_ime(crate::ime::ImeEvent::from_winit(ime));
+                self.scheduler.note_activity(Instant::now());
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::Focused(false) => {
+                // Losing focus mid-composition must clear any dangling preedit (ticket
+                // T-3.2 AC "Disabled/blur clears any dangling preedit"). winit on macOS
+                // does NOT emit `Ime::Disabled` on `windowDidResignKey` - it only sends
+                // `Focused(false)` - so without this a composition marked at blur would
+                // leave `preedit` set forever, and the routing brain (which gates on
+                // `preedit_active` first) would then swallow every subsequent key,
+                // wedging the input box. Synthesize the disable so the host drops it.
+                self.callbacks.on_ime(crate::ime::ImeEvent::Disabled);
                 self.scheduler.note_activity(Instant::now());
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();

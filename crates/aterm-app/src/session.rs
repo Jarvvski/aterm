@@ -20,9 +20,9 @@ use aterm_agent::{AutonomyState, Secrets};
 use aterm_core::{
     keys, BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
 };
-use aterm_ui::{KeyPress, NamedKey, UiCallbacks, Window};
+use aterm_ui::{ImeEvent, KeyPress, NamedKey, UiCallbacks, Window};
 
-use aterm_core::{InputEvent, InputMode, InputModel, Motion};
+use aterm_core::{InputEvent, InputMode, InputModel, Motion, Preedit};
 
 use crate::agent_runtime::{AgentRuntime, TurnHandle};
 use crate::config::Config;
@@ -62,6 +62,30 @@ pub struct Session {
     /// into a new session (AC5); the cycle hotkey mutates it (AC4), the always-visible
     /// indicator reads it, and its `policy()` gates each live turn (ticket T-5.11).
     autonomy: AutonomyState,
+}
+
+/// Apply a T-3.2 IME event to the input model. Pure (no engine / no window), so the
+/// composition semantics are unit-testable without spawning a session:
+///
+/// - `Enabled` - composition may begin; the preedit arrives in following events.
+/// - `Preedit` - set the transient composition overlay. winit sends an EMPTY preedit to
+///   mean "cleared" (it precedes every `Commit`), so an empty string clears it.
+/// - `Commit` - insert the final text as inert characters and clear the preedit (one
+///   undo unit; replaces any selection).
+/// - `Disabled` - the IME was turned off / focus was lost; drop any dangling preedit.
+fn apply_ime(input: &mut InputModel, event: ImeEvent) {
+    match event {
+        ImeEvent::Enabled => {}
+        ImeEvent::Preedit { text, cursor } => {
+            if text.is_empty() {
+                input.set_preedit(None);
+            } else {
+                input.set_preedit(Some(Preedit { text, cursor }));
+            }
+        }
+        ImeEvent::Commit(text) => input.commit_ime(&text),
+        ImeEvent::Disabled => input.set_preedit(None),
+    }
 }
 
 /// Map the agent's autonomy tier onto the UI-local indicator enum. The crate boundary
@@ -127,9 +151,10 @@ impl Session {
 
     /// Build the routing context from live state. `degraded` (integration `None`),
     /// `alt_screen`, `foreground_reading_stdin` (a foreground process group other than
-    /// the hidden shell owns the terminal), and `agent_turn_active` (a live agent turn
-    /// is running, ticket T-5.11) are all sourced live; only `preedit_active` (T-3.2
-    /// IME) still reads `false` until that ticket lands (a documented residual).
+    /// the hidden shell owns the terminal), `agent_turn_active` (a live agent turn is
+    /// running, ticket T-5.11), and `preedit_active` (an IME composition is in progress,
+    /// ticket T-3.2 - so Enter confirms the candidate and never submits) are all sourced
+    /// live.
     fn routing_context(&mut self) -> RoutingContext {
         let degraded = matches!(
             self.engine.integration_status().status,
@@ -138,7 +163,7 @@ impl Session {
         let alt_screen = self.engine.latest_snapshot().alt_screen;
         RoutingContext {
             mode: self.input.mode(),
-            preedit_active: false,
+            preedit_active: self.input.preedit().is_some(),
             degraded,
             alt_screen,
             foreground_reading_stdin: self.engine.foreground_is_foreign(),
@@ -347,8 +372,11 @@ impl UiCallbacks for Session {
 
         let ctx = self.routing_context();
         let bytes = match decide(classify(&key, &self.toggle_key), &ctx) {
-            // The IME owns the key (T-3.2); nothing routes. Unreachable today
-            // (`preedit_active` is false until T-3.2 lands).
+            // The IME owns the key while a composition is active (T-3.2): nothing routes
+            // or submits. The composition itself is driven by `on_ime` (winit delivers
+            // committed/candidate keys as `Ime` events, not `KeyboardInput`); this gate
+            // catches any raw key that still arrives mid-composition (notably Enter, so
+            // it confirms the candidate instead of submitting - the Zed #23003 trap).
             Disposition::ImeComposing => None,
             // The hotkey flips ONLY the mode; text/selection/undo preserved (T-3.1).
             Disposition::ToggleMode => {
@@ -431,6 +459,16 @@ impl UiCallbacks for Session {
         bytes
     }
 
+    fn on_ime(&mut self, event: ImeEvent) {
+        // T-3.2 IME feed. Populate/clear the pure `InputModel`'s preedit (a transient
+        // overlay that never touches the committed buffer) or commit the final text.
+        // `preedit.is_some()` then makes `routing_context` report `preedit_active`, so
+        // the routing brain (T-3.3) gives the IME Enter/Tab/Esc and never submits mid-
+        // composition (the Zed #23003 trap). No PTY bytes flow here - even in Shell mode
+        // the composed text only becomes shell input when the line is submitted.
+        apply_ime(&mut self.input, event);
+    }
+
     fn on_resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) {
         // Pixel dims are advisory (TIOCSWINSZ ws_xpixel/ypixel); clamp rather than
         // silently wrap if a surface somehow exceeds u16.
@@ -439,6 +477,76 @@ impl UiCallbacks for Session {
             cols,
             u16::try_from(width).unwrap_or(u16::MAX),
             u16::try_from(height).unwrap_or(u16::MAX),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The Session-layer IME semantics (ticket T-3.2), tested on a bare `InputModel`
+    // through the pure `apply_ime` boundary - no PTY/engine/window needed. The routing
+    // gate (`preedit_active` -> Enter never submits) is covered in `routing.rs`
+    // (`ime_composition_owns_enter_and_never_submits`); the core mutators in `input.rs`.
+
+    #[test]
+    fn preedit_event_populates_then_an_empty_preedit_clears_it() {
+        let mut input = InputModel::new();
+        input.reduce(InputEvent::Insert("ko".to_string()));
+        apply_ime(
+            &mut input,
+            ImeEvent::Preedit {
+                text: "ni".to_string(),
+                cursor: Some((2, 2)),
+            },
+        );
+        assert!(
+            input.preedit().is_some(),
+            "an active composition drives preedit_active"
+        );
+        assert_eq!(input.text(), "ko", "preedit does not touch the buffer");
+        // winit sends an empty preedit right before a commit; it must CLEAR, not show.
+        apply_ime(
+            &mut input,
+            ImeEvent::Preedit {
+                text: String::new(),
+                cursor: None,
+            },
+        );
+        assert!(input.preedit().is_none(), "an empty preedit clears");
+    }
+
+    #[test]
+    fn commit_inserts_the_final_text_and_clears_preedit() {
+        // AC: Commit inserts the final text (inert) and does not leave a dangling preedit.
+        let mut input = InputModel::new();
+        apply_ime(
+            &mut input,
+            ImeEvent::Preedit {
+                text: "に".to_string(),
+                cursor: None,
+            },
+        );
+        apply_ime(&mut input, ImeEvent::Commit("日本".to_string()));
+        assert_eq!(input.text(), "日本");
+        assert!(input.preedit().is_none());
+    }
+
+    #[test]
+    fn disabled_clears_a_dangling_preedit() {
+        let mut input = InputModel::new();
+        apply_ime(
+            &mut input,
+            ImeEvent::Preedit {
+                text: "x".to_string(),
+                cursor: None,
+            },
+        );
+        apply_ime(&mut input, ImeEvent::Disabled);
+        assert!(
+            input.preedit().is_none(),
+            "blur/disable drops the composition so it cannot wedge the routing gate"
         );
     }
 }
