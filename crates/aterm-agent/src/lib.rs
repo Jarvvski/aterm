@@ -33,6 +33,10 @@ pub use mcp::connector::{
     classify_mcp_tool, validate_connector_body, validate_servers, McpConfigError, McpServer,
     McpToolPolicy, MCP_CONNECTOR_BETA,
 };
+pub use mcp::discovery::{
+    discover, discover_with, DiscoveredServer, DiscoveredTransport, Discovery, DiscoveryEnv,
+    DiscoveryError, RemoteTransport, ServerScope, DISABLE_ENV,
+};
 pub use mcp::stdio::{
     McpError, McpToolRouter, McpTransport, ProcessTransport, StdioMcpClient, StdioServerConfig,
 };

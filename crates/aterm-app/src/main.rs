@@ -8,6 +8,7 @@
 
 mod agent_runtime;
 mod config;
+mod mcp;
 mod routing;
 mod session;
 

@@ -13,6 +13,18 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **aterm now auto-discovers your MCP servers.** On startup it reads the standard `mcpServers`
+  JSON config - a project `.mcp.json` (searched upward from the working directory) and a
+  user-level file (the first that exists among `$HOME/mcp.json`, the `$XDG` locations, and
+  `~/.claude.json`) - then automatically connects the local (stdio) servers and wires the remote
+  ones through the Anthropic MCP connector, so the servers you already set up for Claude Code work
+  in aterm with no extra config. Every discovered tool passes through the same risk gate as a
+  built-in tool: local tools require confirmation, and remote servers are deny-by-default (no tool
+  enabled until you allow-list it), so a discovered destructive tool never runs unattended. A
+  project entry overrides a user one of the same name; `${VAR}` / `${VAR:-default}` are expanded.
+  Disable a server with `"disabled": true` in the config or `ATERM_MCP_DISABLE=name1,name2`;
+  discovered servers and their status are logged at startup. (Codex's `~/.codex/config.toml` is a
+  deferred follow-up.) (Ticket T-6.3.)
 - **Contributor: resize/reflow and the shell-integration matrix are now hardened with tests.**
   A finished command block's captured output is proven byte-identical after a window resize
   (only the live grid reflows - history is immune to alacritty's reflow bugs), and a new

@@ -100,6 +100,14 @@ impl AnthropicProvider {
         self
     }
 
+    /// How many connector servers this provider carries. A read-only accessor (the
+    /// `mcp_servers` are otherwise private) so callers/tests can confirm discovered
+    /// remote servers (ticket T-6.3) were actually attached before a turn.
+    #[must_use]
+    pub fn mcp_server_count(&self) -> usize {
+        self.mcp_servers.len()
+    }
+
     /// Borrow the configured HTTP client.
     #[must_use]
     pub fn http(&self) -> &reqwest::Client {

@@ -31,11 +31,13 @@ use std::time::{Duration, Instant};
 use aterm_agent::{
     badge_for_approval, gate_tool, gloss_for, AgentEvent, AgentTurn, AnthropicProvider, Approval,
     ApprovalPolicy, ApprovalRequest, CancelToken, ChannelConfirmHandler, Effort, LlmProvider,
-    Message, MockProvider, OpenAiProvider, ProviderEvent, Secrets, Sinks, StopReason, ToolCall,
-    ToolRegistry, TurnRequest, Usage,
+    McpServer, McpToolRouter, Message, MockProvider, OpenAiProvider, ProviderEvent, Secrets, Sinks,
+    StopReason, ToolCall, ToolRegistry, TurnRequest, Usage,
 };
 use aterm_core::{AgentBadge, AgentBlock, AgentBlockKind, AgentInjector};
 use tokio::sync::mpsc;
+
+use crate::mcp::{provision, McpProvision};
 
 /// Depth of the turn-loop -> projector event channel. Generous; the projector drains
 /// it as fast as the model thread accepts mailbox sends, and the turn loop produces
@@ -344,6 +346,11 @@ pub struct AgentRuntime {
     rt: Option<tokio::runtime::Runtime>,
     root: PathBuf,
     secrets: Secrets,
+    /// Auto-discovered MCP servers (ticket T-6.3), provisioned ONCE at startup and
+    /// shared (by `Arc`) into every turn: connected local stdio clients + their
+    /// gated tools, plus the deny-by-default remote connector servers. Empty (a
+    /// pure passthrough) when nothing is configured.
+    mcp: Arc<McpProvision>,
 }
 
 impl AgentRuntime {
@@ -351,15 +358,42 @@ impl AgentRuntime {
     /// confined to and its commands default their cwd to) with the single `secrets`
     /// deny-set that feeds the gate, the sandbox, and the sanitizer alike.
     pub fn new(root: PathBuf, secrets: Secrets) -> std::io::Result<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .thread_name("aterm-agent")
-            .build()?;
+        let rt = Self::build_runtime()?;
+        // Auto-discover + connect MCP servers ONCE at startup (ticket T-6.3), on the
+        // runtime we just built (spawning server children needs a tokio context).
+        // This BLOCKS the caller (Session::spawn, hence window creation) until the
+        // connects settle - bounded, not unbounded: servers connect concurrently and
+        // each is capped by `provision`'s per-server timeout, so a wedged server
+        // delays startup by at most that timeout, then is skipped (fail-soft). When
+        // nothing is configured this is a cheap no-op.
+        let mcp = Arc::new(rt.block_on(provision(root.clone())));
         Ok(Self {
             rt: Some(rt),
             root,
             secrets,
+            mcp,
+        })
+    }
+
+    /// The multi-thread tokio runtime the agent turns run on, off the render thread.
+    fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("aterm-agent")
+            .build()
+    }
+
+    /// Test-only constructor that SKIPS MCP auto-discovery, so a unit test never
+    /// reads a developer's real `~/.claude.json` or spawns real server processes
+    /// (ticket T-6.3). Production always goes through [`Self::new`].
+    #[cfg(test)]
+    fn new_without_mcp(root: PathBuf, secrets: Secrets) -> std::io::Result<Self> {
+        Ok(Self {
+            rt: Some(Self::build_runtime()?),
+            root,
+            secrets,
+            mcp: Arc::new(McpProvision::default()),
         })
     }
 
@@ -414,9 +448,14 @@ impl AgentRuntime {
         let cancel_task = cancel.clone();
         let active_task = Arc::clone(&active);
         let pending_task = Arc::clone(&pending);
+        let mcp = Arc::clone(&self.mcp);
         rt.spawn(async move {
             run_turn(
-                select_provider(),
+                select_provider(
+                    mcp.remote.clone(),
+                    nonempty_env("ANTHROPIC_API_KEY"),
+                    nonempty_env("OPENAI_API_KEY"),
+                ),
                 prompt,
                 policy,
                 secrets,
@@ -424,6 +463,7 @@ impl AgentRuntime {
                 injector,
                 handler,
                 &cancel_task,
+                &mcp,
             )
             .await;
             // The turn has ended (completed, errored, or cancelled): fail-closed deny
@@ -476,18 +516,43 @@ enum SelectedProvider {
     Mock(MockProvider),
 }
 
-/// Pick a provider from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, falling back to the
-/// keyless demo mock.
-fn select_provider() -> SelectedProvider {
-    if let Some(key) = nonempty_env("ANTHROPIC_API_KEY") {
-        log::info!("agent: using the Anthropic provider");
-        return SelectedProvider::Anthropic(AnthropicProvider::new(key));
+/// Pick a provider from the given API keys (read from the env at the call site;
+/// INJECTED here so the branching is unit-testable without mutating process env),
+/// falling back to the keyless demo mock. `remote` is the discovered
+/// deny-by-default connector servers (ticket T-6.3): they wire into the Anthropic
+/// provider's connector (the only provider with the MCP connector, T-6.1); under
+/// OpenAI/mock they are inert, and we say so rather than silently dropping them.
+fn select_provider(
+    remote: Vec<McpServer>,
+    anthropic_key: Option<String>,
+    openai_key: Option<String>,
+) -> SelectedProvider {
+    if let Some(key) = anthropic_key {
+        log::info!(
+            "agent: using the Anthropic provider ({} remote MCP server(s))",
+            remote.len()
+        );
+        return SelectedProvider::Anthropic(AnthropicProvider::new(key).with_mcp_servers(remote));
     }
-    if let Some(key) = nonempty_env("OPENAI_API_KEY") {
+    if let Some(key) = openai_key {
         log::info!("agent: using the OpenAI provider");
+        if !remote.is_empty() {
+            log::warn!(
+                "mcp: {} remote server(s) discovered but the MCP connector requires the \
+                 Anthropic provider; they are inactive under OpenAI (local stdio servers \
+                 still work)",
+                remote.len()
+            );
+        }
         return SelectedProvider::OpenAi(OpenAiProvider::new(key));
     }
     log::info!("agent: no API key set; using the keyless mock provider (demo)");
+    if !remote.is_empty() {
+        log::info!(
+            "mcp: {} remote server(s) discovered but inactive under the keyless mock provider",
+            remote.len()
+        );
+    }
     SelectedProvider::Mock(MockProvider::scripted(demo_script()))
 }
 
@@ -510,16 +575,26 @@ async fn run_turn(
     injector: AgentInjector,
     handler: ChannelConfirmHandler,
     cancel: &CancelToken,
+    mcp: &McpProvision,
 ) {
     match provider {
         SelectedProvider::Anthropic(p) => {
-            drive(&p, prompt, policy, secrets, root, injector, handler, cancel).await;
+            drive(
+                &p, prompt, policy, secrets, root, injector, handler, cancel, mcp,
+            )
+            .await;
         }
         SelectedProvider::OpenAi(p) => {
-            drive(&p, prompt, policy, secrets, root, injector, handler, cancel).await;
+            drive(
+                &p, prompt, policy, secrets, root, injector, handler, cancel, mcp,
+            )
+            .await;
         }
         SelectedProvider::Mock(p) => {
-            drive(&p, prompt, policy, secrets, root, injector, handler, cancel).await;
+            drive(
+                &p, prompt, policy, secrets, root, injector, handler, cancel, mcp,
+            )
+            .await;
         }
     }
 }
@@ -537,9 +612,19 @@ async fn drive<P: LlmProvider>(
     injector: AgentInjector,
     handler: ChannelConfirmHandler,
     cancel: &CancelToken,
+    mcp: &McpProvision,
 ) {
-    let registry = ToolRegistry::with_default_tools();
+    // Register the discovered local MCP tools (ticket T-6.3) alongside the native
+    // set; the turn loop gates each MCP call to confirmation like a native mutation.
+    let registry = ToolRegistry::with_default_tools().with_mcp_tools(mcp.tools.clone());
+    // Dispatch through the MCP router: it routes an `ToolInput::Mcp` call to the
+    // owning stdio client and every native tool to the gated+sandboxed sinks. With
+    // no local servers registered it is a pure passthrough to the sinks.
     let sinks = Sinks::seatbelt(root, secrets.clone());
+    let mut router = McpToolRouter::new(sinks);
+    for client in &mcp.clients {
+        router = router.with_server(Arc::clone(client));
+    }
     let turn = AgentTurn::with_policy(provider, &secrets, policy.clone());
 
     let request = TurnRequest {
@@ -559,7 +644,7 @@ async fn drive<P: LlmProvider>(
             projector.apply(event);
         }
     };
-    let run = turn.run(request, &registry, &sinks, &handler, cancel, events_tx);
+    let run = turn.run(request, &registry, &router, &handler, cancel, events_tx);
 
     let (result, ()) = tokio::join!(run, pump);
     match result {
@@ -836,7 +921,8 @@ mod tests {
         // in-flight turn's AgentInjector clone is released before the engine is joined.
         // Guard that it drops the runtime and is safe to call more than once (Session's
         // Drop calls it; a double call must not panic).
-        let mut rt = AgentRuntime::new(PathBuf::from("."), Secrets::new()).expect("runtime builds");
+        let mut rt = AgentRuntime::new_without_mcp(PathBuf::from("."), Secrets::new())
+            .expect("runtime builds");
         assert!(rt.rt.is_some());
         rt.shutdown();
         assert!(rt.rt.is_none(), "shutdown drops the runtime");
@@ -857,5 +943,41 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn select_provider_attaches_discovered_remote_mcp_only_to_anthropic() {
+        // T-6.3 AC(b): a discovered remote server is wired through the connector -
+        // but ONLY on the Anthropic path (the sole provider with the MCP connector).
+        // Under OpenAI / the keyless mock it is inert (not attached), and this is the
+        // branch that decides that. Keys are injected, so no env is mutated.
+        let remote = vec![McpServer::new("docs", "https://mcp.example.com")];
+
+        // Anthropic: the remote server IS attached to the connector.
+        match select_provider(remote.clone(), Some("sk-test".into()), None) {
+            SelectedProvider::Anthropic(p) => assert_eq!(p.mcp_server_count(), 1),
+            _ => panic!("expected the Anthropic provider"),
+        }
+        // Anthropic wins even when both keys are present.
+        assert!(matches!(
+            select_provider(remote.clone(), Some("a".into()), Some("o".into())),
+            SelectedProvider::Anthropic(_)
+        ));
+        // OpenAI: the connector is Anthropic-only, so the remote server is dropped
+        // (the provider is still OpenAI; local stdio tools would still work).
+        assert!(matches!(
+            select_provider(remote.clone(), None, Some("o".into())),
+            SelectedProvider::OpenAi(_)
+        ));
+        // No key: the keyless mock; remote still inert.
+        assert!(matches!(
+            select_provider(remote, None, None),
+            SelectedProvider::Mock(_)
+        ));
+        // No discovered servers + Anthropic key -> zero connector servers attached.
+        match select_provider(Vec::new(), Some("k".into()), None) {
+            SelectedProvider::Anthropic(p) => assert_eq!(p.mcp_server_count(), 0),
+            _ => panic!("expected the Anthropic provider"),
+        }
     }
 }
