@@ -2,7 +2,7 @@
 id: T-9.1
 epic: EPIC-9-vision-mock-reskin
 title: Reconcile tokens to the vision mock - warm palette + agent second-accent + elevated surface
-status: ready-for-agent
+status: done
 labels: [tokens, design, ui]
 depends_on: []
 ---
@@ -61,18 +61,27 @@ never hardcoded hex.
 
 # Acceptance criteria
 
-- [ ] `tokens.toml` carries the mock's dark + light values under the existing
+- [x] `tokens.toml` carries the mock's dark + light values under the existing
   semantic names, plus the new `bg.elev` and `accent.agent` tokens; the
   `aterm-tokens` crate exposes them as typed constants and builds clean.
-- [ ] `design-system.md` intent text matches (warm palette, two mode accents,
+- [x] `design-system.md` intent text matches (warm palette, two mode accents,
   elevated surface); the stale "one accent" / "no title bar / no sidebar" clauses
   are updated to cite ADR-0011.
-- [ ] A "current mode accent" resolver exists (shell->primary, agent->agent) and
+- [x] A "current mode accent" resolver exists (shell->primary, agent->agent) and
   is unit-tested for both modes and both themes.
-- [ ] Contrast re-validation runs in a test; every quoted ratio is recomputed
+- [x] Contrast re-validation runs in a test; every quoted ratio is recomputed
   against the new hexes, and any sub-AA pair is annotated with its permitted use.
-- [ ] No consumer regresses: `mise run build && mise run test` pass across the
+- [x] No consumer regresses: `mise run build && mise run test` pass across the
   workspace.
+
+## Notes
+
+Landed 2026-07-01. The mock's alpha tints (`hairline`, `selection_bg`, the
+`*_weak` fills) are stored pre-composited to opaque (they only ever sit on
+canvas). `fg_muted` is the one intentional sub-AA tone (2.45/2.49:1 - the mock's
+faint meta), annotated and guarded by `fg_muted_is_intentionally_sub_aa`. Wiring
+the mode accent into the caret/prompt-glyph/mode-chip pixels is deferred to T-9.4
+(this ticket adds only the `mode_accent` resolver + `accent_agent` token).
 
 # Out of scope
 
