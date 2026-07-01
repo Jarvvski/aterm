@@ -76,3 +76,25 @@ detector, not the absolute truth - consistent with T-7.1 / T-7.2's honest limits
 `scenario_driver`, it is headless-safe: too few iterations (no display) is
 `Inconclusive`, exit 0 - never a false pass. On a real ProMotion panel a manual
 `--display-link` run raises the frame-equivalent gate to 120Hz.
+
+**Adversarial review (skeptic pass) - 4 findings, all addressed:**
+- **[HIGH] the median arm is ~tautological** (the ordering measure pins the median at
+  ~1.0 present interval, so `median <= 1.5f` mainly re-detects present-slip T-7.2 already
+  gates). REFRAMED honestly: the median arm is a documented cadence-hold floor; the
+  **p99 tail is the real regression signal** (a keystroke whose glyph slipped ~2+ extra
+  presents); the module doc states plainly this is a present-scheduling detector and the
+  genuinely tight keystroke number needs render-side content read-back or the rig (blind
+  spot (c)).
+- **[MED] hardcoded-60Hz frame denominator miscalibrates the CI gate.** Fixed by
+  **self-calibrating**: frames divide by the run's OWN observed median present interval
+  (collected from the recorder samples), falling back to the nominal refresh only when
+  unavailable. Verified on hardware: `cadence=16.69ms`, median 1.00 intervals.
+- **[MED] non-finite f32 breaks the JSON round-trip** (serde emits `null`). Fixed:
+  non-finite samples are dropped in `LatencyReport::new` + `from_samples`; a test asserts
+  a NaN/Inf-laced run still round-trips as a typed struct.
+- **[LOW] the report was `Serialize`-only.** Added `Deserialize` to `LatencyReport` +
+  `LatencyStats`.
+- Verified correct, no change: the percentile/Tukey math, hang-freedom + the MAX_RUN
+  backstop, headless-safety, the insert/backspace alternation, the
+  warmup/cooldown/iteration boundaries, the internally-tagged `Fail{breaches}` serde
+  round-trip, and the two-macos-14-jobs workflow.

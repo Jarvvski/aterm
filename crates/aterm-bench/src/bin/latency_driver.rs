@@ -151,7 +151,7 @@ fn summarize(report: &LatencyReport) {
     };
     log::info!(
         "input-latency {verdict} n={} median={:.2}ms ({:.2}f) p25={:.2}ms p75={:.2}ms \
-         p99={:.2}ms ({:.2}f) max={:.2}ms outliers={} refresh={:?}",
+         p99={:.2}ms ({:.2}f) max={:.2}ms outliers={} cadence={:.2}ms refresh={:?}",
         s.count,
         s.median_ms,
         s.median_frames,
@@ -161,6 +161,7 @@ fn summarize(report: &LatencyReport) {
         s.p99_frames,
         s.max_ms,
         s.outliers,
+        s.interval_ms,
         s.refresh,
     );
 }
@@ -189,6 +190,10 @@ struct LatencyCallbacks {
 
     /// The recorded keystroke->glyph samples.
     samples: Vec<LatencySample>,
+    /// Inter-present intervals (ms) observed during measurement - their median is the
+    /// self-calibrating frame denominator (so the gate is judged against the run's actual
+    /// present cadence, not a hardcoded refresh).
+    present_intervals: Vec<f32>,
     /// 0-based iteration counter (also each sample's `iteration`).
     iteration: u32,
     /// First-tick instant, for the [`MAX_RUN`] backstop.
@@ -210,6 +215,7 @@ impl LatencyCallbacks {
             cooldown: 0,
             insert_next: true,
             samples: Vec::new(),
+            present_intervals: Vec::new(),
             iteration: 0,
             started: None,
             results,
@@ -217,12 +223,19 @@ impl LatencyCallbacks {
         }
     }
 
-    /// Finalize the run into the shared [`LatencyReport`] and request exit.
+    /// Finalize the run into the shared [`LatencyReport`] and request exit. The observed
+    /// median present interval (self-calibrating frame denominator) is computed from the
+    /// intervals seen during measurement.
     fn finish(&mut self) {
         if self.done {
             return;
         }
-        let report = LatencyReport::new(&self.gate, std::mem::take(&mut self.samples));
+        let observed_interval = median_ms(&mut self.present_intervals);
+        let report = LatencyReport::new(
+            &self.gate,
+            std::mem::take(&mut self.samples),
+            observed_interval,
+        );
         *self.results.lock().unwrap_or_else(|p| p.into_inner()) = Some(report);
         self.done = true;
     }
@@ -248,7 +261,7 @@ impl UiCallbacks for LatencyCallbacks {
         }
     }
 
-    fn on_frame(&mut self, _sample: FrameSample) {
+    fn on_frame(&mut self, sample: FrameSample) {
         if self.done {
             return;
         }
@@ -258,6 +271,14 @@ impl UiCallbacks for LatencyCallbacks {
         // Warm the atlas/pipeline + present cadence before measuring.
         if self.frames_seen <= WARMUP_FRAMES {
             return;
+        }
+
+        // Track the steady present cadence (post-warmup) - its median is the
+        // self-calibrating frame denominator. The first post-warmup frame's interval can
+        // be a fresh-burst 0 (the scheduler clears `last_present_at` when it idles), so
+        // only finite positive intervals count.
+        if sample.present_interval_ms.is_finite() && sample.present_interval_ms > 0.0 {
+            self.present_intervals.push(sample.present_interval_ms);
         }
 
         // A keystroke is in flight: the first frame AFTER the one it was applied on is the
@@ -308,4 +329,14 @@ impl UiCallbacks for LatencyCallbacks {
     fn should_exit(&self) -> bool {
         self.done
     }
+}
+
+/// Median of the given ms values (sorts in place), or `None` if empty. Used to reduce the
+/// observed present intervals to the single self-calibrating frame denominator.
+fn median_ms(values: &mut [f32]) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    Some(values[values.len() / 2])
 }

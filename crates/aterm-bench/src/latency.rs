@@ -18,11 +18,29 @@
 //! ## The gate (from [`09-performance-60fps.md`] §9)
 //!
 //! keystroke->glyph **median <= 1.5 frames** and **p99 <= 3 frames** at the active
-//! refresh. Expressed in *frames* (not ms) so the same gate holds at 60Hz and 120Hz:
-//! 1.5 frames is 25ms @ 60Hz / 12.5ms @ 120Hz. The measure runs the GNOME-46
-//! methodology - ~120 iterations, reported as median + p25/p75 + outliers - and needs
-//! at least [`MIN_ITERATIONS`] samples to be conclusive (below that a headless/no-display
-//! run is [`LatencyVerdict::Inconclusive`], never a false pass).
+//! refresh, over the GNOME-46 methodology's ~120 iterations (reported median + p25/p75 +
+//! outliers), needing at least [`MIN_ITERATIONS`] samples to be conclusive (below that a
+//! headless/no-display run is [`LatencyVerdict::Inconclusive`], never a false pass).
+//!
+//! A "frame" here is one **present interval**, and it is measured against the run's OWN
+//! observed present cadence (the median inter-present interval the driver saw), falling
+//! back to the nominal [`Refresh`] deadline only when that observed interval is
+//! unavailable. Self-calibrating to the observed cadence (rather than a hardcoded 60/120
+//! Hz) is deliberate: the shared CI runner's surface may not present at exactly the
+//! nominal refresh, so a hardcoded denominator would silently bias the gate (a slow
+//! runner false-fails, a fast one false-passes). It also cleanly divides labour with
+//! T-7.2: that gate is the ABSOLUTE frame-time floor ("is every present under 16ms"),
+//! while this gate is the keystroke's slip RELATIVE to the steady beat ("does the glyph
+//! appear promptly given the cadence").
+//!
+//! **What each arm means.** Because the measure is present-ordering-based (below), the
+//! **median sits at ~1.0 present interval by construction** in a healthy pipeline - so
+//! the `median <= 1.5` arm is a **cadence-hold floor / sanity check**, not a tight budget.
+//! The real regression signal is the **p99 tail**: when a present genuinely slips a vsync
+//! (the render missed its deadline for that keystroke's frame), that keystroke's glyph
+//! lands a present interval late and shows up in the tail - `p99 <= 3 intervals` catches a
+//! keystroke whose glyph slipped ~2+ extra presents. (Consistent with the frame-budget
+//! being a tail-latency problem, §2.4.)
 //!
 //! ## What the software measure captures (and what it does not)
 //!
@@ -54,12 +72,16 @@
 use aterm_ui::Refresh;
 use serde::{Deserialize, Serialize};
 
-/// The blocking median gate: keystroke->glyph median <= 1.5 frames at the active
-/// refresh ([`09-performance-60fps.md`] §9).
+/// The median gate: keystroke->glyph median <= 1.5 present intervals
+/// ([`09-performance-60fps.md`] §9). A **cadence-hold floor**: the ordering-based measure
+/// pins the median at ~1.0 interval in a healthy pipeline, so this arm trips only on a
+/// gross systematic slip - the falsifiable regression signal is the p99 tail
+/// ([`LATENCY_P99_MAX_FRAMES`]).
 pub const LATENCY_MEDIAN_MAX_FRAMES: f32 = 1.5;
 
-/// The blocking tail gate: keystroke->glyph p99 <= 3 frames at the active refresh
-/// ([`09-performance-60fps.md`] §9).
+/// The blocking tail gate: keystroke->glyph p99 <= 3 present intervals
+/// ([`09-performance-60fps.md`] §9). The real signal - a keystroke whose glyph slipped ~2+
+/// extra presents (the render missed a vsync for its frame) lands here.
 pub const LATENCY_P99_MAX_FRAMES: f32 = 3.0;
 
 /// Minimum conclusive iteration count (the AC floor: report over `>= 100` iterations).
@@ -83,25 +105,31 @@ pub struct LatencySample {
     pub press_to_glyph_ms: f32,
 }
 
-/// The percentile summary of a latency run, in BOTH milliseconds and frame-equivalents
-/// at the run's [`Refresh`] (the gate is stated in frames; the raw ms are kept for the
+/// The percentile summary of a latency run, in BOTH milliseconds and present-interval
+/// equivalents (the gate is stated in intervals; the raw ms are kept for the
 /// histogram/offline analysis). Reports the GNOME-46 quartet - median + p25/p75 +
-/// `outliers` - alongside the p99 tail and the min/max envelope.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+/// `outliers` - alongside the p99 tail and the min/max envelope. `Deserialize` so the
+/// whole report round-trips as a typed struct, not just via `serde_json::Value`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LatencyStats {
     /// Samples summarized.
     pub count: usize,
-    /// The refresh the frame-equivalents derive from.
+    /// The nominal refresh (the fallback denominator + what cadence the run targeted).
     pub refresh: Refresh,
+    /// The present-interval (ms) the frame-equivalents are divided by: the run's OBSERVED
+    /// median inter-present interval when supplied, else `refresh.deadline_ms()`. Recorded
+    /// so a reader can see which denominator the gate actually used.
+    pub interval_ms: f32,
     pub min_ms: f32,
     pub p25_ms: f32,
     pub median_ms: f32,
     pub p75_ms: f32,
     pub p99_ms: f32,
     pub max_ms: f32,
-    /// `median_ms` expressed in frames at `refresh` (the gated quantity).
+    /// `median_ms` expressed in present intervals (the gated quantity; ~1.0 in a healthy
+    /// pipeline - a cadence-hold floor).
     pub median_frames: f32,
-    /// `p99_ms` expressed in frames at `refresh` (the gated tail quantity).
+    /// `p99_ms` expressed in present intervals (the gated tail quantity - the real signal).
     pub p99_frames: f32,
     /// Count of upper outliers: samples above the Tukey fence `p75 + 1.5 * IQR`
     /// (`IQR = p75 - p25`). The slow-keystroke tail the box-plot methodology flags.
@@ -109,16 +137,39 @@ pub struct LatencyStats {
 }
 
 impl LatencyStats {
-    /// Summarize a slice of latency samples at `refresh`. Empty input yields an
-    /// all-zero summary (which the gate treats as [`LatencyVerdict::Inconclusive`] via
-    /// the [`MIN_ITERATIONS`] floor, not a pass).
+    /// Summarize a slice of latency samples. `observed_interval_ms` is the run's measured
+    /// median inter-present interval, used as the frame-equivalent denominator (so the
+    /// gate self-calibrates to the actual present cadence); `None` (or a non-finite /
+    /// non-positive value) falls back to `refresh.deadline_ms()`. Non-finite samples are
+    /// dropped, so a garbage timing can never poison the percentiles or the JSON
+    /// round-trip (serde emits `null` for a non-finite f32, which the non-`Option` fields
+    /// reject on parse). Empty input yields an all-zero summary (which the gate treats as
+    /// [`LatencyVerdict::Inconclusive`] via the [`MIN_ITERATIONS`] floor, not a pass).
     #[must_use]
-    pub fn from_samples(samples: &[LatencySample], refresh: Refresh) -> Self {
-        let count = samples.len();
+    pub fn from_samples(
+        samples: &[LatencySample],
+        refresh: Refresh,
+        observed_interval_ms: Option<f32>,
+    ) -> Self {
+        // The frame denominator: the observed present cadence, else the nominal refresh.
+        let interval_ms = observed_interval_ms
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or_else(|| refresh.deadline_ms())
+            .max(f32::MIN_POSITIVE);
+        // Drop non-finite samples so a NaN/Inf can never pollute the percentiles or break
+        // the JSON round-trip. Finite live timings are the norm; this hardens the public
+        // sample surface (and a future hardware probe) against garbage.
+        let mut ms: Vec<f32> = samples
+            .iter()
+            .map(|s| s.press_to_glyph_ms)
+            .filter(|v| v.is_finite())
+            .collect();
+        let count = ms.len();
         if count == 0 {
             return Self {
                 count: 0,
                 refresh,
+                interval_ms,
                 min_ms: 0.0,
                 p25_ms: 0.0,
                 median_ms: 0.0,
@@ -130,7 +181,6 @@ impl LatencyStats {
                 outliers: 0,
             };
         }
-        let mut ms: Vec<f32> = samples.iter().map(|s| s.press_to_glyph_ms).collect();
         ms.sort_by(f32::total_cmp);
         let p25 = percentile(&ms, 25.0);
         let median = percentile(&ms, 50.0);
@@ -140,18 +190,18 @@ impl LatencyStats {
         let iqr = p75 - p25;
         let upper_fence = p75 + 1.5 * iqr;
         let outliers = ms.iter().filter(|&&v| v > upper_fence).count();
-        let deadline = refresh.deadline_ms().max(f32::MIN_POSITIVE);
         Self {
             count,
             refresh,
+            interval_ms,
             min_ms: ms[0],
             p25_ms: p25,
             median_ms: median,
             p75_ms: p75,
             p99_ms: p99,
             max_ms: *ms.last().unwrap(),
-            median_frames: median / deadline,
-            p99_frames: p99 / deadline,
+            median_frames: median / interval_ms,
+            p99_frames: p99 / interval_ms,
             outliers,
         }
     }
@@ -258,8 +308,9 @@ impl LatencyVerdict {
 
 /// A full latency run's report: the percentile summary, the blocking verdict, and the
 /// raw samples for offline histogram/box-plot analysis. Serializes to the JSON the
-/// `latency_driver` dumps (and CI reads).
-#[derive(Debug, Clone, Serialize)]
+/// `latency_driver` dumps (and CI reads); `Deserialize` too, so an analysis step can read
+/// it back as a typed struct rather than poking at `serde_json::Value`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyReport {
     pub refresh: Refresh,
     pub stats: LatencyStats,
@@ -269,11 +320,23 @@ pub struct LatencyReport {
 }
 
 impl LatencyReport {
-    /// Assemble a report from a gate + the run's samples. Computes the summary + the
-    /// verdict; `overall_pass` for a run is simply `!verdict.is_fail()`.
+    /// Assemble a report from a gate + the run's samples + the run's observed median
+    /// present interval (the self-calibrating frame denominator; `None` falls back to the
+    /// gate's nominal refresh - see [`LatencyStats::from_samples`]). Computes the summary +
+    /// the verdict; `overall_pass` for a run is simply `!verdict.is_fail()`.
     #[must_use]
-    pub fn new(gate: &LatencyGate, samples: Vec<LatencySample>) -> Self {
-        let stats = LatencyStats::from_samples(&samples, gate.refresh);
+    pub fn new(
+        gate: &LatencyGate,
+        samples: Vec<LatencySample>,
+        observed_interval_ms: Option<f32>,
+    ) -> Self {
+        // Drop any non-finite sample up front so the STORED samples match the summarized
+        // set AND the whole report round-trips (serde emits `null` for a non-finite f32,
+        // which the sample's non-Option field would reject on parse). Live timings are
+        // always finite; this hardens against a future probe emitting garbage.
+        let mut samples = samples;
+        samples.retain(|s| s.press_to_glyph_ms.is_finite());
+        let stats = LatencyStats::from_samples(&samples, gate.refresh, observed_interval_ms);
         let verdict = gate.evaluate(&stats);
         Self {
             refresh: gate.refresh,
@@ -400,7 +463,7 @@ mod tests {
         // 1..=100 ms. nearest-rank: p25 -> rank ceil(25)=25 -> the 25th value = 25.
         // median -> rank 50 -> 50; p75 -> 75; p99 -> rank ceil(99)=99 -> 99; max 100.
         let ms: Vec<f32> = (1..=100).map(|v| v as f32).collect();
-        let s = LatencyStats::from_samples(&from_ms(&ms), Refresh::Hz60);
+        let s = LatencyStats::from_samples(&from_ms(&ms), Refresh::Hz60, None);
         assert_eq!(s.count, 100);
         assert!((s.p25_ms - 25.0).abs() < 1e-6);
         assert!((s.median_ms - 50.0).abs() < 1e-6);
@@ -408,17 +471,19 @@ mod tests {
         assert!((s.p99_ms - 99.0).abs() < 1e-6);
         assert!((s.min_ms - 1.0).abs() < 1e-6);
         assert!((s.max_ms - 100.0).abs() < 1e-6);
-        // Frame-equivalents @60Hz (16.6667ms): 50/16.6667 = 3.0 frames, 99 -> 5.94.
+        // With no observed interval, the denominator is the nominal 60Hz deadline.
+        assert!((s.interval_ms - Refresh::Hz60.deadline_ms()).abs() < 1e-4);
         assert!((s.median_frames - 50.0 / Refresh::Hz60.deadline_ms()).abs() < 1e-4);
         assert!((s.p99_frames - 99.0 / Refresh::Hz60.deadline_ms()).abs() < 1e-4);
     }
 
     #[test]
-    fn frame_equivalents_track_the_refresh() {
-        // The SAME 25ms median is 1.5 frames @60Hz but 3.0 frames @120Hz.
+    fn frame_equivalents_fall_back_to_the_nominal_refresh() {
+        // With no observed cadence, the SAME 25ms median is 1.5 frames @60Hz but 3.0
+        // frames @120Hz (the nominal-refresh fallback denominator).
         let ms = flat(120, 25.0);
-        let at60 = LatencyStats::from_samples(&ms, Refresh::Hz60);
-        let at120 = LatencyStats::from_samples(&ms, Refresh::Hz120);
+        let at60 = LatencyStats::from_samples(&ms, Refresh::Hz60, None);
+        let at120 = LatencyStats::from_samples(&ms, Refresh::Hz120, None);
         assert!((at60.median_frames - 1.5).abs() < 1e-3, "25ms = 1.5f @60Hz");
         assert!(
             (at120.median_frames - 3.0).abs() < 1e-3,
@@ -427,18 +492,44 @@ mod tests {
     }
 
     #[test]
+    fn observed_interval_self_calibrates_the_frame_denominator() {
+        // The fix for the hardcoded-refresh miscalibration: frames divide by the run's
+        // OWN observed present interval when supplied, not the nominal refresh. The same
+        // 25ms samples are ~1.0 interval at a 25ms cadence but ~2.0 at a 12.5ms cadence -
+        // regardless of the nominal refresh passed.
+        let ms = flat(120, 25.0);
+        let at_cadence = LatencyStats::from_samples(&ms, Refresh::Hz60, Some(25.0));
+        assert!((at_cadence.interval_ms - 25.0).abs() < 1e-4);
+        assert!(
+            (at_cadence.median_frames - 1.0).abs() < 1e-3,
+            "25ms latency at a 25ms cadence is ~1.0 interval, got {}",
+            at_cadence.median_frames
+        );
+        let fast_cadence = LatencyStats::from_samples(&ms, Refresh::Hz60, Some(12.5));
+        assert!(
+            (fast_cadence.median_frames - 2.0).abs() < 1e-3,
+            "25ms latency at a 12.5ms cadence is ~2.0 intervals"
+        );
+        // A non-finite / non-positive observed interval falls back to the nominal refresh.
+        let bad = LatencyStats::from_samples(&ms, Refresh::Hz60, Some(0.0));
+        assert!((bad.interval_ms - Refresh::Hz60.deadline_ms()).abs() < 1e-4);
+        let nan = LatencyStats::from_samples(&ms, Refresh::Hz60, Some(f32::NAN));
+        assert!((nan.interval_ms - Refresh::Hz60.deadline_ms()).abs() < 1e-4);
+    }
+
+    #[test]
     fn outliers_use_the_tukey_upper_fence() {
         // p25=25, p75=75 over 1..=100 -> IQR 50, fence 75 + 75 = 150. Nothing over 100
         // exceeds it -> zero outliers in the uniform set.
         let uniform: Vec<f32> = (1..=100).map(|v| v as f32).collect();
         assert_eq!(
-            LatencyStats::from_samples(&from_ms(&uniform), Refresh::Hz60).outliers,
+            LatencyStats::from_samples(&from_ms(&uniform), Refresh::Hz60, None).outliers,
             0
         );
         // Add a few far-out spikes well past the fence -> counted as outliers.
         let mut spiky = uniform.clone();
         spiky.extend_from_slice(&[400.0, 500.0, 600.0]);
-        let s = LatencyStats::from_samples(&from_ms(&spiky), Refresh::Hz60);
+        let s = LatencyStats::from_samples(&from_ms(&spiky), Refresh::Hz60, None);
         assert!(
             s.outliers >= 3,
             "the three 400ms+ spikes are outliers: {s:?}"
@@ -446,21 +537,53 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_samples_are_dropped_and_report_round_trips_typed() {
+        // M2: a NaN/Inf sample is dropped (never poisons the percentiles) AND the report
+        // still round-trips - serde emits `null` for a non-finite f32, which the
+        // non-Option fields reject on parse, so a leaked non-finite would break the dump.
+        let mut list = flat(102, 16.0);
+        list[10].press_to_glyph_ms = f32::NAN;
+        list[20].press_to_glyph_ms = f32::INFINITY;
+        let gate = LatencyGate::frames_gate(Refresh::Hz60);
+        let report = LatencyReport::new(&gate, list, Some(16.0));
+        assert_eq!(
+            report.stats.count, 100,
+            "the 2 non-finite samples were dropped"
+        );
+        assert!(report.stats.median_ms.is_finite() && report.stats.median_frames.is_finite());
+        // L1: the whole report deserializes back into a typed struct (not just Value).
+        let json = report.to_json();
+        let back: LatencyReport =
+            serde_json::from_str(&json).expect("report must round-trip as a typed struct");
+        assert_eq!(back.stats, report.stats);
+        assert_eq!(back.verdict, report.verdict);
+    }
+
+    #[test]
     fn clean_run_passes_the_frames_gate() {
-        // ~1.1 frames median @60Hz (18ms), tail 30ms (~1.8f) - a healthy pipeline.
+        // ~1.1 intervals median (18ms at a 16.67ms cadence), tail 30ms (~1.8) - healthy.
         let mut list = vec![18.0_f32; 118];
         list.push(30.0);
         list.push(30.0);
         let gate = LatencyGate::frames_gate(Refresh::Hz60);
-        let v = gate.evaluate(&LatencyStats::from_samples(&from_ms(&list), Refresh::Hz60));
-        assert!(v.is_pass(), "a ~1.1f median run passes: {v:?}");
+        let v = gate.evaluate(&LatencyStats::from_samples(
+            &from_ms(&list),
+            Refresh::Hz60,
+            None,
+        ));
+        assert!(v.is_pass(), "a ~1.1-interval median run passes: {v:?}");
     }
 
     #[test]
-    fn median_over_one_and_a_half_frames_fails() {
-        // AC: median > 1.5 frames fails. 30ms @60Hz = 1.8 frames.
+    fn median_over_one_and_a_half_intervals_fails() {
+        // The cadence-hold floor: a gross systematic slip (median 30ms at a 16.67ms
+        // cadence = 1.8 intervals) trips the median arm.
         let gate = LatencyGate::frames_gate(Refresh::Hz60);
-        let v = gate.evaluate(&LatencyStats::from_samples(&flat(120, 30.0), Refresh::Hz60));
+        let v = gate.evaluate(&LatencyStats::from_samples(
+            &flat(120, 30.0),
+            Refresh::Hz60,
+            None,
+        ));
         assert!(v.is_fail());
         let LatencyVerdict::Fail { breaches } = &v else {
             panic!("expected fail, got {v:?}")
@@ -470,18 +593,23 @@ mod tests {
                 b,
                 LatencyBreach::MedianFrames { limit, .. } if (*limit - 1.5).abs() < 1e-6
             )),
-            "the median breach names the 1.5-frame limit: {breaches:?}"
+            "the median breach names the 1.5-interval limit: {breaches:?}"
         );
     }
 
     #[test]
-    fn p99_over_three_frames_fails_even_with_a_fast_median() {
-        // A fast median (16ms ~1f) but a heavy tail: 5% of samples at 60ms (~3.6f @60Hz)
-        // pushes p99 over the 3-frame limit -> fail on the tail alone.
+    fn p99_over_three_intervals_fails_even_with_a_fast_median() {
+        // The real tail signal: a fast median (16ms ~1 interval) but 5% of keystrokes
+        // slip to 60ms (~3.6 intervals at a 16.67ms cadence) pushes p99 over 3 -> fail on
+        // the tail alone (a keystroke whose glyph slipped ~2+ extra presents).
         let mut list = vec![16.0_f32; 114];
         list.extend_from_slice(&[60.0; 6]);
         let gate = LatencyGate::frames_gate(Refresh::Hz60);
-        let v = gate.evaluate(&LatencyStats::from_samples(&from_ms(&list), Refresh::Hz60));
+        let v = gate.evaluate(&LatencyStats::from_samples(
+            &from_ms(&list),
+            Refresh::Hz60,
+            None,
+        ));
         assert!(v.is_fail());
         assert!(
             matches!(&v, LatencyVerdict::Fail { breaches } if breaches.iter().any(|b| matches!(b, LatencyBreach::P99Frames { .. }))),
@@ -494,7 +622,11 @@ mod tests {
         // The false-pass guard: < MIN_ITERATIONS samples (a headless run captured ~none)
         // is inconclusive, never a pass - even if the few it has are blazing fast.
         let gate = LatencyGate::frames_gate(Refresh::Hz120);
-        let v = gate.evaluate(&LatencyStats::from_samples(&flat(10, 1.0), Refresh::Hz120));
+        let v = gate.evaluate(&LatencyStats::from_samples(
+            &flat(10, 1.0),
+            Refresh::Hz120,
+            None,
+        ));
         assert!(
             matches!(v, LatencyVerdict::Inconclusive { iterations: 10, required } if required == MIN_ITERATIONS),
             "10 samples is inconclusive: {v:?}"
@@ -504,6 +636,7 @@ mod tests {
         let ok = gate.evaluate(&LatencyStats::from_samples(
             &flat(MIN_ITERATIONS as u32, 4.0),
             Refresh::Hz120,
+            None,
         ));
         assert!(
             ok.is_pass(),
@@ -514,10 +647,11 @@ mod tests {
     #[test]
     fn report_json_is_valid_and_carries_the_verdict_and_samples() {
         // AC: the run dumps valid JSON consumable by an analysis step. A failing run
-        // (median 30ms @60Hz = 1.8f) -> parse -> assert verdict + a round-tripped sample.
+        // (median 30ms at a 16.67ms cadence = 1.8) -> parse -> verdict + round-tripped
+        // sample.
         let gate = LatencyGate::frames_gate(Refresh::Hz60);
-        let report = LatencyReport::new(&gate, flat(120, 30.0));
-        assert!(!report.overall_pass(), "1.8f median fails");
+        let report = LatencyReport::new(&gate, flat(120, 30.0), None);
+        assert!(!report.overall_pass(), "1.8-interval median fails");
         let json = report.to_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("latency JSON must parse");
         assert_eq!(v["verdict"]["result"], "fail");
