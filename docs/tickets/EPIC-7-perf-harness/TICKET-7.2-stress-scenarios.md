@@ -2,7 +2,7 @@
 id: T-7.2
 epic: EPIC-7-perf-harness
 title: Seven scripted stress scenarios + driver
-status: ready-for-agent
+status: done
 labels: [bench, perf, ci]
 depends_on: [T-7.1]
 ---
@@ -35,3 +35,67 @@ Implement the seven named, scripted stress scenarios and a driver that feeds det
 - Input-latency gate (T-7.3).
 - Resize-reflow correctness + shell matrix (T-7.4).
 - Provisioning the runner (infra/owner).
+
+# Resolution
+
+**2026-07-01 (agent): Done.** Split the way T-7.1 was - a PURE, headless-tested
+scenario+gate+JSON model, plus an on-hardware live driver, plus the nightly job.
+Landed in four commits (plus an adversarial-review fix commit).
+
+- **Pure core** (`aterm-bench::scenario`): `ScenarioKind` (the seven exact
+  `domain.md` names), `Scenario` (each a deterministic input program - an optional
+  output `Generator` [`seq`/`yes`/an alt-screen repaint loop] + a timed
+  synthetic-input `DriverAction` script + warmup/measure windows + engine
+  scrollback), the `Gate` (the blocking 60fps floor: `present` p50<=16.67 /
+  p99<=16.0 / max<=16.0 / 0 dropped, with per-scenario builders for the flood/resize
+  drop budget, the resize one-frame spike allowance, the idle frames budget, and the
+  flood render/byte decoupling), `Gate::evaluate -> Verdict {Pass, Fail{breaches},
+  Inconclusive}`, the informational non-blocking `Target120`, and
+  `ScenarioReport`/`RunReport` -> JSON. **16 unit tests**, no window/GPU (runs on the
+  Linux CI too).
+- **AC1 (all seven run + JSON + verdict):** the `scenario_driver` bin runs the real
+  `aterm-ui` app loop (`run_with_recorder`) with the T-7.1 recorder installed,
+  advances a per-scenario state machine from `tick()`, spawns the generators, replays
+  synthetic input (typing / scroll / resize via the real window / streamed agent
+  tokens), buckets recorded frames, evaluates the gate, and dumps the JSON `RunReport`
+  + a pass/fail exit code. Smoke-verified end-to-end locally.
+- **AC2 (gates enforced; p99>16ms fails):** the pure gate, exhaustively tested
+  (`p99_over_the_floor_fails`, max/dropped/idle cases).
+- **AC3 (idle ~0 frames after keep-warm):** the `idle` gate + the driver's idle phase
+  (warmup elapses keep-warm, then `wants_redraw=false` lets the app idle so `on_frame`
+  collects ~0).
+- **AC4 (output_flood render decoupled from byte-rate):** decoupling now has two
+  FALSIFIABLE halves - a sustained byte firehose (`bytes_fed >= MIN_FLOOD_BYTES`; a
+  render coupled into the drain path collapses it) AND vsync-paced frames (the frame
+  ceiling; catches a regression that drops `Fifo`). (The first cut was a frame-count
+  ceiling alone, which is a tautology under `Fifo` - fixed after the review.)
+- **AC5 (nightly CI, blocks on breach):** `.github/workflows/nightly-perf.yml` -
+  `schedule` cron + `workflow_dispatch`, `--gate` (exits non-zero on a floor breach),
+  uploads the JSON artifact always.
+- **Real scroll input** (owner chose "full fidelity"): the `fast_scroll` /
+  `large_scrollback` scenarios drive a genuine user scroll path - a new pure
+  `ScrollState` follow-bottom scroll-lock in `aterm-ui`, wired to `MouseWheel` +
+  `PageUp`/`PageDown` (and a driver-facing `ScrollCommand` seam). This wired the
+  wheel/key bindings `timeline.rs` had deferred to EPIC-3.
+- **New `UiCallbacks` seams** (all inert by default, zero-cost for a normal host):
+  `poll_scroll`, `wants_redraw`, `on_frame` (only under a recorder - the T-7.1
+  zero-overhead path is untouched), `should_exit`; plus `run_with_recorder`.
+- **Adversarial review (4 lenses, skeptic-verified) found 5 real defects, all fixed
+  before finalizing:** the unfalsifiable flood decoupling gate (AC4); the
+  window_resize p99==max collapse at <100 frames (the allowed spike tripped the tight
+  p99 - fixed by sizing the window to >=100 frames); the count-bounded (not
+  duration-bounded) TUI-redraw source; and a measure-boundary action drop.
+
+**HONEST CAVEAT (owner resolved open-question #2 as "GitHub runners, not
+self-hosted"):** a GitHub-hosted `macos-14` runner is Apple Silicon but is NOT
+ProMotion and is timing-noisy (§9 warns shared macOS runners cannot gate frame time
+precisely). So the nightly gates the **60fps floor** as a smoke/regression signal;
+120fps is tracked (`target_120hz`), not blocked; and a genuine 120Hz confirmation is
+a manual on-hardware `--display-link` run. Where a runner cannot present at all
+(headless), the driver reports every scenario `Inconclusive` and exits 0 - never a
+false pass or a false failure.
+
+The live present cadence / 120Hz hold on real ProMotion hardware remains the
+on-hardware confirmation this driver enables but does not itself prove in CI
+(consistent with T-1.5 / T-7.1). `window_resize` deep reflow correctness feeds T-7.4;
+input-latency is T-7.3.
