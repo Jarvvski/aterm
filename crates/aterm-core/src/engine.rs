@@ -2432,10 +2432,13 @@ mod tests {
             eprintln!("skip {label}: shim could not arm for {path}");
             return;
         }
+        // A late nonce-matched `A` still confirms (confirm wins over a window-elapse), so a
+        // generous wait tolerates a slow first prompt (a heavy user `.zshrc`) without a
+        // false red; the happy path returns the instant it flips Integrated.
         let status = wait_for_status(
             &engine,
             crate::IntegrationStatus::Integrated,
-            Duration::from_secs(10),
+            Duration::from_secs(15),
         );
         assert_eq!(
             status,
@@ -2483,26 +2486,32 @@ mod tests {
             }
         };
         // Wait for Integrated; if the confirm window elapses first it lands on Heuristic.
-        let status = wait_for_status(
+        let _ = wait_for_status(
             &engine,
             crate::IntegrationStatus::Integrated,
-            Duration::from_secs(8),
+            Duration::from_secs(15),
         );
-        let final_status = if status == crate::IntegrationStatus::Integrated {
-            status
-        } else {
-            engine.integration_status().status
-        };
+        let integ = engine.integration_status();
         eprintln!(
-            "bash 3.2 reliability observation: reached {final_status:?} (version={:?})",
+            "bash 3.2 reliability observation: reached {:?} (reason={:?}, version={:?})",
+            integ.status,
+            integ.reason,
             engine.shell_version()
         );
+        // Its static `A` rides PS1 (not the fragile DEBUG trap), so it should reach
+        // Integrated. The AC also allows an HONEST downgrade to Heuristic - but ONLY the
+        // benign `HooksSilent` (the confirm window elapsed, e.g. a slow first prompt), NOT
+        // `ShimInstallFailed`: a broken shim is a real regression, not an honest downgrade,
+        // and must red the build (so this can actually fail on a bash-3.2 integration
+        // break, rather than accepting every reachable status).
+        let ok = integ.status == crate::IntegrationStatus::Integrated
+            || (integ.status == crate::IntegrationStatus::Heuristic
+                && matches!(integ.reason, crate::IntegrationReason::HooksSilent));
         assert!(
-            matches!(
-                final_status,
-                crate::IntegrationStatus::Integrated | crate::IntegrationStatus::Heuristic
-            ),
-            "bash 3.2 must integrate or honestly downgrade to Heuristic, got {final_status:?}"
+            ok,
+            "bash 3.2 must integrate or honestly downgrade via HooksSilent (a slow prompt), \
+             not via a broken shim, got {:?}/{:?}",
+            integ.status, integ.reason
         );
         drop(engine);
     }
@@ -2525,13 +2534,16 @@ mod tests {
     }
 
     #[test]
-    fn exec_zsh_keeps_the_session_alive_and_integrated() {
-        // T-7.4 AC: `exec zsh` mid-session preserves integration. The re-pin MECHANISM is
-        // proved deterministically in shell_integration.rs
-        // (`zsh_bootstrap_repins_zdotdir_for_exec_zsh_survival`); this is the on-shell
-        // SMOKE - a real zsh, integrated, is told to `exec zsh`, and the session must stay
-        // alive + responsive (new snapshots keep publishing) and NOT lose its Integrated
-        // status across the re-exec (which would wedge the block timeline).
+    fn exec_zsh_reintegrates_the_reexeced_shell() {
+        // T-7.4 AC: `exec zsh` preserves integration. The re-pin MECHANISM is proved
+        // deterministically in shell_integration.rs
+        // (`zsh_bootstrap_repins_zdotdir_for_exec_zsh_survival`). THIS is the on-shell
+        // proof that a re-exec'd zsh actually RE-SOURCES the shim: after `exec zsh`, a
+        // uniquely-marked command must produce a FINISHED nonce'd block (its output
+        // captured), which can ONLY happen if the re-exec'd shell re-armed the OSC-133
+        // hooks. (Asserting the monitor still reads Integrated would be a no-op - it
+        // latches on the first prompt's `A` and never regresses, so it cannot detect a
+        // re-exec that lost integration.)
         let path = "/bin/zsh";
         if !program_exists(path) {
             eprintln!("skip exec zsh: {path} absent");
@@ -2557,27 +2569,47 @@ mod tests {
         let s0 = wait_for_status(
             &engine,
             crate::IntegrationStatus::Integrated,
-            Duration::from_secs(10),
+            Duration::from_secs(15),
         );
         if s0 != crate::IntegrationStatus::Integrated {
             eprintln!("skip exec zsh: first prompt did not integrate (loaded host?) got {s0:?}");
             return;
         }
-        // Re-exec into a fresh zsh; the re-pinned ZDOTDIR makes it re-source the shim.
-        let v_pre = engine.latest_snapshot().version;
+        // Re-exec into a fresh zsh (the re-pinned ZDOTDIR makes it re-source the shim),
+        // then run a UNIQUELY-marked command in that new shell.
         engine.send_input(b"exec zsh\n".to_vec());
-        // The session must stay alive + responsive after the re-exec: a new prompt (and
-        // its nonce'd A from the re-sourced shim) advances the published snapshot.
-        let v_post = wait_for_version_at_least(&engine, v_pre + 1, Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(300)); // let exec replace + the new prompt draw
+        engine.send_input(b"printf 'ATERM_POSTEXEC_MARK_7\\n'\n".to_vec());
+        // A finished nonce'd block CAPTURING the marker proves the re-exec'd shell re-armed
+        // the hooks. If integration were lost, the marker text would still hit the grid but
+        // no nonce'd `D` would snapshot a finished block carrying it - so this genuinely
+        // distinguishes re-integration from a dead-integration latch.
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut reintegrated = false;
+        while Instant::now() < deadline {
+            reintegrated = engine
+                .latest_blocks()
+                .iter()
+                .filter_map(|b| b.as_command())
+                .any(|b| {
+                    !b.is_running()
+                        && b.output.iter().any(|r| {
+                            r.cells
+                                .iter()
+                                .map(|c| c.c)
+                                .collect::<String>()
+                                .contains("ATERM_POSTEXEC_MARK_7")
+                        })
+                });
+            if reintegrated {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
         assert!(
-            v_post > v_pre,
-            "the session must keep publishing after `exec zsh` (it wedged: {v_pre} -> {v_post})"
-        );
-        // Integration must not regress across the re-exec.
-        assert_eq!(
-            engine.integration_status().status,
-            crate::IntegrationStatus::Integrated,
-            "`exec zsh` must preserve integration (ZDOTDIR re-pinned)"
+            reintegrated,
+            "after `exec zsh`, a marked command must produce a finished nonce'd block - the \
+             re-exec'd shell must re-source the shim (ZDOTDIR re-pinned)"
         );
         drop(engine);
     }

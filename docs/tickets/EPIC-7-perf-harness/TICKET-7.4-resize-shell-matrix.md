@@ -86,3 +86,23 @@ skips (never reds) when a binary is absent, matching the existing real-shell tes
 convention. su/sudo/tmux/exec-non-zsh are documented as honest v1 degradation, not
 silently claimed to work - re-warpify across privilege/tmux is a deferred future ticket
 (consistent with the dossier's out-of-scope stance).
+
+**Adversarial review (skeptic pass) - no correctness bugs / no leaks; 3 honesty/robustness
+gaps, all fixed:**
+- **[MED] exec-zsh test was tautological.** The monitor LATCHES Integrated on the first
+  prompt, so asserting "still Integrated" after `exec zsh` could not fail even if the
+  re-exec'd shell lost its hooks. REWRITTEN (`exec_zsh_reintegrates_the_reexeced_shell`):
+  after `exec zsh` it runs a uniquely-marked command and asserts a FINISHED nonce'd block
+  captures the marker - which can only happen if the re-exec'd shell re-sourced the shim.
+- **[MED] bash 3.2 accepted every reachable status.** `Integrated | Heuristic` covered all
+  reachable states (None/Unsupported unreachable for a supported shell), so a real
+  integration break passed green. Tightened to reject `ShimInstallFailed`: pass iff
+  `Integrated` OR (`Heuristic` AND reason == `HooksSilent`, the honest slow-prompt
+  downgrade) - so a broken shim now reds the build. (Observed: Integrated/Confirmed.)
+- **[LOW] slow-host flake.** The integrate waits were bumped 10s -> 15s (a late nonce'd A
+  still confirms), so a heavy user `.zshrc` delaying the first prompt does not false-red.
+- Verified sound, no change: the reflow byte-identity test (not vacuous - the `assert_ne`
+  on cols is the real guard, a missed reflow reds loudly), the phantom/double-block test
+  (`blocks.len()==1` is correct; foreign marks are dropped pre-segmentation), no
+  child/PTY leak (Engine::drop reaps + removes the temp shim dir), and the
+  `maximized_reflow` gate reuse + driver plumbing + the su/sudo/tmux/exec doc accuracy.
