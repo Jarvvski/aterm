@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin:0; }
+  :root { --mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, "Cascadia Mono", monospace; }
+  body { font-family: var(--mono); -webkit-font-smoothing: antialiased; }
+  [data-theme="dark"] { --desk:#100e0a; --ink:#ece6d8; --ink-dim:#9a9382; --ink-faint:#5e584b; --hairline: rgba(236,230,216,0.1); --accent:#3d88cc; }
+  [data-theme="light"] { --desk:#e6e0d2; --ink:#26231b; --ink-dim:#6c6555; --ink-faint:#a89f8c; --hairline: rgba(38,35,27,0.12); --accent:#2f7dc2; }
+  .seg { cursor:pointer; transition: color .15s ease; color: var(--ink-dim); }
+  .seg:hover { color: var(--ink); }
+  .seg[data-active="true"] { color: var(--accent); }
+</style>
+</helmet>
+
+<div ref="{{ setRoot }}" data-theme="{{ theme }}" style="min-height:100vh; background:var(--desk); color:var(--ink); padding:60px 48px 100px;">
+
+  <!-- showcase header -->
+  <div style="max-width:1000px; margin:0 auto 8px; display:flex; align-items:flex-start; justify-content:space-between; gap:32px;">
+    <div>
+      <div style="font-size:30px; letter-spacing:0.04em; color:var(--ink);">aterm</div>
+      <div style="margin-top:12px; font-size:14px; color:var(--ink-dim); line-height:1.8; max-width:560px;">A vision mock of a GPU-rendered macOS terminal. The six frames below are <span style="color:var(--ink);">states of the app</span> — captured moments, not pages you navigate between. Toggle the theme to see both treatments; the mode chip and risk gate are live.</div>
+    </div>
+    <div style="display:flex; align-items:center; gap:10px; font-size:12px; flex:none; padding-top:6px;">
+      <span class="seg" data-active="{{ isLight }}" onClick="{{ setLight }}">Light</span>
+      <span style="color:var(--ink-faint);">/</span>
+      <span class="seg" data-active="{{ isDark }}" onClick="{{ setDark }}">Dark</span>
+      <span style="color:var(--ink-faint); margin-left:6px; font-size:11px;">⌘L</span>
+    </div>
+  </div>
+
+  <!-- gallery -->
+  <div style="max-width:1000px; margin:0 auto; display:flex; flex-direction:column; gap:72px; padding-top:56px;">
+
+    <div id="s1">
+      <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px;">
+        <span style="font-size:12px; color:var(--accent); letter-spacing:0.1em;">01</span>
+        <span style="font-size:15px; color:var(--ink);">Launch state</span>
+        <span style="font-size:13px; color:var(--ink-dim);">— a fresh window; quiet, inviting, no history yet.</span>
+      </div>
+      <dc-import name="AtermWindow" screen="launch" theme="{{ theme }}" accent="{{ accent }}" set-theme="{{ setTheme }}" hint-size="100%,620px"></dc-import>
+    </div>
+
+    <div id="s2">
+      <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px;">
+        <span style="font-size:12px; color:var(--accent); letter-spacing:0.1em;">02</span>
+        <span style="font-size:15px; color:var(--ink);">Shell session</span>
+        <span style="font-size:13px; color:var(--ink-dim);">— every command and its output is a block; exit status reads at a glance.</span>
+      </div>
+      <dc-import name="AtermWindow" screen="shell" theme="{{ theme }}" accent="{{ accent }}" set-theme="{{ setTheme }}" hint-size="100%,760px"></dc-import>
+    </div>
+
+    <div id="s3">
+      <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px;">
+        <span style="font-size:12px; color:var(--accent); letter-spacing:0.1em;">03</span>
+        <span style="font-size:15px; color:var(--ink);">Unified input · modes</span>
+        <span style="font-size:13px; color:var(--ink-dim);">— one box routes to shell or agent; the chip flips Enter, text preserved.</span>
+      </div>
+      <dc-import name="AtermWindow" screen="modes" theme="{{ theme }}" accent="{{ accent }}" set-theme="{{ setTheme }}" hint-size="100%,620px"></dc-import>
+    </div>
+
+    <div id="s4">
+      <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px;">
+        <span style="font-size:12px; color:var(--accent); letter-spacing:0.1em;">04</span>
+        <span style="font-size:15px; color:var(--ink);">Agent session</span>
+        <span style="font-size:13px; color:var(--ink-dim);">— the agent plans, calls tools, observes, and reports back as blocks.</span>
+      </div>
+      <dc-import name="AtermWindow" screen="agent" theme="{{ theme }}" accent="{{ accent }}" set-theme="{{ setTheme }}" hint-size="100%,820px"></dc-import>
+    </div>
+
+    <div id="s5">
+      <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px;">
+        <span style="font-size:12px; color:var(--accent); letter-spacing:0.1em;">05</span>
+        <span style="font-size:15px; color:var(--ink);">Risk gate</span>
+        <span style="font-size:13px; color:var(--ink-dim);">— safe commands run silently; destructive ones pause for approval.</span>
+      </div>
+      <dc-import name="AtermWindow" screen="gate" theme="{{ theme }}" accent="{{ accent }}" set-theme="{{ setTheme }}" hint-size="100%,620px"></dc-import>
+    </div>
+
+    <div id="s7">
+      <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px;">
+        <span style="font-size:12px; color:var(--accent); letter-spacing:0.1em;">07</span>
+        <span style="font-size:15px; color:var(--ink);">Tab completion</span>
+        <span style="font-size:13px; color:var(--ink-dim);">— a built-in fuzzy finder; matched letters highlighted, the list narrows as you type.</span>
+      </div>
+      <dc-import name="AtermWindow" screen="complete" theme="{{ theme }}" accent="{{ accent }}" set-theme="{{ setTheme }}" hint-size="100%,620px"></dc-import>
+    </div>
+
+    <div id="s6">
+      <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px;">
+        <span style="font-size:12px; color:var(--accent); letter-spacing:0.1em;">06</span>
+        <span style="font-size:15px; color:var(--ink);">Settings</span>
+        <span style="font-size:13px; color:var(--ink-dim);">— even configuration stays calm and typographic.</span>
+      </div>
+      <dc-import name="AtermWindow" screen="settings" theme="{{ theme }}" accent="{{ accent }}" set-theme="{{ setTheme }}" hint-size="100%,620px"></dc-import>
+    </div>
+
+    <div id="s8">
+      <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px;">
+        <span style="font-size:12px; color:var(--accent); letter-spacing:0.1em;">08</span>
+        <span style="font-size:15px; color:var(--ink);">Editor mode</span>
+        <span style="font-size:13px; color:var(--ink-dim);">— open a file into a calm, centered writing surface; the terminal folds away.</span>
+      </div>
+      <dc-import name="AtermWindow" screen="editor" theme="{{ theme }}" accent="{{ accent }}" set-theme="{{ setTheme }}" hint-size="100%,620px"></dc-import>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#3d88cc&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;dark&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;}}">
+class Component extends DCLogic {
+  state = { theme: undefined };
+
+  setRoot = (el) => { this.rootEl = el; };
+  theme() { return this.state.theme ?? this.props.theme ?? 'dark'; }
+
+  applyVars() {
+    if (this.rootEl) this.rootEl.style.setProperty('--accent', this.props.accent || '#3d88cc');
+  }
+
+  componentDidMount() {
+    this.applyVars();
+    this._key = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'l') {
+        e.preventDefault();
+        this.setState({ theme: this.theme() === 'dark' ? 'light' : 'dark' });
+      }
+    };
+    window.addEventListener('keydown', this._key);
+  }
+  componentDidUpdate() { this.applyVars(); }
+  componentWillUnmount() { window.removeEventListener('keydown', this._key); }
+
+  renderVals() {
+    const theme = this.theme();
+    return {
+      setRoot: this.setRoot,
+      theme,
+      accent: this.props.accent || '#3d88cc',
+      isDark: theme === 'dark',
+      isLight: theme === 'light',
+      setDark: () => this.setState({ theme: 'dark' }),
+      setLight: () => this.setState({ theme: 'light' }),
+      setTheme: (t) => this.setState({ theme: t }),
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -56,6 +56,12 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | [EPIC-6](EPIC-6-mcp-interop/) | MCP + interop (best host for external agents) | EPIC-5 |
 | [EPIC-7](EPIC-7-perf-harness/) | Tier-2 perf harness + hardening | EPIC-1..4 |
 | [EPIC-8](EPIC-8-packaging/) | Packaging, signing, polish (deferred) | EPIC-1..6 |
+| [EPIC-9](EPIC-9-vision-mock-reskin/) | Vision-mock parity re-skin (adopt the imported mock as the UI north star) | EPIC-1..5 |
+| [EPIC-10](EPIC-10-sessions-sidebar/) | Multi-session + sessions sidebar | EPIC-9 (T-9.1, T-9.2) |
+| [EPIC-11](EPIC-11-editor-mode/) | Editor mode (open a file into a centered writing surface) | EPIC-9 (T-9.1) |
+| [EPIC-12](EPIC-12-settings-screen/) | Settings screen (rendered preferences) | EPIC-9 (T-9.1), EPIC-8 (T-8.3) |
+
+**EPIC-9 onward translate the imported vision mock** (`docs/design/vision-mock/`, adopted as the UI north star by [ADR-0011](../adr/0011-vision-mock-ui-north-star.md)) into the live UI. EPIC-9 reconciles the design tokens to the mock's warm palette + agent second-accent and re-skins every already-shipped surface to match; EPIC-10/11/12 add the new surfaces the mock introduces (multi-session + sidebar, editor mode, settings). **T-9.1** (the token reconciliation) is the keystone the whole set depends on.
 
 ## Ticket roster
 
@@ -142,3 +148,33 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-8.3 | Config load + API-key Keychain custody | ready-for-agent | T-5.6 |
 | T-8.4 | Signing/notarization (when distribution matters) | needs-info | T-8.1 |
 | T-8.5 | Focus-Mode analog + completions menu | ready-for-agent | T-2.7, T-3.5 |
+
+### EPIC-9 - Vision-mock parity re-skin
+| id | title | status | depends_on |
+|---|---|---|---|
+| T-9.1 | Reconcile tokens to the mock (warm palette + agent second-accent + elevated surface) | ready-for-agent | - |
+| T-9.2 | Window frame + custom title bar shell (traffic lights, centered title, sidebar toggle) | ready-for-agent | T-9.1 |
+| T-9.3 | Command block re-skin (prompt glyph, hover block-meta, exit status, hairline rhythm) | ready-for-agent | T-9.1 |
+| T-9.4 | Unified input bar + mode chip re-skin (mode-colored glyph/caret, pill chip) | ready-for-agent | T-9.1 |
+| T-9.5 | Launch + modes empty states and the tab-completion popover | ready-for-agent | T-9.1, T-9.4 |
+| T-9.6 | Agent transcript re-skin (agent glyph, plan header, tool-call rows, diff colors) | ready-for-agent | T-9.1, T-5.10 |
+| T-9.7 | Risk-gate approval UI re-skin (caution card, split Approve+menu, reject states) | ready-for-agent | T-9.1, T-5.11 |
+
+### EPIC-10 - Multi-session + sessions sidebar
+| id | title | status | depends_on |
+|---|---|---|---|
+| T-10.1 | Multi-session model - concurrent PTY-backed sessions + SessionList | ready-for-agent | - |
+| T-10.2 | Sessions sidebar + title-bar session binding | ready-for-agent | T-10.1, T-9.1, T-9.2 |
+| T-10.3 | Session keybindings + switching/focus routing | ready-for-agent | T-10.1, T-10.2 |
+
+### EPIC-11 - Editor mode
+| id | title | status | depends_on |
+|---|---|---|---|
+| T-11.1 | Editor mode state + file open/save + mode transitions | ready-for-agent | - |
+| T-11.2 | Editor writing-surface widget (centered prose editing) | ready-for-agent | T-11.1, T-9.1 |
+
+### EPIC-12 - Settings screen
+| id | title | status | depends_on |
+|---|---|---|---|
+| T-12.1 | Settings screen UI - typographic preference rows | ready-for-agent | T-9.1 |
+| T-12.2 | Settings persistence + live application | ready-for-agent | T-12.1, T-8.3 |

@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  * { box-sizing: border-box; }
+  .aw[data-theme="dark"] {
+    --bg:#1b1915; --bg-elev:#221f19;
+    --ink:#ece6d8; --ink-dim:#9a9382; --ink-faint:#5e584b;
+    --hairline: rgba(236,230,216,0.085);
+    --accent:#3d88cc; --agent:#9d86d6; --warn:#d59a4a; --warn-bg: rgba(213,154,74,0.09);
+    --err:#d47257; --ok:#82ac79;
+  }
+  .aw[data-theme="light"] {
+    --bg:#faf7ef; --bg-elev:#f2ede1;
+    --ink:#26231b; --ink-dim:#6c6555; --ink-faint:#a89f8c;
+    --hairline: rgba(38,35,27,0.10);
+    --accent:#2f7dc2; --agent:#7458bd; --warn:#b57d2c; --warn-bg: rgba(181,125,44,0.08);
+    --err:#bf5a40; --ok:#5c8a56;
+  }
+  .aw [data-mode="shell"] { --mode: var(--accent); }
+  .aw [data-mode="agent"] { --mode: var(--agent); }
+  .aw, .aw * { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, "Cascadia Mono", monospace; }
+  .aw .block-meta { opacity:0; transition: opacity .18s ease; }
+  .aw .block:hover .block-meta { opacity:1; }
+  .aw .navitem { cursor:pointer; transition: color .15s ease; color: var(--ink-dim); }
+  .aw .navitem:hover { color: var(--ink); }
+  .aw .seg { cursor:pointer; transition: color .15s ease; color: var(--ink-dim); }
+  .aw .seg:hover { color: var(--ink); }
+  .aw .seg[data-active="true"] { color: var(--accent); }
+  .aw .menuitem { transition: background .12s ease; }
+  .aw .menuitem:hover { background: var(--hairline); }
+  .aw .tab { color: var(--ink-dim); transition: color .15s ease; }
+  .aw .tab:hover { color: var(--ink); }
+  .aw .tab[data-active="true"] { color: var(--ink); font-weight:500; background: color-mix(in srgb, var(--accent) 9%, transparent); box-shadow: inset 2px 0 0 var(--accent); }
+  .aw .sdot { background: var(--ink-faint); }
+  .aw .sdot[data-run="true"] { background: var(--accent); }
+  .aw .tab[data-active="true"] .sdot { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
+  .aw .tabclose { opacity: 0; transition: opacity .14s ease; color: var(--ink-faint); }
+  .aw .tab:hover .tabclose { opacity: 1; }
+  .aw .tabclose:hover { color: var(--ink) !important; }
+  .aw .cmpl { color: var(--ink-dim); transition: background .1s ease; }
+  .aw .cmpl:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
+  .aw .cmpl[data-active="true"] { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--ink); }
+  .aw .cmpl [data-hit="true"] { color: var(--accent); font-weight:600; }
+  .aw ::selection { background: color-mix(in srgb, var(--accent) 26%, transparent); }
+  .aw input::placeholder, .aw textarea::placeholder { color: var(--ink-faint); }
+  .aw button { cursor:pointer; }
+</style>
+</helmet>
+
+<div ref="{{ setRoot }}" class="aw" data-theme="{{ theme }}" style="width:100%; min-height:560px; background:var(--bg); border:1px solid var(--hairline); border-radius:12px; overflow:hidden; display:flex; flex-direction:column; box-shadow: 0 24px 60px -34px rgba(0,0,0,0.4);">
+
+  <!-- title bar -->
+  <div style="height:44px; flex:none; display:flex; align-items:center; padding:0 15px; border-bottom:1px solid var(--hairline); position:relative;">
+    <div style="display:flex; gap:9px; align-items:center;">
+      <span style="width:12px; height:12px; border-radius:50%; background:#e0655a;"></span>
+      <span style="width:12px; height:12px; border-radius:50%; background:#dfa63f;"></span>
+      <span style="width:12px; height:12px; border-radius:50%; background:#7cae5b;"></span>
+    </div>
+    <span class="navitem" onClick="{{ toggleSidebar }}" title="Toggle sessions" style="margin-left:18px; font-size:15px; line-height:1; color:var(--ink-faint); z-index:2; cursor:pointer;">◧</span>
+    <div style="position:absolute; left:0; right:0; text-align:center; pointer-events:none; font-size:12.5px; letter-spacing:0.02em; color:var(--ink-dim);">
+      <span style="color:var(--ink);">{{ activeSessionName }}</span><span style="color:var(--ink-faint);"> &nbsp;—&nbsp; ~/projects/aterm</span>
+    </div>
+  </div>
+
+  <!-- body -->
+  <div style="flex:1; display:flex; min-height:0;">
+
+    <!-- sidebar -->
+    <sc-if value="{{ sidebarOpen }}" hint-placeholder-val="{{ true }}">
+    <div style="width:210px; flex:none; border-right:1px solid var(--hairline); padding:20px 0; display:flex; flex-direction:column;">
+      <div style="padding:0 22px 8px; display:flex; align-items:center; justify-content:space-between;">
+        <span style="font-size:10.5px; letter-spacing:0.14em; text-transform:uppercase; color:var(--ink-faint);">Sessions</span>
+        <span class="navitem" onClick="{{ newSession }}" style="font-size:15px; line-height:1; color:var(--ink-faint);">+</span>
+      </div>
+      <sc-for list="{{ sessions }}" as="session" hint-placeholder-count="3">
+        <div class="tab" data-active="{{ session.active }}" onClick="{{ session.onSelect }}" style="padding:7px 22px; display:flex; align-items:center; gap:11px; font-size:12.5px; cursor:pointer;">
+          <span class="sdot" data-run="{{ session.running }}" style="width:6px; height:6px; border-radius:50%; flex:none;"></span>
+          <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ session.name }}</span>
+          <span class="tabclose" onClick="{{ session.onClose }}" style="font-size:11px; flex:none;">✕</span>
+        </div>
+      </sc-for>
+      <div style="margin-top:auto; padding:16px 22px 0; font-size:10.5px; color:var(--ink-faint); line-height:1.7;">
+        <div>⌘T &nbsp;new session</div>
+        <div>⌘I &nbsp;switch mode</div>
+        <div>⌘L &nbsp;switch theme</div>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- main -->
+    <div style="flex:1; min-width:0; display:flex; flex-direction:column;">
+      <div style="flex:1; overflow-y:auto; font-size:var(--fs, 14px);">
+        <div style="margin:0; padding:30px 22px 24px;">
+
+          <!-- launch -->
+          <sc-if value="{{ isLaunch }}" hint-placeholder-val="{{ true }}">
+            <div style="min-height:400px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; gap:18px;">
+              <div style="font-size:22px; letter-spacing:0.04em; color:var(--ink);">aterm</div>
+              <div style="font-size:13.5px; color:var(--ink-dim); line-height:1.9; max-width:400px;">A quiet place to run things.<br/>Type a command below, or press ⌘I to ask the agent instead.</div>
+              <div style="margin-top:6px; font-size:11.5px; color:var(--ink-faint); letter-spacing:0.06em;">no history yet</div>
+            </div>
+          </sc-if>
+
+          <!-- shell -->
+          <sc-if value="{{ isShell }}" hint-placeholder-val="{{ true }}">
+            <div>
+              <div class="block" style="padding:18px 0; border-top:1px solid var(--hairline);">
+                <div style="display:flex; gap:13px; align-items:baseline;">
+                  <span style="color:var(--accent); font-weight:600;">❯</span>
+                  <span style="color:var(--ink);">git status</span>
+                  <span class="block-meta" style="margin-left:auto; display:flex; align-items:center; gap:9px; color:var(--ink-faint); font-size:0.82em;"><span style="width:6px; height:6px; border-radius:50%; background:var(--ink-faint);"></span>0.06s</span>
+                </div>
+                <div style="padding-left:29px; margin-top:9px; color:var(--ink-dim); white-space:pre-wrap; line-height:1.75;">On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean</div>
+              </div>
+              <div class="block" style="padding:18px 0; border-top:1px solid var(--hairline);">
+                <div style="display:flex; gap:13px; align-items:baseline;">
+                  <span style="color:var(--accent); font-weight:600;">❯</span>
+                  <span style="color:var(--ink);">ls</span>
+                  <span class="block-meta" style="margin-left:auto; display:flex; align-items:center; gap:9px; color:var(--ink-faint); font-size:0.82em;"><span style="width:6px; height:6px; border-radius:50%; background:var(--ink-faint);"></span>0.01s</span>
+                </div>
+                <div style="padding-left:29px; margin-top:9px; color:var(--ink-dim); white-space:pre-wrap; line-height:1.75;">Cargo.toml   README.md   src/   tests/   target/</div>
+              </div>
+              <div class="block" style="padding:18px 0; border-top:1px solid var(--hairline);">
+                <div style="display:flex; gap:13px; align-items:baseline;">
+                  <span style="color:var(--accent); font-weight:600;">❯</span>
+                  <span style="color:var(--ink);">cargo build --release</span>
+                  <span class="block-meta" style="margin-left:auto; display:flex; align-items:center; gap:9px; color:var(--ink-faint); font-size:0.82em;"><span style="width:6px; height:6px; border-radius:50%; background:var(--ok);"></span>12.71s</span>
+                </div>
+                <div style="padding-left:29px; margin-top:9px; color:var(--ink-dim); white-space:pre-wrap; line-height:1.75;">   Compiling aterm v0.4.0 (/Users/you/projects/aterm)
+    Finished release [optimized] target(s) in 12.71s</div>
+              </div>
+              <div class="block" style="padding:18px 0; border-top:1px solid var(--hairline);">
+                <div style="display:flex; gap:13px; align-items:baseline;">
+                  <span style="color:var(--accent); font-weight:600;">❯</span>
+                  <span style="color:var(--ink);">cargo test render::blocks</span>
+                  <span class="block-meta" style="margin-left:auto; display:flex; align-items:center; gap:9px; color:var(--ink-faint); font-size:0.82em;"><span style="width:6px; height:6px; border-radius:50%; background:var(--err);"></span>exit 1 · 2.34s</span>
+                </div>
+                <div style="padding-left:29px; margin-top:9px; color:var(--ink-dim); white-space:pre-wrap; line-height:1.75;">running 3 tests
+test render::blocks::wraps_long_lines ... ok
+test render::blocks::hairline_between ... <span style="color:var(--err);">FAILED</span>
+test render::blocks::block_metadata ... ok
+
+test result: <span style="color:var(--err);">FAILED</span>. 2 passed; 1 failed; finished in 2.34s</div>
+              </div>
+              <div class="block" style="padding:18px 0; border-top:1px solid var(--hairline);">
+                <div style="display:flex; gap:13px; align-items:baseline;">
+                  <span style="color:var(--accent); font-weight:600;">❯</span>
+                  <span style="color:var(--ink);">git log --oneline -3</span>
+                  <span class="block-meta" style="margin-left:auto; display:flex; align-items:center; gap:9px; color:var(--ink-faint); font-size:0.82em;"><span style="width:6px; height:6px; border-radius:50%; background:var(--ink-faint);"></span>0.02s</span>
+                </div>
+                <div style="padding-left:29px; margin-top:9px; color:var(--ink-dim); white-space:pre-wrap; line-height:1.75;"><span style="color:var(--ink-faint);">a1c4f0e</span>  paint blocks from the first byte
+<span style="color:var(--ink-faint);">9d2b118</span>  warm near-black and paper themes
+<span style="color:var(--ink-faint);">3e77aa2</span>  route Enter by the mode chip</div>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- modes -->
+          <sc-if value="{{ isModes }}" hint-placeholder-val="{{ true }}">
+            <div style="min-height:400px; display:flex; flex-direction:column; justify-content:center; gap:26px;">
+              <div style="font-size:12px; letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-faint);">One input, two destinations</div>
+              <div style="font-size:14.5px; color:var(--ink-dim); line-height:1.9; max-width:520px;">The box at the bottom drives the shell or the agent. The <span style="color:var(--ink);">mode chip</span> decides where <span style="color:var(--ink);">Enter</span> goes — press <span style="color:var(--accent);">⌘I</span> (or tap the chip) to flip it. Whatever you've typed stays exactly where it is.</div>
+              <div style="display:flex; gap:34px; margin-top:4px;">
+                <div style="flex:1;">
+                  <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;"><span style="color:var(--accent);">❯</span><span style="font-size:12.5px; color:var(--ink-dim);">Shell</span></div>
+                  <div style="font-size:12.5px; color:var(--ink-faint); line-height:1.8;">Enter hands the line to the background shell and appends a command block to the timeline.</div>
+                </div>
+                <div style="width:1px; background:var(--hairline);"></div>
+                <div style="flex:1;">
+                  <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;"><span style="color:var(--agent);">◇</span><span style="font-size:12.5px; color:var(--ink-dim);">Agent</span></div>
+                  <div style="font-size:12.5px; color:var(--ink-faint); line-height:1.8;">Enter starts a client-side agentic loop that plans, calls tools, and reports back as blocks.</div>
+                </div>
+              </div>
+              <div style="font-size:12px; color:var(--ink-faint);">Currently routing to <span style="color:var(--accent);">{{ modeLabel }}</span> — try flipping it below.</div>
+            </div>
+          </sc-if>
+
+          <!-- agent -->
+          <sc-if value="{{ isAgent }}" hint-placeholder-val="{{ true }}">
+            <div>
+              <div class="block" style="padding:18px 0; border-top:1px solid var(--hairline);">
+                <div style="display:flex; gap:13px; align-items:baseline;">
+                  <span style="color:var(--agent); font-weight:600;">◇</span>
+                  <span style="color:var(--ink);">fix the failing block-render test</span>
+                  <span class="block-meta" style="margin-left:auto; color:var(--ink-faint); font-size:0.82em;">agent · 4 steps</span>
+                </div>
+              </div>
+              <div style="padding:6px 0 10px 29px; color:var(--ink-dim); line-height:1.85; font-size:0.95em;">
+                <div style="color:var(--ink-faint); font-size:0.86em; letter-spacing:0.08em; text-transform:uppercase; margin-bottom:8px;">plan</div>
+                Read the failing test, reproduce it, then trace the hairline logic in the block renderer and patch it. Re-run the suite to confirm.
+              </div>
+              <div style="padding-left:29px; margin-top:6px;">
+                <div style="display:flex; gap:11px; align-items:baseline;"><span style="color:var(--accent); opacity:0.9;">read_file</span><span style="color:var(--ink-faint);">src/render/blocks.rs</span></div>
+                <div style="margin-top:7px; margin-bottom:16px; color:var(--ink-faint); white-space:pre-wrap; line-height:1.7; border-left:1px solid var(--hairline); padding-left:15px;">fn draw(&self, blocks: &[Block]) {
+    for (i, b) in blocks.iter().enumerate() {
+        self.hairline(b.top);   // drawn for every block
+        b.paint(&mut self.buf);
+    }
+}</div>
+                <div style="display:flex; gap:11px; align-items:baseline;"><span style="color:var(--accent); opacity:0.9;">run_command</span><span style="color:var(--ink-faint);">cargo test render::blocks::hairline_between</span></div>
+                <div style="margin-top:7px; margin-bottom:16px; color:var(--ink-faint); white-space:pre-wrap; line-height:1.7; border-left:1px solid var(--hairline); padding-left:15px;">assertion failed: expected 0 hairlines above the first block, found 1
+test result: <span style="color:var(--err);">FAILED</span>. 0 passed; 1 failed</div>
+                <div style="margin-bottom:16px; color:var(--ink-dim); line-height:1.85; font-size:0.95em;">The hairline is painted above every block including the first. It should be skipped for <span style="color:var(--ink);">i == 0</span>.</div>
+                <div style="display:flex; gap:11px; align-items:baseline;"><span style="color:var(--accent); opacity:0.9;">edit_file</span><span style="color:var(--ink-faint);">src/render/blocks.rs</span><span style="margin-left:auto; color:var(--ink-faint); font-size:0.86em;">+1 −1</span></div>
+                <div style="margin-top:7px; margin-bottom:16px; white-space:pre-wrap; line-height:1.7; border-left:1px solid var(--hairline); padding-left:15px;"><span style="color:var(--err);">-        self.hairline(b.top);</span>
+<span style="color:var(--ok);">+        if i > 0 { self.hairline(b.top); }</span></div>
+                <div style="display:flex; gap:11px; align-items:baseline;"><span style="color:var(--accent); opacity:0.9;">run_command</span><span style="color:var(--ink-faint);">cargo test render::blocks</span></div>
+                <div style="margin-top:7px; margin-bottom:10px; color:var(--ink-faint); white-space:pre-wrap; line-height:1.7; border-left:1px solid var(--hairline); padding-left:15px;">test result: <span style="color:var(--ok);">ok</span>. 3 passed; 0 failed; finished in 2.29s</div>
+              </div>
+              <div style="padding:14px 0 6px 29px; border-top:1px solid var(--hairline); color:var(--ink); line-height:1.85;">
+                Fixed. The hairline was being drawn above the first block; I guarded it with <span style="color:var(--ink-dim);">i &gt; 0</span>. All three tests pass.
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- gate -->
+          <sc-if value="{{ isGate }}" hint-placeholder-val="{{ true }}">
+            <div>
+              <div class="block" style="padding:18px 0; border-top:1px solid var(--hairline);">
+                <div style="display:flex; gap:13px; align-items:baseline;">
+                  <span style="color:var(--agent); font-weight:600;">◇</span>
+                  <span style="color:var(--ink);">free up disk space in this repo</span>
+                </div>
+              </div>
+              <div style="padding:2px 0 12px 29px; color:var(--ink-dim); line-height:1.85; font-size:0.95em;">The <span style="color:var(--ink);">target/</span> directory is 380&nbsp;MB of build artifacts. Removing it recovers the space; it rebuilds on next compile.</div>
+              <div style="padding-left:29px;">
+                <div style="display:flex; gap:11px; align-items:baseline; margin-bottom:14px;"><span style="color:var(--accent); opacity:0.9;">run_command</span><span style="color:var(--ink);">rm -rf ./target</span></div>
+                <sc-if value="{{ gatePending }}" hint-placeholder-val="{{ true }}">
+                  <div style="border:1px solid var(--warn); background:var(--warn-bg); border-radius:9px; padding:18px 20px;">
+                    <div style="display:flex; gap:12px; align-items:baseline;">
+                      <span style="color:var(--warn);">△</span>
+                      <div style="flex:1;">
+                        <div style="color:var(--ink); margin-bottom:6px;">Destructive command — needs your approval</div>
+                        <div style="color:var(--ink-dim); font-size:0.92em; line-height:1.8;">This permanently deletes files and can't be undone. Safe commands run on their own; this one is gated.</div>
+                      </div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:12px; margin-top:18px; padding-left:24px;">
+                      <div style="position:relative; display:flex;">
+                        <button onClick="{{ approveGate }}" style="border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:7px 0 0 7px; padding:8px 16px; font-size:12.5px;">Approve</button>
+                        <button onClick="{{ toggleGateMenu }}" style="border:1px solid var(--accent); border-left:1px solid rgba(255,255,255,0.3); background:var(--accent); color:#fff; border-radius:0 7px 7px 0; padding:8px 9px; font-size:10px; display:flex; align-items:center;">▾</button>
+                        <sc-if value="{{ gateMenu }}" hint-placeholder-val="{{ false }}">
+                          <div style="position:absolute; top:calc(100% + 6px); left:0; min-width:236px; background:var(--bg-elev); border:1px solid var(--hairline); border-radius:9px; padding:5px; z-index:10; box-shadow:0 12px 34px -14px rgba(0,0,0,0.45);">
+                            <div class="menuitem" onClick="{{ approveOnce }}" style="padding:9px 11px; border-radius:6px; font-size:12.5px; color:var(--ink); cursor:pointer;">Approve once</div>
+                            <div class="menuitem" onClick="{{ approveAlways }}" style="padding:9px 11px; border-radius:6px; font-size:12.5px; color:var(--ink); cursor:pointer;">Always approve <span style="color:var(--ink-faint);">rm -rf …</span></div>
+                          </div>
+                        </sc-if>
+                      </div>
+                      <button onClick="{{ rejectGate }}" style="border:1px solid var(--hairline); background:transparent; color:var(--ink-dim); border-radius:7px; padding:8px 18px; font-size:12.5px;">Reject</button>
+                      <span style="margin-left:6px; color:var(--ink-faint); font-size:11.5px;">⏎ approve · esc reject</span>
+                    </div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ gateApproved }}" hint-placeholder-val="{{ false }}">
+                  <div style="color:var(--ink-dim); line-height:1.8;"><span style="color:var(--ok);">✓</span> &nbsp;Approved · removed <span style="color:var(--ink);">./target</span> — 380&nbsp;MB freed <span style="color:var(--ink-faint);">· exit 0</span></div>
+                  <sc-if value="{{ alwaysApprove }}" hint-placeholder-val="{{ false }}">
+                    <div style="margin-top:9px; color:var(--ink-faint); font-size:12px; line-height:1.7;">Similar commands (<span style="color:var(--ink-dim);">rm -rf …</span>) will now run without asking · change in Settings → Autonomy.</div>
+                  </sc-if>
+                </sc-if>
+                <sc-if value="{{ gateRejected }}" hint-placeholder-val="{{ false }}">
+                  <div style="color:var(--ink-dim); line-height:1.8;"><span style="color:var(--err);">✕</span> &nbsp;Rejected · the command was not run. The agent will continue without it.</div>
+                </sc-if>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- tab completion -->
+          <sc-if value="{{ isComplete }}" hint-placeholder-val="{{ true }}">
+            <div style="min-height:360px; display:flex; flex-direction:column; justify-content:flex-end; gap:22px; padding-bottom:6px;">
+              <div style="font-size:12px; letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-faint);">Tab completion</div>
+              <div style="font-size:14px; color:var(--ink-dim); line-height:1.95; max-width:530px;">A built-in fuzzy finder that hugs the prompt. Press <span style="color:var(--ink);">Tab</span> to open it — matched letters are highlighted in <span style="color:var(--accent);">accent</span>, and the list narrows as you type more of the command.</div>
+            </div>
+          </sc-if>
+
+          <!-- editor -->
+          <sc-if value="{{ isEditor }}" hint-placeholder-val="{{ true }}">
+            <div style="display:flex; flex-direction:column; min-height:430px;">
+              <div style="display:flex; align-items:center; justify-content:space-between; padding-bottom:16px; border-bottom:1px solid var(--hairline);">
+                <span style="font-size:12.5px; color:var(--ink-dim);"><span style="color:var(--ink);">NOTES.md</span> &nbsp;·&nbsp; edited</span>
+                <span style="font-size:11.5px; color:var(--ink-faint);">markdown · {{ editorWords }} words · ⌘S save · esc to shell</span>
+              </div>
+              <textarea value="{{ editorText }}" onChange="{{ onEditor }}" spellcheck="false" style="flex:1; width:100%; max-width:620px; margin:22px auto 0; background:transparent; border:none; outline:none; resize:none; color:var(--ink); font-size:16px; line-height:1.9; caret-color:var(--accent); padding:0;"></textarea>
+            </div>
+          </sc-if>
+
+          <!-- settings -->
+          <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ true }}">
+            <div style="display:flex; flex-direction:column; gap:2px;">
+              <div style="font-size:12px; letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-faint); padding-bottom:22px;">Preferences</div>
+              <div style="display:flex; align-items:center; padding:20px 0; border-top:1px solid var(--hairline);">
+                <div style="flex:1;"><div style="color:var(--ink);">Theme</div><div style="color:var(--ink-faint); font-size:12px; margin-top:4px;">Warm paper, or warm near-black.</div></div>
+                <div style="display:flex; gap:18px; font-size:13px;"><span class="seg" data-active="{{ isDark }}" onClick="{{ setDark }}">Dark</span><span class="seg" data-active="{{ isLight }}" onClick="{{ setLight }}">Light</span></div>
+              </div>
+              <div style="display:flex; align-items:center; padding:20px 0; border-top:1px solid var(--hairline);">
+                <div style="flex:1;"><div style="color:var(--ink);">Font size</div><div style="color:var(--ink-faint); font-size:12px; margin-top:4px;">Applies across every block.</div></div>
+                <div style="display:flex; gap:16px; align-items:center; font-size:13px;">
+                  <button onClick="{{ decFont }}" style="border:1px solid var(--hairline); background:transparent; color:var(--ink-dim); border-radius:6px; width:28px; height:28px; font-size:15px;">−</button>
+                  <span style="color:var(--ink); min-width:44px; text-align:center;">{{ fontSize }} px</span>
+                  <button onClick="{{ incFont }}" style="border:1px solid var(--hairline); background:transparent; color:var(--ink-dim); border-radius:6px; width:28px; height:28px; font-size:15px;">+</button>
+                </div>
+              </div>
+              <div style="display:flex; align-items:center; padding:20px 0; border-top:1px solid var(--hairline);">
+                <div style="flex:1;"><div style="color:var(--ink);">Default provider</div><div style="color:var(--ink-faint); font-size:12px; margin-top:4px;">Model backing the agent loop.</div></div>
+                <div style="display:flex; gap:18px; font-size:13px;"><span class="seg" data-active="{{ provA }}" onClick="{{ setProvA }}">Anthropic</span><span class="seg" data-active="{{ provO }}" onClick="{{ setProvO }}">OpenAI</span><span class="seg" data-active="{{ provL }}" onClick="{{ setProvL }}">Local</span></div>
+              </div>
+              <div style="display:flex; align-items:center; padding:20px 0; border-top:1px solid var(--hairline); border-bottom:1px solid var(--hairline);">
+                <div style="flex:1;"><div style="color:var(--ink);">Autonomy</div><div style="color:var(--ink-faint); font-size:12px; margin-top:4px;">When the agent may act without asking.</div></div>
+                <div style="display:flex; gap:18px; font-size:13px;"><span class="seg" data-active="{{ autoAsk }}" onClick="{{ setAutoAsk }}">Ask each time</span><span class="seg" data-active="{{ autoSafe }}" onClick="{{ setAutoSafe }}">Auto-run safe</span><span class="seg" data-active="{{ autoFull }}" onClick="{{ setAutoFull }}">Full auto</span></div>
+              </div>
+              <div style="padding-top:26px; color:var(--ink-faint); font-size:11.5px;">aterm 0.4.0 · themes stay calm, config stays typographic</div>
+            </div>
+          </sc-if>
+
+        </div>
+      </div>
+
+      <!-- input bar -->
+      <sc-if value="{{ showInput }}" hint-placeholder-val="{{ true }}">
+        <div style="flex:none; border-top:1px solid var(--hairline); position:relative;">
+          <sc-if value="{{ completeOpen }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute; left:14px; bottom:calc(100% + 6px); z-index:20; background:var(--bg-elev); border:1px solid var(--hairline); border-radius:9px; box-shadow:0 12px 34px -16px rgba(0,0,0,0.6); padding:6px 6px 7px; font-size:13px; line-height:1.58;">
+              <div style="color:var(--ink-faint); font-size:11px; padding:2px 9px 6px; letter-spacing:0.02em;">{{ completeCount }}/12 &nbsp;·&nbsp; tab ⏎ accept &nbsp;·&nbsp; ↑↓ move &nbsp;·&nbsp; esc</div>
+              <sc-for list="{{ completions }}" as="c" hint-placeholder-count="4">
+                <div class="cmpl" data-active="{{ c.active }}" onClick="{{ c.onPick }}" style="display:flex; align-items:baseline; gap:9px; padding:3px 10px; border-radius:6px; cursor:pointer;">
+                  <span style="width:11px; flex:none; color:var(--accent); font-weight:600;">{{ c.pointer }}</span>
+                  <span><sc-for list="{{ c.parts }}" as="p" hint-placeholder-count="1"><span data-hit="{{ p.hit }}" style="white-space:pre;">{{ p.t }}</span></sc-for></span>
+                  <span style="color:var(--ink-faint); font-size:0.8em; margin-left:2px;">{{ c.desc }}</span>
+                </div>
+              </sc-for>
+            </div>
+          </sc-if>
+          <div data-mode="{{ mode }}" style="padding:14px 22px; display:flex; align-items:flex-start; gap:14px;">
+            <span style="color:var(--mode); font-weight:600; font-size:15px; line-height:1.6; padding-top:1px;">{{ promptGlyph }}</span>
+            <textarea value="{{ inputText }}" onChange="{{ onInput }}" onKeyDown="{{ onKeyDown }}" placeholder="{{ inputPlaceholder }}" rows="1" style="flex:1; background:transparent; border:none; outline:none; resize:none; overflow-y:auto; color:var(--ink); font-size:14px; line-height:1.6; caret-color:var(--mode); padding:0; max-height:200px;"></textarea>
+            <button onClick="{{ toggleMode }}" style="align-self:flex-start; margin-top:1px; border:1px solid var(--mode); background:color-mix(in srgb, var(--mode) 13%, transparent); color:var(--mode); border-radius:20px; padding:5px 12px; font-size:11.5px; display:flex; align-items:center; gap:8px;">
+              <span style="font-weight:600; font-size:12.5px;">{{ promptGlyph }}</span>{{ modeLabel }}<span style="opacity:0.55; margin-left:1px;">⌘I</span>
+            </button>
+          </div>
+        </div>
+      </sc-if>
+
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:&quot;960px&quot;,&quot;height&quot;:&quot;620px&quot;},&quot;screen&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;launch&quot;,&quot;options&quot;:[&quot;launch&quot;,&quot;shell&quot;,&quot;modes&quot;,&quot;agent&quot;,&quot;gate&quot;,&quot;complete&quot;,&quot;editor&quot;,&quot;settings&quot;],&quot;tsType&quot;:&quot;string&quot;},&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;dark&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;tsType&quot;:&quot;string&quot;},&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#3d88cc&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;setTheme&quot;:{&quot;editor&quot;:null,&quot;tsType&quot;:&quot;(t: string) =&gt; void&quot;}}">
+class Component extends DCLogic {
+  state = {
+    mode: 'shell',
+    inputText: '',
+    completeOpen: false,
+    completeIndex: 0,
+    editorText: '# Release notes — v0.4.0\n\nBlocks now paint from the first byte, so output appears as it streams in — not after the command exits.\n\n- warm near-black and warm paper themes\n- Enter routes by the mode chip\n- a risk gate for destructive commands\n\nStill to do: fold long outputs, and a jump-to-block palette.\n',
+    gate: 'pending',
+    gateMenu: false,
+    alwaysApprove: false,
+    fontSize: 14,
+    provider: 'Anthropic',
+    autonomy: 'safe',
+    sessions: [
+      { id: 1, name: 'main', running: true },
+      { id: 2, name: 'dev server', running: true },
+      { id: 3, name: 'db shell', running: false },
+    ],
+    activeSession: 1,
+    sessionSeq: 3,
+    sidebarOpen: true,
+  };
+
+  setRoot = (el) => { this.rootEl = el; };
+
+  applyVars() {
+    const el = this.rootEl;
+    if (!el) return;
+    el.style.setProperty('--accent', this.props.accent || '#3d88cc');
+    el.style.setProperty('--fs', (this.state.fontSize || 14) + 'px');
+  }
+
+  componentDidMount() {
+    const s = this.props.screen;
+    const patch = {};
+    if (s === 'agent') patch.mode = 'agent';
+    if (s === 'modes' && !this.state.inputText) patch.inputText = 'check the build status and open a PR';
+    if (s === 'complete') { patch.inputText = 'git'; patch.completeOpen = true; patch.completeIndex = 0; }
+    if (Object.keys(patch).length) this.setState(patch);
+    this.applyVars();
+  }
+  componentDidUpdate() { this.applyVars(); }
+
+  toggleMode = () => this.setState((s) => ({ mode: s.mode === 'shell' ? 'agent' : 'shell' }));
+
+  newSession = () => this.setState((st) => {
+    const id = st.sessionSeq + 1;
+    return { sessions: [...st.sessions, { id, name: 'session ' + id, running: true }], sessionSeq: id, activeSession: id };
+  });
+
+  closeSession(id) {
+    this.setState((st) => {
+      const sessions = st.sessions.filter((s) => s.id !== id);
+      let activeSession = st.activeSession;
+      if (activeSession === id) activeSession = sessions.length ? sessions[0].id : null;
+      return { sessions, activeSession };
+    });
+  }
+
+  candidates = [
+    { cmd: 'git status', desc: 'working tree' },
+    { cmd: 'git switch -c ', desc: 'new branch' },
+    { cmd: 'git commit -m ""', desc: 'record' },
+    { cmd: 'git push --force-with-lease', desc: 'safe force' },
+    { cmd: 'git log --oneline -10', desc: 'history' },
+    { cmd: 'git stash pop', desc: 'restore' },
+    { cmd: 'cargo build --release', desc: 'build' },
+    { cmd: 'cargo test render::blocks', desc: 'test' },
+    { cmd: 'cargo run', desc: 'run' },
+    { cmd: 'rg "" src/', desc: 'ripgrep' },
+    { cmd: 'ls -la', desc: 'list' },
+    { cmd: 'docker compose up -d', desc: 'services' },
+  ];
+
+  fuzzyParts(q, s) {
+    if (!q) return { parts: [{ t: s, hit: false }], score: 0 };
+    const hits = new Array(s.length).fill(false);
+    let qi = 0, first = -1, last = -1;
+    for (let i = 0; i < s.length && qi < q.length; i++) {
+      if (s[i].toLowerCase() === q[qi]) { hits[i] = true; if (first < 0) first = i; last = i; qi++; }
+    }
+    if (qi < q.length) return null;
+    const parts = [];
+    for (let i = 0; i < s.length; i++) {
+      const h = hits[i];
+      if (parts.length && parts[parts.length - 1].hit === h) parts[parts.length - 1].t += s[i];
+      else parts.push({ t: s[i], hit: h });
+    }
+    const span = last - first + 1;
+    return { parts, score: first + (span - q.length) };
+  }
+
+  computeCompletions(text) {
+    const q = (text || '').trim().toLowerCase();
+    const out = [];
+    for (const c of this.candidates) {
+      const r = this.fuzzyParts(q, c.cmd);
+      if (r) out.push({ cmd: c.cmd, desc: c.desc, parts: r.parts, score: r.score });
+    }
+    out.sort((a, b) => a.score - b.score);
+    return out.slice(0, 6);
+  }
+
+  accept(item) {
+    this.setState({ inputText: item.cmd, completeOpen: false, completeIndex: 0 });
+  }
+
+  handleKeyDown(e) {
+    const list = this.computeCompletions(this.state.inputText);
+    const open = this.state.completeOpen && list.length > 0;
+    const idx = Math.max(0, Math.min(this.state.completeIndex, list.length - 1));
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      if (open) this.accept(list[idx]);
+      else this.setState({ completeOpen: true, completeIndex: 0 });
+    } else if (e.key === 'ArrowDown' && open) {
+      e.preventDefault();
+      this.setState((s) => ({ completeIndex: Math.min(s.completeIndex + 1, list.length - 1) }));
+    } else if (e.key === 'ArrowUp' && open) {
+      e.preventDefault();
+      this.setState((s) => ({ completeIndex: Math.max(s.completeIndex - 1, 0) }));
+    } else if (e.key === 'Enter' && open) {
+      e.preventDefault();
+      this.accept(list[idx]);
+    } else if (e.key === 'Escape') {
+      this.setState({ completeOpen: false });
+    }
+  }
+
+  renderVals() {
+    const screen = this.props.screen || 'launch';
+    const theme = this.props.theme || 'dark';
+    const mode = this.state.mode;
+    const isAgentMode = mode === 'agent';
+    const setTheme = this.props.setTheme;
+    const compList = this.computeCompletions(this.state.inputText);
+    const compIdx = Math.max(0, Math.min(this.state.completeIndex, compList.length - 1));
+    return {
+      setRoot: this.setRoot,
+      theme,
+      isDark: theme === 'dark',
+      isLight: theme === 'light',
+      setDark: () => setTheme && setTheme('dark'),
+      setLight: () => setTheme && setTheme('light'),
+
+      isLaunch: screen === 'launch',
+      isShell: screen === 'shell',
+      isModes: screen === 'modes',
+      isAgent: screen === 'agent',
+      isGate: screen === 'gate',
+      isSettings: screen === 'settings',
+      isComplete: screen === 'complete',
+      isEditor: screen === 'editor',
+      showInput: screen !== 'settings' && screen !== 'editor',
+      editorText: this.state.editorText,
+      editorWords: (this.state.editorText.trim().match(/\S+/g) || []).length,
+      onEditor: (e) => this.setState({ editorText: e.target.value }),
+      completeOpen: this.state.completeOpen && compList.length > 0,
+      completeCount: compList.length,
+      completions: compList.map((c, i) => ({ cmd: c.cmd, desc: c.desc, parts: c.parts, active: i === compIdx, pointer: i === compIdx ? '›' : ' ', onPick: () => this.accept(c) })),
+      onKeyDown: (e) => this.handleKeyDown(e),
+
+      mode,
+      modeLabel: isAgentMode ? 'Agent' : 'Shell',
+      promptGlyph: isAgentMode ? '◇' : '❯',
+      inputPlaceholder: isAgentMode ? 'Ask the agent to do something…' : 'Type a command…',
+      toggleMode: this.toggleMode,
+      inputText: this.state.inputText,
+      onInput: (e) => {
+        const el = e.target;
+        const v = el.value;
+        const has = this.computeCompletions(v).length > 0;
+        this.setState({ inputText: v, completeOpen: v.trim().length > 0 && has, completeIndex: 0 });
+        el.style.height = 'auto';
+        el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+      },
+
+      gatePending: this.state.gate === 'pending',
+      gateApproved: this.state.gate === 'approved',
+      gateRejected: this.state.gate === 'rejected',
+      approveGate: () => this.setState({ gate: 'approved', gateMenu: false }),
+      rejectGate: () => this.setState({ gate: 'rejected', gateMenu: false }),
+      gateMenu: this.state.gateMenu,
+      alwaysApprove: this.state.alwaysApprove,
+      toggleGateMenu: () => this.setState((s) => ({ gateMenu: !s.gateMenu })),
+      approveOnce: () => this.setState({ gate: 'approved', gateMenu: false }),
+      approveAlways: () => this.setState({ gate: 'approved', gateMenu: false, alwaysApprove: true, autonomy: 'full' }),
+
+      fontSize: this.state.fontSize,
+      incFont: () => this.setState((s) => ({ fontSize: Math.min(18, s.fontSize + 1) })),
+      decFont: () => this.setState((s) => ({ fontSize: Math.max(12, s.fontSize - 1) })),
+
+      provA: this.state.provider === 'Anthropic',
+      provO: this.state.provider === 'OpenAI',
+      provL: this.state.provider === 'Local',
+      setProvA: () => this.setState({ provider: 'Anthropic' }),
+      setProvO: () => this.setState({ provider: 'OpenAI' }),
+      setProvL: () => this.setState({ provider: 'Local' }),
+
+      autoAsk: this.state.autonomy === 'ask',
+      autoSafe: this.state.autonomy === 'safe',
+      autoFull: this.state.autonomy === 'full',
+      setAutoAsk: () => this.setState({ autonomy: 'ask' }),
+      setAutoSafe: () => this.setState({ autonomy: 'safe' }),
+      setAutoFull: () => this.setState({ autonomy: 'full' }),
+
+      newSession: this.newSession,
+      sidebarOpen: this.state.sidebarOpen,
+      toggleSidebar: () => this.setState((s) => ({ sidebarOpen: !s.sidebarOpen })),
+      activeSessionName: (this.state.sessions.find((s) => s.id === this.state.activeSession) || {}).name || 'aterm',
+      sessions: this.state.sessions.map((s) => ({
+        ...s,
+        active: s.id === this.state.activeSession,
+        onSelect: () => this.setState({ activeSession: s.id }),
+        onClose: (e) => { e.stopPropagation(); this.closeSession(s.id); },
+      })),
+    };
+  }
+}
+</script>
+</body>
+</html>
