@@ -47,11 +47,23 @@ pub const RESIZE_SPIKE_MS: f32 = 33.4;
 /// ~no frames) from silently "passing" every gate.
 pub const MIN_ACTIVE_SAMPLES: usize = 30;
 
-/// Decoupling slack for `output_flood`: the presented-frame count may exceed the
-/// vsync-implied count by at most this factor. With `Fifo` present a frame can never
-/// beat vsync, so a healthy flood sits well under 1x; a render coupled to the byte
-/// firehose would present orders of magnitude more, so 2x cleanly separates the two.
+/// Decoupling frame ceiling for `output_flood`: presented frames may exceed the
+/// vsync-implied count by at most this factor. This arm catches a regression that
+/// abandons vsync pacing (e.g. drops `Fifo` present) and starts drawing per byte-chunk:
+/// it would present far past vsync. On its own it is NOT sufficient (under `Fifo` a
+/// present cannot beat vsync anyway), which is why the decoupling gate ALSO requires a
+/// sustained byte firehose ([`MIN_FLOOD_BYTES`]) - see [`Gate::evaluate`].
 pub const DECOUPLE_SLACK: f32 = 2.0;
+
+/// The minimum bytes the model must have drained during the `output_flood` measured
+/// window for the run to count as an actual flood. This is the falsifiable half of the
+/// decoupling proof: the byte firehose kept flowing (huge `bytes_fed`) WHILE the
+/// renderer presented only ~vsync frames. If a regression coupled the render into the
+/// byte-drain path, the vsync-blocked present would throttle the drain and `bytes_fed`
+/// would collapse below this floor - so the gate fires. ~4 MiB is far below what `yes`
+/// sustains over a multi-second window, yet far above what a render-throttled drain
+/// would manage.
+pub const MIN_FLOOD_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The seven named Tier-2 stress scenarios ([`09-performance-60fps.md`] §9 table). The
 /// [`Self::name`]s are the exact `domain.md` vocabulary used in the ticket, the JSON,
@@ -105,8 +117,11 @@ pub enum Generator {
     /// Flood `y\n` for `run_ms` milliseconds (`yes`-style) then stop - the backpressure
     /// / decoupling source.
     Yes { run_ms: u32 },
-    /// Perform `repaints` full-screen alt-screen repaints (a TUI redraw loop).
-    AltScreenRepaint { repaints: u32 },
+    /// A full-screen alt-screen repaint loop (a vim/htop-style TUI redraw). Runs until
+    /// the PTY closes at scenario teardown (like [`Self::Yes`]), so full-grid
+    /// invalidation covers the ENTIRE measured window - a fixed repaint COUNT could
+    /// finish early on a fast host and leave the tail presenting a frozen frame.
+    AltScreenRepaint,
 }
 
 /// A synthetic input-box edit (typing / caret motion / mode toggle), replayed straight
@@ -290,6 +305,24 @@ impl Gate {
             });
         }
         if self.require_decoupled {
+            // Render/byte decoupling (AC4) has TWO falsifiable halves, both required:
+            //
+            // (a) The byte firehose actually kept flowing: `bytes_fed` (bytes the model
+            //     drained during the window) is huge. If a regression coupled the render
+            //     INTO the byte-drain path, the vsync-blocked present would throttle the
+            //     drain and `bytes_fed` would collapse - so a stalled flood fails here.
+            //     This is the honest signal a frame-count ceiling alone cannot give
+            //     (under `Fifo` a present can never beat vsync, so frames_drawn alone is
+            //     ~vsync for BOTH a healthy and a naively-coupled render).
+            // (b) The renderer stayed vsync-paced: `frames_drawn` did not balloon past
+            //     the vsync-implied count. This catches a regression that abandons vsync
+            //     pacing (drops `Fifo`) and draws per byte-chunk.
+            if facts.bytes_fed < MIN_FLOOD_BYTES {
+                breaches.push(Breach::FloodStalled {
+                    bytes_fed: facts.bytes_fed,
+                    required: MIN_FLOOD_BYTES,
+                });
+            }
             let vsync_frames = facts.vsync_frames(self.refresh);
             let ceiling = (vsync_frames as f32 * DECOUPLE_SLACK) as u64;
             if facts.frames_drawn > ceiling {
@@ -361,6 +394,13 @@ pub enum Breach {
     NotDecoupled {
         frames_drawn: u64,
         vsync_frames: u64,
+    },
+    /// The flood did not sustain a byte firehose (`bytes_fed` below the floor) - the
+    /// model's byte-drain was throttled, which is what a render coupled into the drain
+    /// path would cause. Half of the `output_flood` decoupling proof.
+    FloodStalled {
+        bytes_fed: u64,
+        required: u64,
     },
 }
 
@@ -569,7 +609,15 @@ fn window_resize() -> Scenario {
         setup: Some(Generator::Seq { lines: 2_000 }),
         script,
         warmup_ms: 300,
-        measure_ms: 1_100,
+        // 2s (not 1.1s) so the measured window records >= 100 frames at BOTH refreshes
+        // (>=120 @ 60Hz, >=240 @ 120Hz). That matters because the nearest-rank p99 of a
+        // <100-frame window collapses to the max, which would make the single allowed
+        // transaction spike (`RESIZE_SPIKE_MS` in `frame_max`) ALSO trip the tight
+        // p99<=16ms gate. With >=100 frames the single worst (spike) frame falls
+        // strictly past the p99 rank, so p99 stays tight while `frame_max` absorbs the
+        // one spike - matching "resize allowed a one-frame transaction spike" (§9). The
+        // ~1s animation is paced across this window (a short settle tail follows).
+        measure_ms: 2_000,
     }
 }
 
@@ -580,7 +628,7 @@ fn fullscreen_tui_redraw() -> Scenario {
         kind: ScenarioKind::FullscreenTuiRedraw,
         gate: Gate::floor_60hz(),
         scrollback: DEFAULT_RING,
-        setup: Some(Generator::AltScreenRepaint { repaints: 600 }),
+        setup: Some(Generator::AltScreenRepaint),
         script: vec![DriverAction::Idle { ms: 2_000 }],
         warmup_ms: 300,
         measure_ms: 2_000,
@@ -839,27 +887,81 @@ mod tests {
 
     #[test]
     fn output_flood_gates_render_byte_decoupling() {
-        // AC: output_flood shows render decoupled from byte-rate. Over a 5s window @
-        // 60Hz, vsync implies ~300 frames. Decoupled: ~300 presented despite 200MB fed.
+        // AC: output_flood shows render decoupled from byte-rate. Decoupling has TWO
+        // falsifiable halves - a sustained byte firehose AND vsync-paced frames - and
+        // both must hold. Over a 5s window @60Hz, vsync implies ~300 frames.
         let flood = Gate::floor_60hz()
             .with_dropped_budget(2)
             .require_decoupled();
         let huge_bytes = 200 * 1024 * 1024;
+        // Decoupled: the model drained 200MB while the renderer presented only ~vsync
+        // frames -> pass.
         assert!(
             flood
                 .evaluate(&stats(8.0, 9.0, 10.0, 1), &facts(300, huge_bytes, 5_000.0))
                 .is_pass(),
-            "vsync-paced frames pass regardless of byte volume"
+            "huge byte firehose + vsync-paced frames = decoupled"
         );
-        // Coupled to the byte firehose (drawing per chunk) -> thousands of frames -> fail.
-        let v = flood.evaluate(
+        // The flood stalled: only a trickle of bytes drained (a render coupled INTO the
+        // byte-drain path throttles it) -> FloodStalled, even though frames look fine.
+        let stalled = flood.evaluate(&stats(8.0, 9.0, 10.0, 0), &facts(300, 1_000, 5_000.0));
+        assert!(stalled.is_fail());
+        assert!(
+            matches!(&stalled, Verdict::Fail { breaches } if breaches.iter().any(|x| matches!(x, Breach::FloodStalled { .. }))),
+            "a throttled byte-drain is a FloodStalled breach: {stalled:?}"
+        );
+        // Frames ballooned past vsync (a regression that abandons vsync pacing and draws
+        // per chunk) -> NotDecoupled, even with the firehose flowing.
+        let coupled = flood.evaluate(
             &stats(8.0, 9.0, 10.0, 1),
             &facts(6_000, huge_bytes, 5_000.0),
         );
-        assert!(v.is_fail());
+        assert!(coupled.is_fail());
         assert!(
-            matches!(&v, Verdict::Fail { breaches } if breaches.iter().any(|x| matches!(x, Breach::NotDecoupled { .. }))),
-            "byte-coupled frame count is a NotDecoupled breach: {v:?}"
+            matches!(&coupled, Verdict::Fail { breaches } if breaches.iter().any(|x| matches!(x, Breach::NotDecoupled { .. }))),
+            "ballooned frame count is a NotDecoupled breach: {coupled:?}"
+        );
+    }
+
+    #[test]
+    fn window_resize_measure_window_keeps_p99_below_the_max_spike() {
+        // The window_resize gate allows a single transaction spike via `frame_max`
+        // (RESIZE_SPIKE_MS) while keeping p99 tight at the 16ms floor. That only works
+        // if the measured window records >= 100 frames, otherwise the nearest-rank p99
+        // collapses to the max and the allowed spike would trip p99. Assert the window
+        // is sized so a single spike falls strictly past the p99 rank at BOTH refreshes.
+        let resize = all_scenarios()
+            .into_iter()
+            .find(|s| s.kind == ScenarioKind::WindowResize)
+            .unwrap();
+        for hz in [60.0_f32, 120.0] {
+            let frames = (f32::from(resize.measure_ms as u16) / (1000.0 / hz)).floor() as usize;
+            assert!(
+                frames >= 100,
+                "window_resize must record >=100 frames @ {hz}Hz (got {frames}) so the \
+                 single allowed spike falls past the p99 rank"
+            );
+        }
+        // Concretely: 200 fast frames + one 33ms spike -> p99 stays fast, max absorbs
+        // the spike -> the resize gate passes (it would FAIL if p99 collapsed to max).
+        let mut samples: Vec<FrameSample> = (0..200)
+            .map(|i| FrameSample {
+                frame: i,
+                cpu_frame_ms: 2.0,
+                gpu_frame_ms: None,
+                present_interval_ms: 8.0,
+                dirty_cells: 10,
+                allocations: None,
+                frame_dropped: false,
+            })
+            .collect();
+        samples[100].present_interval_ms = 33.0; // the one transaction spike
+        let st = FrameStats::from_samples(&samples);
+        assert!(st.present_p99_ms <= 16.0, "p99 excludes the single spike");
+        assert!(st.present_max_ms > 16.0, "the spike is the max");
+        assert!(
+            resize.gate.evaluate(&st, &facts(200, 0, 2_000.0)).is_pass(),
+            "one spike + tight p99 passes the resize gate"
         );
     }
 

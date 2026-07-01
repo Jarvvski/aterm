@@ -409,12 +409,9 @@ impl UiCallbacks for DriverCallbacks {
                 }
             }
             Some(mstart) => {
-                if now >= mstart + measure {
-                    self.finalize_scenario(measure);
-                    self.advance();
-                    return;
-                }
-                // Apply every scripted action whose paced time has arrived.
+                // Apply every scripted action whose paced time has arrived FIRST, then
+                // check the finalize deadline - so an action due just before the window
+                // closes is still replayed rather than silently dropped at the boundary.
                 while self.script_idx < script_len && self.next_action_at.is_some_and(|t| now >= t)
                 {
                     let action =
@@ -422,6 +419,11 @@ impl UiCallbacks for DriverCallbacks {
                     self.apply_action(action);
                     self.script_idx += 1;
                     self.next_action_at = self.next_action_at.map(|t| t + self.action_interval);
+                }
+                if now >= mstart + measure {
+                    self.finalize_scenario(measure);
+                    self.advance();
+                    return;
                 }
                 self.measuring = true;
             }
@@ -482,31 +484,26 @@ fn spawn_generator(gen: Generator, scrollback: usize) -> Option<Engine> {
             // `yes` floods until the PTY closes (scenario teardown drops the engine).
             Engine::spawn_command("/usr/bin/yes", &[], INITIAL_DIMS, scrollback)
         }
-        Generator::AltScreenRepaint { repaints } => {
-            let script = alt_screen_script(repaints);
-            Engine::spawn_command(
-                "/bin/sh",
-                &["-c", script.as_str()],
-                INITIAL_DIMS,
-                scrollback,
-            )
-        }
+        Generator::AltScreenRepaint => Engine::spawn_command(
+            "/bin/sh",
+            &["-c", ALT_SCREEN_SCRIPT],
+            INITIAL_DIMS,
+            scrollback,
+        ),
     };
     result
         .map_err(|e| log::error!("failed to spawn generator {gen:?}: {e}"))
         .ok()
 }
 
-/// A POSIX `sh` script that performs `repaints` full-screen alt-screen repaints (a
-/// vim/htop-style redraw loop) via `printf` - deterministic program output, no echo.
-fn alt_screen_script(repaints: u32) -> String {
-    format!(
-        "printf '\\033[?1049h'; i=0; while [ $i -lt {repaints} ]; do \
-         printf '\\033[2J\\033[H'; r=1; while [ $r -le 24 ]; do \
-         printf '\\033[%d;1Hrow %d repaint %d ||||||||||||||||||||' $r $r $i; r=$((r+1)); done; \
-         i=$((i+1)); done; printf '\\033[?1049l'"
-    )
-}
+/// A POSIX `sh` full-screen alt-screen repaint loop (a vim/htop-style redraw) via
+/// `printf` - deterministic program output, no PTY echo. It repaints FOREVER (until the
+/// PTY closes at scenario teardown), so full-grid invalidation covers the entire
+/// measured window rather than a fixed count that could finish early on a fast host.
+const ALT_SCREEN_SCRIPT: &str = "printf '\\033[?1049h'; i=0; while :; do \
+     printf '\\033[2J\\033[H'; r=1; while [ $r -le 24 ]; do \
+     printf '\\033[%d;1Hrow %d repaint %d ||||||||||||||||||||' $r $r $i; r=$((r+1)); done; \
+     i=$((i+1)); done";
 
 /// Map a scenario [`InputAction`] onto the input reducer's [`InputEvent`].
 fn map_input(action: InputAction) -> Option<InputEvent> {
