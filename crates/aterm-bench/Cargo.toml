@@ -43,3 +43,10 @@ harness = false
 [[bin]]
 name = "scenario_driver"
 path = "src/bin/scenario_driver.rs"
+
+# The input-latency driver (T-7.3): the on-hardware keystroke->glyph software measure.
+# Sibling of scenario_driver - same nightly-only, headless-safe (inconclusive, not a
+# false pass) shape; dumps the JSON latency report + a pass/fail verdict.
+[[bin]]
+name = "latency_driver"
+path = "src/bin/latency_driver.rs"

@@ -69,3 +69,45 @@ jobs:
           name: tier2-perf-report
           path: perf-report.json
           if-no-files-found: warn
+
+  # Input latency is a SEPARATE metric from frame rate (ticket T-7.3): a renderer can
+  # hold a solid 60/120fps and still feel laggy (Ghostty's 24ms/41ms data point). This
+  # job runs the keystroke->glyph software measure (aterm-bench `latency_driver`) over
+  # ~120 iterations and gates on median <= 1.5 frames / p99 <= 3 frames at the active
+  # refresh. The SAME fidelity caveat as above applies (GitHub-hosted runner, not
+  # ProMotion): the software measure is a present-scheduling lower bound and a
+  # regression detector - the keyboard-to-photon ground truth is a hardware light-sensor
+  # rig (stubbed in v1, owner open-question #3) run manually with --display-link.
+  input-latency-gate:
+    name: Input latency (keystroke->glyph)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nightly-latency-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the latency driver (release)
+        run: cargo build -p aterm-bench --bin latency_driver --release
+
+      # `--gate` fails the job on a hard breach of the latency gate; `--out` writes the
+      # JSON report (percentiles + raw samples) so a failure is always diagnosable.
+      - name: Measure input latency (gate on median <= 1.5f / p99 <= 3f)
+        run: cargo run -p aterm-bench --bin latency_driver --release -- --gate --out latency-report.json
+
+      - name: Upload the latency report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: input-latency-report
+          path: latency-report.json
+          if-no-files-found: warn

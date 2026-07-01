@@ -10,7 +10,10 @@
 //! [`scenario`] declares the Tier-2 stress scenarios + the pass/fail gate (the pure,
 //! headless-tested core of the "60fps always" proof, ticket T-7.2); the on-hardware
 //! `scenario_driver` binary replays them against the real `aterm-ui` app loop.
+//! [`latency`] is the sibling for input latency (ticket T-7.3): the pure
+//! keystroke->glyph measure + gate, with the on-hardware `latency_driver` binary.
 
+pub mod latency;
 pub mod scenario;
 
 /// Deterministic VT byte payloads for the benches. Built programmatically so they

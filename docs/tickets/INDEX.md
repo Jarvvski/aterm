@@ -131,7 +131,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 |---|---|---|---|
 | T-7.1 | In-process frame recorder | done | T-1.5, T-1.8 |
 | T-7.2 | Seven scripted stress scenarios + driver | done | T-7.1 |
-| T-7.3 | Input-latency measurement gate | ready-for-agent | T-7.1, T-3.2 |
+| T-7.3 | Input-latency measurement gate | done | T-7.1, T-3.2 |
 | T-7.4 | Resize/reflow perf check + shell-matrix hardening | ready-for-agent | T-7.2, T-2.3 |
 
 ### EPIC-8 - Packaging, signing, polish (deferred)

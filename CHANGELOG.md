@@ -13,6 +13,14 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Contributor: input latency is now measured and gated separately from frame rate.** A new
+  `latency_driver` (in `aterm-bench`) injects synthetic keystrokes into the real app loop and
+  times keystroke->visible-glyph over ~120 iterations, reporting median + p25/p75 + outliers as
+  JSON and gating on median <= 1.5 frames / p99 <= 3 frames at the active refresh - because a
+  renderer can hold 60fps and still feel laggy. A nightly CI job runs it and fails on a breach.
+  The measure + gate are a pure, headless-unit-tested module; the live software measure captures
+  the present-scheduling pipeline (a lower bound), and the keyboard-to-photon hardware
+  light-sensor rig is stubbed and documented for future ground truth. (Ticket T-7.3.)
 - **You can now scroll back through the block timeline.** The mouse wheel / trackpad and the
   PageUp / PageDown keys scroll up into history; the view stays locked to the newest output (so a
   running command's tail is always visible) until you scroll away, and re-locks the moment you
