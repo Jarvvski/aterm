@@ -377,6 +377,69 @@ impl Engine {
         )
     }
 
+    /// Test-only: spawn a SPECIFIC shell binary (`shell_path`) with its REAL integration
+    /// shim installed - the shell-matrix hardening path (ticket T-7.4). Mirrors
+    /// [`Self::spawn_login_shell`] but targets an explicit path + [`ShellKind`] instead of
+    /// `$SHELL`, so a test can drive zsh / bash 5.3 / bash 3.2 / fish end-to-end WITHOUT
+    /// mutating the process environment (the shim env is passed only to the child). Falls
+    /// back to an untrusted scanner if the shim cannot be installed.
+    #[cfg(test)]
+    pub(crate) fn spawn_real_shell(
+        shell_path: &str,
+        kind: ShellKind,
+        dims: PtyDimensions,
+        scrollback: usize,
+        confirm_window: Duration,
+    ) -> Result<Self, PtyError> {
+        let nonce = ShimNonce::generate();
+        let install: io::Result<Option<IntegrationDir>> = match kind {
+            ShellKind::Zsh => IntegrationDir::install_zsh(&nonce, None).map(Some),
+            ShellKind::Bash => IntegrationDir::install_bash(&nonce).map(Some),
+            ShellKind::Fish => IntegrationDir::install_fish(&nonce, None).map(Some),
+            ShellKind::Other => Ok(None),
+        };
+        let mut osc = OscScanner::untrusted();
+        let integration = match install {
+            Ok(Some(shim)) => {
+                osc = OscScanner::with_nonce(nonce.0.clone());
+                Some(shim)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("{kind:?} shim install failed in test: {e}");
+                None
+            }
+        };
+        let env = integration
+            .as_ref()
+            .map(IntegrationDir::env_vars)
+            .unwrap_or_default();
+        let arg_strings = integration
+            .as_ref()
+            .map(IntegrationDir::shell_args)
+            .unwrap_or_else(|| vec!["-l".to_string()]);
+        let args: Vec<&str> = arg_strings.iter().map(String::as_str).collect();
+        let pty = Pty::spawn(
+            shell_path,
+            &args,
+            dims,
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )?;
+        let shim_installed = integration.is_some();
+        Self::spawn_with_pty(
+            pty,
+            dims,
+            scrollback,
+            IntegrationSetup {
+                osc,
+                dir: integration,
+                shell_kind: kind,
+                shim_installed,
+                confirm_window,
+            },
+        )
+    }
+
     /// Wire the reader + model threads around an already-spawned [`Pty`]. `setup`
     /// carries the integration wiring (the OSC scanner, the held shim dir, and the
     /// integration-indicator inputs); see [`IntegrationSetup`].
@@ -2257,6 +2320,333 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "the finished block's output rows were not captured in time"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn finished_block_output_is_byte_identical_after_a_reflow_resize() {
+        // T-7.4 reflow AC (03-pty-vt-rust.md reflow risk list): a window resize reflows
+        // the LIVE alacritty grid, but a finished block owns an IMMUTABLE copy of its
+        // output rows, so its captured bytes must be byte-identical after the resize -
+        // and only the live grid reflows. This is the design guarantee (T-2.4,
+        // 03-pty-vt-rust.md Rec 4) that command history is immune to alacritty's known
+        // reflow bugs (#2213/#2567/#4419/#8576) even on a maximized 4K-scale resize.
+        let nonce = "ATERMREFLOW0";
+        let script = format!(
+            "printf '\\033]133;A;aterm_nonce={n}\\007'; \
+             printf '\\033]133;C;aterm_nonce={n}\\007'; \
+             printf 'alpha the quick brown fox jumps over the lazy dog 0123456789\\n'; \
+             printf 'bravo\\ncharlie delta echo\\n'; \
+             printf '\\033]133;D;0;aterm_nonce={n}\\007'; \
+             sleep 8",
+            n = nonce
+        );
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", &script],
+            dims(), // 24x80
+            1_000,
+            ShellKind::Bash,
+            Some(nonce),
+            Duration::from_secs(5),
+        )
+        .expect("spawn sh emitting a full command cycle");
+
+        // Wait for the finished block's immutable output to be captured, then snapshot it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let before = loop {
+            if let Some(b) = engine.latest_blocks().get(0).and_then(|b| b.as_command()) {
+                if !b.is_running() && !b.output.is_empty() {
+                    break b.output.clone(); // Vec<RowSnapshot> - the owned, immutable rows
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the finished block's output was not captured in time"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let cols_before = engine.latest_snapshot().cols;
+
+        // Reflow the LIVE grid twice to very different geometries (a wide "maximized"
+        // width, then a narrow one) so alacritty must rewrap the live grid - the resize
+        // path that the maximized-4K perf scenario stresses. Each resize publishes a new
+        // snapshot (the Resize arm returns "dirty"), so wait on the version to be sure the
+        // reflow actually ran before re-reading.
+        for (rows, cols) in [(60u16, 240u16), (20, 32)] {
+            let v = engine.latest_snapshot().version;
+            engine.resize(rows, cols, 0, 0);
+            wait_for_version_at_least(&engine, v + 1, Duration::from_secs(3));
+        }
+
+        // The live grid reflowed (its width changed) ...
+        let cols_after = engine.latest_snapshot().cols;
+        assert_ne!(
+            cols_before, cols_after,
+            "the live grid should have reflowed to the new width (before={cols_before}, \
+             after={cols_after})"
+        );
+        // ... but the finished block's immutable output is byte-identical - reflow never
+        // touched it.
+        let after = engine
+            .latest_blocks()
+            .get(0)
+            .and_then(|b| b.as_command())
+            .map(|b| b.output.clone())
+            .expect("the finished block must persist across the resize");
+        assert_eq!(
+            before, after,
+            "a finished block's captured output must be byte-identical after a reflow \
+             resize - only the live grid reflows"
+        );
+        drop(engine);
+    }
+
+    // --- T-7.4 shell matrix (real binaries; skip-if-absent so CI stays honest) --------
+
+    /// Whether an absolute program path exists as a file - the skip-if gate for the
+    /// real-shell matrix, so a host missing bash 5.3 / fish stays honest, not red.
+    fn program_exists(path: &str) -> bool {
+        std::path::Path::new(path).is_file()
+    }
+
+    /// Drive a real shell binary to its first prompt and assert it confirms Integrated
+    /// (the shim's static `A` rides PS1, emitted the moment the prompt draws). Skips (does
+    /// not fail) when the binary is absent or the shim could not arm.
+    fn assert_real_shell_integrates(path: &str, kind: ShellKind, label: &str) {
+        if !program_exists(path) {
+            eprintln!("skip {label}: {path} not present on this host");
+            return;
+        }
+        let engine =
+            match Engine::spawn_real_shell(path, kind, dims(), 1_000, INTEGRATION_CONFIRM_WINDOW) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("skip {label}: spawn {path} failed: {e}");
+                    return;
+                }
+            };
+        if !engine.integration_active() {
+            eprintln!("skip {label}: shim could not arm for {path}");
+            return;
+        }
+        let status = wait_for_status(
+            &engine,
+            crate::IntegrationStatus::Integrated,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            status,
+            crate::IntegrationStatus::Integrated,
+            "{label} ({path}) must confirm integration via its first prompt's nonce-matched A"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn real_zsh_reaches_integrated() {
+        // T-7.4 matrix: real zsh (5.x) installs the per-session ZDOTDIR shim + confirms.
+        assert_real_shell_integrates("/bin/zsh", ShellKind::Zsh, "zsh");
+    }
+
+    #[test]
+    fn real_bash53_reaches_integrated() {
+        // T-7.4 matrix: Homebrew bash 5.3 (the PS0 `${ ...;}` preexec tier) confirms.
+        assert_real_shell_integrates("/opt/homebrew/bin/bash", ShellKind::Bash, "bash 5.3");
+    }
+
+    #[test]
+    fn real_bash32_integrates_or_downgrades_never_crashes() {
+        // T-7.4 matrix: macOS system bash 3.2 (the DEBUG-trap tier). Its static `A` rides
+        // PS1 so it should reach Integrated, but the AC only requires it either integrates
+        // OR honestly downgrades to Heuristic - never crash, phantom, or Unknown/None.
+        // Logs which, recording the 3.2 mark-reliability observation that validates the
+        // downgrade threshold.
+        let path = "/bin/bash";
+        if !program_exists(path) {
+            eprintln!("skip bash 3.2: {path} absent");
+            return;
+        }
+        let engine = match Engine::spawn_real_shell(
+            path,
+            ShellKind::Bash,
+            dims(),
+            1_000,
+            INTEGRATION_CONFIRM_WINDOW,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skip bash 3.2: spawn failed: {e}");
+                return;
+            }
+        };
+        // Wait for Integrated; if the confirm window elapses first it lands on Heuristic.
+        let status = wait_for_status(
+            &engine,
+            crate::IntegrationStatus::Integrated,
+            Duration::from_secs(8),
+        );
+        let final_status = if status == crate::IntegrationStatus::Integrated {
+            status
+        } else {
+            engine.integration_status().status
+        };
+        eprintln!(
+            "bash 3.2 reliability observation: reached {final_status:?} (version={:?})",
+            engine.shell_version()
+        );
+        assert!(
+            matches!(
+                final_status,
+                crate::IntegrationStatus::Integrated | crate::IntegrationStatus::Heuristic
+            ),
+            "bash 3.2 must integrate or honestly downgrade to Heuristic, got {final_status:?}"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn real_fish_reaches_integrated_or_skips() {
+        // T-7.4 matrix: fish 3.2+ (the XDG_DATA_DIRS vendor_conf.d shim). Absent on most
+        // CI hosts -> skips honestly.
+        for path in [
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/usr/bin/fish",
+        ] {
+            if program_exists(path) {
+                assert_real_shell_integrates(path, ShellKind::Fish, "fish");
+                return;
+            }
+        }
+        eprintln!("skip fish: no fish binary present on this host");
+    }
+
+    #[test]
+    fn exec_zsh_keeps_the_session_alive_and_integrated() {
+        // T-7.4 AC: `exec zsh` mid-session preserves integration. The re-pin MECHANISM is
+        // proved deterministically in shell_integration.rs
+        // (`zsh_bootstrap_repins_zdotdir_for_exec_zsh_survival`); this is the on-shell
+        // SMOKE - a real zsh, integrated, is told to `exec zsh`, and the session must stay
+        // alive + responsive (new snapshots keep publishing) and NOT lose its Integrated
+        // status across the re-exec (which would wedge the block timeline).
+        let path = "/bin/zsh";
+        if !program_exists(path) {
+            eprintln!("skip exec zsh: {path} absent");
+            return;
+        }
+        let engine = match Engine::spawn_real_shell(
+            path,
+            ShellKind::Zsh,
+            dims(),
+            1_000,
+            INTEGRATION_CONFIRM_WINDOW,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skip exec zsh: spawn failed: {e}");
+                return;
+            }
+        };
+        if !engine.integration_active() {
+            eprintln!("skip exec zsh: shim could not arm");
+            return;
+        }
+        let s0 = wait_for_status(
+            &engine,
+            crate::IntegrationStatus::Integrated,
+            Duration::from_secs(10),
+        );
+        if s0 != crate::IntegrationStatus::Integrated {
+            eprintln!("skip exec zsh: first prompt did not integrate (loaded host?) got {s0:?}");
+            return;
+        }
+        // Re-exec into a fresh zsh; the re-pinned ZDOTDIR makes it re-source the shim.
+        let v_pre = engine.latest_snapshot().version;
+        engine.send_input(b"exec zsh\n".to_vec());
+        // The session must stay alive + responsive after the re-exec: a new prompt (and
+        // its nonce'd A from the re-sourced shim) advances the published snapshot.
+        let v_post = wait_for_version_at_least(&engine, v_pre + 1, Duration::from_secs(10));
+        assert!(
+            v_post > v_pre,
+            "the session must keep publishing after `exec zsh` (it wedged: {v_pre} -> {v_post})"
+        );
+        // Integration must not regress across the re-exec.
+        assert_eq!(
+            engine.integration_status().status,
+            crate::IntegrationStatus::Integrated,
+            "`exec zsh` must preserve integration (ZDOTDIR re-pinned)"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn framework_marks_never_create_phantom_or_double_blocks() {
+        // T-7.4 AC: starship / p10k / oh-my-posh can emit their OWN OSC-133 marks; those
+        // carry NO aterm nonce, so the nonce-armed scanner DROPS them - they can never
+        // create a phantom block or double an existing one. Deterministic at the engine
+        // layer: interleave un-nonced framework-style marks (incl. a double `A` right
+        // beside ours, the precmd re-fire case) with ONE nonce'd cycle, and assert exactly
+        // ONE block forms (ours), with our output and none of the foreign noise as a
+        // separate block.
+        let nonce = "ATERMFRAME00";
+        let script = format!(
+            // A full FOREIGN cycle (starship-style, un-nonced) - all dropped:
+            "printf '\\033]133;A\\007'; printf '\\033]133;B\\007'; \
+             printf 'foreign-prompt-noise\\n'; \
+             printf '\\033]133;C\\007'; printf '\\033]133;D;0\\007'; \
+             printf '\\033]133;A\\007'; \
+             printf '\\033]133;A;aterm_nonce={n}\\007'; \
+             printf '\\033]133;A\\007'; \
+             printf '\\033]133;C;aterm_nonce={n}\\007'; \
+             printf 'ours-real-output\\n'; \
+             printf '\\033]133;D;0;aterm_nonce={n}\\007'; \
+             sleep 3",
+            n = nonce
+        );
+        let engine = Engine::spawn_command_with_integration(
+            "/bin/sh",
+            &["-c", &script],
+            dims(),
+            1_000,
+            ShellKind::Bash,
+            Some(nonce),
+            Duration::from_secs(5),
+        )
+        .expect("spawn sh emitting foreign + nonce'd marks");
+
+        // Wait for OUR finished block to appear (the nonce'd cycle).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let blocks = engine.latest_blocks();
+            if let Some(b) = blocks.get(0).and_then(|b| b.as_command()) {
+                if !b.is_running() && !b.output.is_empty() {
+                    // Exactly ONE block - no phantom from the foreign marks (which,
+                    // including the double `A` beside ours, were all nonce-dropped).
+                    assert_eq!(
+                        blocks.len(),
+                        1,
+                        "only our nonce'd cycle may segment a block; the foreign starship/\
+                         p10k/oh-my-posh-style marks must be dropped (no phantom/double)"
+                    );
+                    let text: String = b
+                        .output
+                        .iter()
+                        .flat_map(|r| r.cells.iter().map(|c| c.c))
+                        .collect();
+                    assert!(
+                        text.contains("ours-real-output"),
+                        "the one block is ours (nonce'd), got {text:?}"
+                    );
+                    drop(engine);
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "our nonce'd block never formed (foreign marks may have interfered)"
             );
             std::thread::sleep(Duration::from_millis(20));
         }

@@ -87,6 +87,12 @@ pub enum ScenarioKind {
     FullscreenTuiRedraw,
     /// Sit idle for 5s: down-clock + ~0 frames drawn after keep-warm.
     Idle,
+    /// Animate a maximized (4K) window resize (ticket T-7.4): the large-grid live reflow
+    /// stress alacritty is known to be sharp-edged on (#2213/#2567/#4419/#8576). NOT one
+    /// of the seven core scenarios ([`all_scenarios`]) - a hardening addition
+    /// ([`hardening_scenarios`]) that reuses the `window_resize` gate on a much larger
+    /// grid delta.
+    MaximizedReflow,
 }
 
 impl ScenarioKind {
@@ -101,6 +107,7 @@ impl ScenarioKind {
             ScenarioKind::WindowResize => "window_resize",
             ScenarioKind::FullscreenTuiRedraw => "fullscreen_tui_redraw",
             ScenarioKind::Idle => "idle",
+            ScenarioKind::MaximizedReflow => "maximized_reflow",
         }
     }
 }
@@ -650,6 +657,41 @@ fn idle() -> Scenario {
     }
 }
 
+/// Build the `maximized_reflow` scenario (ticket T-7.4): animate a maximized (4K) window
+/// resize to stress the LIVE-grid reflow alacritty is known to be sharp-edged on
+/// (03-pty-vt-rust.md reflow risk list). It reuses the `window_resize` gate (the same
+/// one-frame transaction-spike + drop budget) but sweeps a MUCH larger grid delta -
+/// 1280x720 up to 3840x2160 (true 4K). On a non-4K/headless runner the compositor clamps
+/// the requested size, so it degrades to a smaller reflow (still a stress, honestly
+/// not-4K); on a real 4K/5K panel it is the maximized check. The finished-block byte
+/// identity across this reflow is proved separately + deterministically by the
+/// `aterm-core` engine test `finished_block_output_is_byte_identical_after_a_reflow_resize`.
+fn maximized_reflow() -> Scenario {
+    let mut script = Vec::new();
+    // 60 steps over ~1s: 1280x720 -> 3840x2160 (4K), a large cols/rows delta so the live
+    // grid genuinely rewraps a big buffer each step.
+    for step in 0..=60u32 {
+        let width = 1280 + (2560 * step) / 60;
+        let height = 720 + (1440 * step) / 60;
+        script.push(DriverAction::Resize { width, height });
+        script.push(DriverAction::Idle { ms: 16 });
+    }
+    Scenario {
+        kind: ScenarioKind::MaximizedReflow,
+        gate: Gate::floor_60hz()
+            .with_frame_max_ms(RESIZE_SPIKE_MS)
+            .with_dropped_budget(2),
+        scrollback: DEFAULT_RING,
+        // A big buffer so the reflow has real rows to rewrap (not an empty grid).
+        setup: Some(Generator::Seq { lines: 5_000 }),
+        script,
+        warmup_ms: 300,
+        // Same >=100-frame rationale as `window_resize` (the resize spike must fall past
+        // the p99 rank while `frame_max` absorbs it).
+        measure_ms: 2_000,
+    }
+}
+
 /// The seven scenarios in table order ([`09-performance-60fps.md`] §9). Deterministic
 /// and byte-identical across calls (built programmatically, no rng/clock/env).
 #[must_use]
@@ -663,6 +705,15 @@ pub fn all_scenarios() -> Vec<Scenario> {
         fullscreen_tui_redraw(),
         idle(),
     ]
+}
+
+/// Extra hardening scenarios beyond the core seven (ticket T-7.4): the maximized-4K
+/// resize/reflow perf check, feeding the same `window_resize` gate on a larger grid. Kept
+/// separate from [`all_scenarios`] so the "seven named scenarios" proof stays exactly
+/// seven; the driver runs both.
+#[must_use]
+pub fn hardening_scenarios() -> Vec<Scenario> {
+    vec![maximized_reflow()]
 }
 
 /// The recorded result of one scenario run: its percentiles, the run facts, the
@@ -787,6 +838,34 @@ mod tests {
                 "idle",
             ]
         );
+    }
+
+    #[test]
+    fn hardening_adds_the_maximized_4k_reflow_without_touching_the_seven() {
+        // T-7.4: the maximized-4K reflow is a HARDENING scenario, kept out of the core
+        // seven so the "seven named scenarios" proof is unaffected.
+        assert_eq!(all_scenarios().len(), 7, "the core set stays exactly seven");
+        let h = hardening_scenarios();
+        assert_eq!(h.len(), 1);
+        let m = &h[0];
+        assert_eq!(m.kind, ScenarioKind::MaximizedReflow);
+        assert_eq!(m.name(), "maximized_reflow");
+        // It reuses the window_resize gate (a one-frame transaction spike is allowed).
+        assert!((m.gate.frame_max_ms - RESIZE_SPIKE_MS).abs() < 1e-6);
+        assert!(m.gate.dropped_budget >= 1);
+        // The animation actually reaches true 4K (3840x2160) so it is a maximized reflow.
+        let reaches_4k = m.script.iter().any(|a| {
+            matches!(a, DriverAction::Resize { width, height } if *width >= 3840 && *height >= 2160)
+        });
+        assert!(reaches_4k, "the animation must sweep up to 4K (3840x2160)");
+        // Same >=100-frame window as window_resize so the spike falls past the p99 rank.
+        for hz in [60.0_f32, 120.0] {
+            let frames = (f32::from(m.measure_ms as u16) / (1000.0 / hz)).floor() as usize;
+            assert!(
+                frames >= 100,
+                "maximized_reflow must record >=100 frames @ {hz}Hz"
+            );
+        }
     }
 
     #[test]

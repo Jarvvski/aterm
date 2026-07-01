@@ -44,8 +44,8 @@ use aterm_ui::{
 use winit::dpi::LogicalSize;
 
 use aterm_bench::scenario::{
-    all_scenarios, AgentStepKind, DriverAction, Generator, InputAction, RunReport, Scenario,
-    ScenarioReport, ScrollAction, Verdict,
+    all_scenarios, hardening_scenarios, AgentStepKind, DriverAction, Generator, InputAction,
+    RunReport, Scenario, ScenarioReport, ScrollAction, Verdict,
 };
 
 /// Initial PTY size for a freshly spawned scenario engine; the first real window resize
@@ -81,7 +81,11 @@ fn main() -> ExitCode {
     }
 
     let results: Arc<Mutex<Option<RunReport>>> = Arc::new(Mutex::new(None));
-    let callbacks = DriverCallbacks::new(all_scenarios(), Arc::clone(&results));
+    // The seven core §9 scenarios plus the T-7.4 hardening additions (the maximized-4K
+    // resize/reflow perf check), all run in the one app session.
+    let mut scenarios = all_scenarios();
+    scenarios.extend(hardening_scenarios());
+    let callbacks = DriverCallbacks::new(scenarios, Arc::clone(&results));
     // The recorder is judged against the 60Hz floor, so a frame's `frame_dropped` flag
     // reflects the blocking gate's deadline (a frame slipping past ~18.67ms).
     let recorder = FrameRecorder::new(DEFAULT_CAPACITY, Refresh::Hz60);

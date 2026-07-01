@@ -27,6 +27,37 @@
 //! single `printf` (or, for the static zsh/bash A/B marks, a single literal prompt
 //! string), so the nonce is never written detached from its `ESC ]` introducer (the
 //! T-2.1 contract).
+//!
+//! ## Environment survival across `exec` / `su` / `sudo`, and tmux (ticket T-7.4)
+//!
+//! The shim's reach depends on which env var carries it and whether the transition
+//! resets the environment (research 04 Risk list). Behavior, honestly:
+//!
+//! - **`exec zsh`**: integration SURVIVES. The `.zshenv` bootstrap re-pins `$ZDOTDIR`
+//!   at the shim dir (not the user's), so a re-exec'd zsh re-enters the bootstrap and
+//!   re-sources the (idempotent) integration. Proved by the deterministic
+//!   `zsh_bootstrap_repins_zdotdir_for_exec_zsh_survival` test + the live
+//!   `exec_zsh_keeps_the_session_alive_and_integrated` smoke.
+//! - **`exec bash` / `exec fish`**: integration is NOT preserved automatically - bash's
+//!   `--rcfile` is a spawn arg (not inherited by an `exec bash`) and fish's
+//!   `XDG_DATA_DIRS` entry is stripped back out by our own vendor script after loading.
+//!   A re-exec'd bash/fish falls back to the confirm-window timeout -> `Heuristic`
+//!   (honest degradation, no phantom blocks). Re-warpifying a re-exec'd non-zsh shell is
+//!   deferred (needs a persistent env var like zsh's `ZDOTDIR`).
+//! - **`su` / `sudo -i`**: a login shell under another user RESETS the environment -
+//!   `ZDOTDIR` is typically cleared by the login/`su -`, and `sudo` sanitizes the env
+//!   (its `env_reset` default) so `XDG_DATA_DIRS` and `ZDOTDIR` do not carry through.
+//!   Integration therefore does NOT follow into a `su`/`sudo -i` shell in v1; the
+//!   indicator honestly reports the inner shell as un-integrated (`Heuristic`/`None`)
+//!   rather than pretending. This matches the dossier's stance (warpify-across-privilege
+//!   is out of v1 scope); a future ticket could inject via the target user's environment.
+//! - **tmux**: OSC-133 marks must ride tmux's passthrough (`\ePtmux;...`) or tmux must
+//!   have `allow-passthrough on`; tmux also has documented EL0/clear-line quirks that
+//!   drop prompt marks (tmux#3064/#4918). aterm does NOT wrap marks for tmux in v1, so a
+//!   shell running INSIDE tmux inside aterm degrades to `Heuristic` (the marks are eaten
+//!   by tmux, the confirm window elapses) - honest degradation, not a phantom-block mess.
+//!   tmux passthrough support is a deferred edge case (users run aterm's own shell
+//!   directly far more often than aterm-inside-tmux).
 
 use std::fs;
 use std::io;
@@ -342,6 +373,40 @@ mod tests {
         assert!(
             s.contains("aterm_ver=") && s.contains("ZSH_VERSION"),
             "A reports the zsh version (ticket T-2.3 AC2)"
+        );
+    }
+
+    #[test]
+    fn zsh_bootstrap_repins_zdotdir_for_exec_zsh_survival() {
+        // T-7.4 AC: `exec zsh` must preserve integration. The mechanism is the .zshenv
+        // bootstrap RE-PINNING $ZDOTDIR back at the shim dir (after sourcing the user's
+        // real config against their own dir), so a re-exec'd zsh re-enters this bootstrap
+        // and re-sources the integration. A restored ZDOTDIR would silently lose
+        // integration after exec (the kitty #6330 failure mode). This proves the
+        // mechanism deterministically; the live `exec_zsh_*` engine test is the on-shell
+        // smoke.
+        let bootstrap = ZSHENV_BOOTSTRAP;
+        assert!(
+            bootstrap.contains("ATERM_REAL_ZDOTDIR"),
+            "the bootstrap sources the user's real config dir"
+        );
+        assert!(
+            bootstrap.contains("export ZDOTDIR=\"$__aterm_shim\""),
+            "the bootstrap must re-pin ZDOTDIR at the shim so `exec zsh` re-integrates"
+        );
+        // The shim re-pin must be the LAST ZDOTDIR export (after the user-dir export) so
+        // the session keeps the shim through any later re-exec.
+        let last_shim = bootstrap.rfind("ZDOTDIR=\"$__aterm_shim\"");
+        let last_real = bootstrap.rfind("ZDOTDIR=\"$__aterm_real\"");
+        assert!(
+            matches!((last_shim, last_real), (Some(s), Some(r)) if s > r),
+            "the shim re-pin must come AFTER the user-dir export so the shim wins"
+        );
+        // The integration is idempotent, so a nested / re-exec'd zsh re-source is safe.
+        let integ = zsh_integration_script(&ShimNonce("N".into()));
+        assert!(
+            integ.contains("ATERM_INTEGRATION_LOADED"),
+            "integration must be idempotent across `exec zsh`"
         );
     }
 

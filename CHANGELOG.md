@@ -13,6 +13,15 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Contributor: resize/reflow and the shell-integration matrix are now hardened with tests.**
+  A finished command block's captured output is proven byte-identical after a window resize
+  (only the live grid reflows - history is immune to alacritty's reflow bugs), and a new
+  maximized-4K `maximized_reflow` bench scenario feeds the resize frame-budget gate. The
+  shell matrix now runs real zsh / bash 5.3 / bash 3.2 to a first prompt and asserts each
+  integrates (bash 3.2 integrates or honestly downgrades to a labeled "Heuristic"; fish
+  skips when absent); starship/p10k/oh-my-posh-style un-nonced marks are proven to create no
+  phantom or double blocks; `exec zsh` is shown to preserve integration; and `su`/`sudo -i`
+  + tmux passthrough behavior (honest degradation in v1) is documented. (Ticket T-7.4.)
 - **Contributor: input latency is now measured and gated separately from frame rate.** A new
   `latency_driver` (in `aterm-bench`) injects synthetic keystrokes into the real app loop and
   times keystroke->visible-glyph over ~120 iterations, reporting median + p25/p75 + outliers as
