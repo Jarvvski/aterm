@@ -73,8 +73,8 @@ pub use text::{
     GlyphCache, GlyphKey, GridCell, RunLayout, ShelfAllocator,
 };
 pub use timeline::{
-    layout as timeline_layout, visible_block_count, GutterMarker, Scroll, TimelineLayout,
-    TimelineMode, TimelineRow, VisibleBlock,
+    layout as timeline_layout, visible_block_count, GutterMarker, Scroll, ScrollState,
+    TimelineLayout, TimelineMode, TimelineRow, VisibleBlock,
 };
 pub use timeline_render::TimelineRenderer;
 

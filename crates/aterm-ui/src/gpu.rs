@@ -66,9 +66,10 @@ pub struct GpuRenderer {
     /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
     /// instances are redrawn - so an idle present allocates nothing (the T-1.8 floor).
     timeline_sig: Option<(u64, u64, u32, u32, u8, bool)>,
-    /// Virtualized-timeline scroll position (ticket T-2.7). Auto-follows the bottom
-    /// (the live-terminal default) until scroll input lands (EPIC-3).
-    scroll: crate::timeline::Scroll,
+    /// Virtualized-timeline scroll controller (ticket T-2.7). Follows the bottom (the
+    /// live-terminal default) until the user scrolls; the wheel / PageUp / PageDown
+    /// bindings that drive it are wired in [`crate::app`] (ticket T-7.2).
+    scroll: crate::timeline::ScrollState,
     /// Blocks that built timeline geometry on the last drawn frame - the AC1
     /// virtualization counter (ticket T-2.7), exposed via
     /// [`GpuRenderer::visible_block_count`] for tests / a future status line. `0`
@@ -158,7 +159,7 @@ impl GpuRenderer {
             timeline,
             input,
             timeline_sig: None,
-            scroll: crate::timeline::Scroll::default(),
+            scroll: crate::timeline::ScrollState::default(),
             last_visible_blocks: 0,
             drew_timeline: false,
             drew_input: false,
@@ -172,6 +173,36 @@ impl GpuRenderer {
     #[must_use]
     pub fn visible_block_count(&self) -> usize {
         self.last_visible_blocks
+    }
+
+    /// Scroll the block timeline by a signed number of display rows (NEGATIVE = up,
+    /// toward older output; POSITIVE = down, toward the newest). Breaks the
+    /// follow-bottom lock; the offset is clamped and finalized on the next frame's
+    /// `render`. The wheel binding in [`crate::app`] drives this (ticket T-7.2).
+    pub fn scroll_by_rows(&mut self, delta: i64) {
+        self.scroll.scroll_by_rows(delta);
+    }
+
+    /// Page the timeline by `dir` viewports (`-1` = PageUp/older, `+1` =
+    /// PageDown/newer). Driven by the PageUp / PageDown key bindings (ticket T-7.2).
+    pub fn scroll_page(&mut self, dir: i64) {
+        self.scroll.page(dir);
+    }
+
+    /// Jump the timeline to the oldest block (top); breaks the follow-bottom lock.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll.to_top();
+    }
+
+    /// Jump the timeline to the newest output and re-engage the follow-bottom lock.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll.to_bottom();
+    }
+
+    /// Whether the timeline is currently following (pinned to) the newest output.
+    #[must_use]
+    pub fn is_following_bottom(&self) -> bool {
+        self.scroll.is_following_bottom()
     }
 
     /// The input caret's rect in PHYSICAL px `[x, y, w, h]` when the input box drew on
@@ -275,12 +306,16 @@ impl GpuRenderer {
             let _build = tracing::trace_span!("build").entered();
             if draw_timeline {
                 let blocks = frame.blocks.expect("draw_timeline implies blocks");
-                // Pin to the bottom (the live-terminal default) until scroll input lands
-                // (EPIC-3); the latest blocks + the running command's tail stay on screen.
-                self.scroll
-                    .to_bottom(crate::timeline::total_display_rows(blocks), viewport_rows);
+                // Finalize the scroll offset for this frame against the live extents:
+                // while following the bottom (the live-terminal default) this pins to
+                // the latest content so the running command's tail stays on screen;
+                // once the user scrolls (wheel / PageUp / PageDown, wired in `app`) it
+                // holds their offset, clamped into range (ticket T-7.2).
+                let scroll = self
+                    .scroll
+                    .resolve(crate::timeline::total_display_rows(blocks), viewport_rows);
                 self.last_visible_blocks =
-                    crate::timeline::visible_block_count(blocks, false, self.scroll, viewport_rows);
+                    crate::timeline::visible_block_count(blocks, false, scroll, viewport_rows);
                 // Idle gate: `timeline::layout` allocates, so skip it (and the rebuild)
                 // when nothing drawn changed - an idle present then allocates nothing and
                 // simply redraws the prior timeline instances.
@@ -288,14 +323,14 @@ impl GpuRenderer {
                 // growing multi-line input box reflows the timeline above it.
                 let sig = (
                     frame.snapshot.map_or(0, |s| s.version),
-                    self.scroll.offset_rows,
+                    scroll.offset_rows,
                     self.config.width,
                     effective_h.round() as u32,
                     theme_kind_code(frame.theme),
                     false,
                 );
                 if self.timeline_sig != Some(sig) {
-                    let layout = crate::timeline::layout(blocks, false, self.scroll, viewport_rows);
+                    let layout = crate::timeline::layout(blocks, false, scroll, viewport_rows);
                     self.timeline.prepare(
                         &self.device,
                         &self.queue,

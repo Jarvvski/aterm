@@ -110,8 +110,8 @@ fn first_block_at_or_below(blocks: &BlockList, row: u64) -> usize {
 /// Vertical scroll position of the timeline, in *display* rows from the very top
 /// (`0` = top of the oldest block). Display rows include the inter-block gaps
 /// ([`GAP_ROWS`]); clamp against [`total_display_rows`], not the gap-less content total.
-/// The renderer owns one of these; input bindings (wheel / keys) that mutate it are
-/// EPIC-3.
+/// The renderer owns one inside a [`ScrollState`], whose follow-bottom lock the wheel /
+/// PageUp / PageDown bindings drive (ticket T-7.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Scroll {
     pub offset_rows: u64,
@@ -150,6 +150,118 @@ impl Scroll {
     pub fn by(&mut self, delta: i64, total_rows: u64, viewport_rows: u64) {
         let max = Self::max_offset(total_rows, viewport_rows) as i64;
         self.offset_rows = (self.offset_rows as i64 + delta).clamp(0, max) as u64;
+    }
+}
+
+/// The live scroll *controller* for the timeline: a [`Scroll`] position plus a
+/// "follow the bottom" lock. A fresh terminal follows the newest output (the
+/// live default); the first scroll toward older output breaks the lock so history
+/// stays put beneath new output, and scrolling back to the bottom re-engages it -
+/// the standard terminal scroll-lock behavior (the input bindings the module note
+/// above defers to EPIC-3; T-7.2 wires wheel + PageUp/PageDown to this).
+///
+/// Pure (no GPU, no clock): the renderer owns one and calls [`Self::resolve`] once
+/// per frame with the live content/viewport extents, so ALL clamping happens
+/// against the current geometry and an offset can never drift out of range. The
+/// wheel/page deltas issued *between* frames clamp against the extents cached at the
+/// last `resolve`, so a caller never needs to know the geometry to scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollState {
+    scroll: Scroll,
+    /// While `true`, [`Self::resolve`] pins to the newest content each frame so live
+    /// output stays visible.
+    follow_bottom: bool,
+    /// Extents seen at the last [`Self::resolve`], so [`Self::scroll_by_rows`] /
+    /// [`Self::page`] can clamp without the caller supplying geometry.
+    last_total_rows: u64,
+    last_viewport_rows: u64,
+}
+
+impl Default for ScrollState {
+    /// A fresh controller pinned to the bottom (the live-terminal default).
+    fn default() -> Self {
+        Self {
+            scroll: Scroll::default(),
+            follow_bottom: true,
+            last_total_rows: 0,
+            last_viewport_rows: 0,
+        }
+    }
+}
+
+impl ScrollState {
+    /// Whether the timeline is currently pinned to (following) the newest output.
+    #[must_use]
+    pub fn is_following_bottom(&self) -> bool {
+        self.follow_bottom
+    }
+
+    /// The offset as last finalized by [`Self::resolve`].
+    #[must_use]
+    pub fn offset_rows(&self) -> u64 {
+        self.scroll.offset_rows
+    }
+
+    /// Scroll by a signed number of display rows: NEGATIVE scrolls UP toward older
+    /// output (decreasing offset), POSITIVE scrolls DOWN toward the newest
+    /// (increasing offset). Any motion breaks the follow-bottom lock; if the result
+    /// lands back at the bottom the lock re-engages. Clamped against the extents from
+    /// the last [`Self::resolve`].
+    pub fn scroll_by_rows(&mut self, delta: i64) {
+        self.follow_bottom = false;
+        self.scroll
+            .by(delta, self.last_total_rows, self.last_viewport_rows);
+        self.reengage_if_at_bottom();
+    }
+
+    /// Page by `dir` viewports (`-1` = up/older, `+1` = down/newer), each step one
+    /// viewport height minus a one-row overlap (the conventional page-scroll feel).
+    pub fn page(&mut self, dir: i64) {
+        let vp = self.last_viewport_rows.max(1);
+        let step = vp.saturating_sub(1).max(1) as i64;
+        self.scroll_by_rows(dir.signum() * step);
+    }
+
+    /// Jump to the oldest block (top); breaks the follow-bottom lock.
+    pub fn to_top(&mut self) {
+        self.follow_bottom = false;
+        self.scroll.to_top();
+    }
+
+    /// Jump to the newest output and re-engage the follow-bottom lock. The exact
+    /// offset is finalized in [`Self::resolve`]; this also sets it against the
+    /// last-seen extents so a query before the next frame reads the bottom.
+    pub fn to_bottom(&mut self) {
+        self.follow_bottom = true;
+        self.scroll
+            .to_bottom(self.last_total_rows, self.last_viewport_rows);
+    }
+
+    /// Finalize the offset for this frame against the live `total_rows` /
+    /// `viewport_rows` and return the [`Scroll`] the layout should use. While
+    /// following the bottom this pins to the latest content (new output stays
+    /// visible); otherwise it clamps the user's offset into range (and re-engages the
+    /// lock if that clamp lands at the bottom). Also caches the extents for later
+    /// wheel/page deltas.
+    pub fn resolve(&mut self, total_rows: u64, viewport_rows: u64) -> Scroll {
+        self.last_total_rows = total_rows;
+        self.last_viewport_rows = viewport_rows;
+        if self.follow_bottom {
+            self.scroll.to_bottom(total_rows, viewport_rows);
+        } else {
+            self.scroll = self.scroll.clamped(total_rows, viewport_rows);
+            self.reengage_if_at_bottom();
+        }
+        self.scroll
+    }
+
+    /// Re-engage the follow-bottom lock when the offset is at (or past) the maximum -
+    /// i.e. the user scrolled back down to the newest output.
+    fn reengage_if_at_bottom(&mut self) {
+        let max = self.last_total_rows.saturating_sub(self.last_viewport_rows);
+        if self.scroll.offset_rows >= max {
+            self.follow_bottom = true;
+        }
     }
 }
 
@@ -840,5 +952,108 @@ mod tests {
             vec![TimelineRow::Agent(0), TimelineRow::Agent(1)]
         );
         assert_eq!(l.visible[2].display_height, 2);
+    }
+
+    // ----- ScrollState: the follow-bottom scroll-lock controller (T-7.2) -----
+
+    #[test]
+    fn scroll_state_follows_bottom_by_default() {
+        // A fresh controller follows the newest output: resolve pins to the last
+        // full viewport regardless of the prior offset.
+        let mut s = ScrollState::default();
+        assert!(s.is_following_bottom());
+        let got = s.resolve(1000, 30);
+        assert_eq!(
+            got.offset_rows, 970,
+            "pinned to the bottom (total - viewport)"
+        );
+        // New output grows the total: still pinned to the (new) bottom.
+        let got = s.resolve(1200, 30);
+        assert_eq!(got.offset_rows, 1170);
+    }
+
+    #[test]
+    fn scroll_up_breaks_follow_and_holds_position_under_new_output() {
+        let mut s = ScrollState::default();
+        s.resolve(1000, 30); // establish extents; offset 970
+                             // Scroll up 100 rows: follow-lock breaks, offset drops.
+        s.scroll_by_rows(-100);
+        assert!(!s.is_following_bottom());
+        let got = s.resolve(1000, 30);
+        assert_eq!(got.offset_rows, 870, "held 100 rows above the bottom");
+        // New output arrives (total grows) - history stays put (offset unchanged),
+        // it does NOT jump to the new bottom because the lock is broken.
+        let got = s.resolve(1400, 30);
+        assert_eq!(
+            got.offset_rows, 870,
+            "un-followed history is pinned in place"
+        );
+        assert!(!s.is_following_bottom());
+    }
+
+    #[test]
+    fn scrolling_back_to_bottom_reengages_follow() {
+        let mut s = ScrollState::default();
+        s.resolve(1000, 30); // offset 970 (max)
+        s.scroll_by_rows(-50); // -> 920, follow off
+        assert!(!s.is_following_bottom());
+        s.resolve(1000, 30);
+        // Scroll back down past the bottom: clamps to max (970) AND re-engages follow.
+        s.scroll_by_rows(200);
+        assert!(
+            s.is_following_bottom(),
+            "landing at the bottom re-engages the lock"
+        );
+        assert_eq!(s.resolve(1000, 30).offset_rows, 970);
+    }
+
+    #[test]
+    fn scroll_is_clamped_at_both_ends() {
+        let mut s = ScrollState::default();
+        s.resolve(1000, 30);
+        // Scroll up far past the top: clamps to 0, never negative.
+        s.scroll_by_rows(-100_000);
+        assert_eq!(s.resolve(1000, 30).offset_rows, 0);
+        assert!(!s.is_following_bottom());
+        // Scroll down far past the bottom: clamps to max and re-follows.
+        s.scroll_by_rows(100_000);
+        assert_eq!(s.resolve(1000, 30).offset_rows, 970);
+        assert!(s.is_following_bottom());
+    }
+
+    #[test]
+    fn page_steps_one_viewport_minus_one_row() {
+        let mut s = ScrollState::default();
+        s.resolve(1000, 30); // viewport 30 -> page step = 29
+        s.page(-1); // up one page
+        assert_eq!(s.resolve(1000, 30).offset_rows, 970 - 29);
+        s.page(-1); // up another
+        assert_eq!(s.resolve(1000, 30).offset_rows, 970 - 58);
+        s.page(1); // down one page
+        assert_eq!(s.resolve(1000, 30).offset_rows, 970 - 29);
+    }
+
+    #[test]
+    fn to_top_and_to_bottom_jumps() {
+        let mut s = ScrollState::default();
+        s.resolve(1000, 30);
+        s.to_top();
+        assert!(!s.is_following_bottom());
+        assert_eq!(s.resolve(1000, 30).offset_rows, 0, "top is offset 0");
+        s.to_bottom();
+        assert!(s.is_following_bottom());
+        assert_eq!(s.resolve(1000, 30).offset_rows, 970);
+    }
+
+    #[test]
+    fn everything_fits_pins_to_top_and_follows() {
+        // When the whole timeline fits the viewport there is nothing to scroll:
+        // max_offset is 0, so resolve pins to 0 and the lock stays engaged even
+        // after a scroll attempt.
+        let mut s = ScrollState::default();
+        assert_eq!(s.resolve(20, 30).offset_rows, 0);
+        s.scroll_by_rows(-5);
+        assert_eq!(s.resolve(20, 30).offset_rows, 0);
+        assert!(s.is_following_bottom(), "no scroll room -> stays following");
     }
 }

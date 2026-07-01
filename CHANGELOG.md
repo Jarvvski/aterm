@@ -13,6 +13,10 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **You can now scroll back through the block timeline.** The mouse wheel / trackpad and the
+  PageUp / PageDown keys scroll up into history; the view stays locked to the newest output (so a
+  running command's tail is always visible) until you scroll away, and re-locks the moment you
+  scroll back to the bottom - the standard terminal scroll-follow behavior. (Ticket T-7.2.)
 - **The input box now highlights your command as you type and suggests completions from your
   history.** In shell mode the command line gets restrained, near-monochrome syntax tinting
   (command vs argument vs flag) plus an error underline for mistakes like an unterminated quote -

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -50,6 +50,27 @@ const WARM_WAKE: Duration = Duration::from_millis(4);
 /// beat. Drawn frames stay at zero while idle; this is a few cheap version reads a
 /// second, not a render. A true model→render wake mailbox is a clean follow-up.
 const IDLE_WAKE: Duration = Duration::from_millis(100);
+
+/// Display rows scrolled per mouse-wheel notch (`MouseScrollDelta::LineDelta`), the
+/// conventional 3-line step. Timeline scroll is whole-row (the `Scroll` coordinate is
+/// row-based), so a wheel notch moves three blocks-timeline rows (ticket T-7.2).
+const WHEEL_ROWS_PER_LINE: i64 = 3;
+
+/// Logical px per timeline row used to convert a trackpad `PixelDelta` wheel into whole
+/// rows. Approximate (the row-based scroll coordinate has no sub-row precision); the
+/// offset self-clamps every frame, so an imperfect divisor only affects wheel *feel*,
+/// never correctness. Fine-grained pixel-precise scroll is the deferred EPIC-3 refactor.
+const WHEEL_PX_PER_ROW: f64 = 16.0;
+
+/// Convert a winit wheel delta into a signed timeline row delta: NEGATIVE scrolls UP
+/// toward older output, POSITIVE scrolls DOWN toward the newest. A positive winit `y`
+/// (wheel pushed away / two fingers up) reveals older content, i.e. scrolls up.
+fn wheel_delta_rows(delta: MouseScrollDelta) -> i64 {
+    match delta {
+        MouseScrollDelta::LineDelta(_x, y) => -(y.round() as i64) * WHEEL_ROWS_PER_LINE,
+        MouseScrollDelta::PixelDelta(pos) => -((pos.y / WHEEL_PX_PER_ROW).round() as i64),
+    }
+}
 
 /// Keyboard modifier state at the time of a key press, in a renderer-neutral form
 /// so the host routes on plain bools rather than winit's `ModifiersState`. `cmd`
@@ -564,6 +585,22 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     w.request_redraw();
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Scroll the block timeline (ticket T-7.2). The renderer owns the
+                // follow-bottom scroll-lock; a wheel notch breaks it and holds the
+                // offset, and scrolling back to the bottom re-engages the live follow.
+                if let Some(r) = self.renderer.as_mut() {
+                    let rows = wheel_delta_rows(delta);
+                    if rows != 0 {
+                        r.scroll_by_rows(rows);
+                    }
+                }
+                // Scrolling is activity: re-arm keep-warm and repaint.
+                self.scheduler.note_activity(Instant::now());
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -578,6 +615,23 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     Key::Named(n) => Some(*n),
                     _ => None,
                 };
+                // PageUp / PageDown scroll the block timeline rather than editing the
+                // input box (the single-line box has no page concept), so intercept
+                // them before routing to the host (ticket T-7.2). Still activity.
+                if let Some(dir) = match named {
+                    Some(NamedKey::PageUp) => Some(-1),
+                    Some(NamedKey::PageDown) => Some(1),
+                    _ => None,
+                } {
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.scroll_page(dir);
+                    }
+                    self.scheduler.note_activity(Instant::now());
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 // The logical character of a Character key (e.g. `/`), needed for
                 // the `Cmd-/` chord since macOS suppresses `text` under Command.
                 let ch = match &logical_key {
