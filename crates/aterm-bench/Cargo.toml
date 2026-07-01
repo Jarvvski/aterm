@@ -19,6 +19,10 @@ aterm-core.workspace = true
 aterm-ui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# scenario_driver only: winit for the window resize (LogicalSize) it animates; logging.
+winit.workspace = true
+log.workspace = true
+env_logger.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
@@ -32,3 +36,10 @@ harness = false
 [[bench]]
 name = "tier1"
 harness = false
+
+# The Tier-2 scenario driver (T-7.2): replays the scripted stress scenarios against the
+# real app loop on real hardware, dumps JSON + a pass/fail verdict. Nightly-only (needs
+# a display/GPU); compiles everywhere, reports "inconclusive" where it cannot present.
+[[bin]]
+name = "scenario_driver"
+path = "src/bin/scenario_driver.rs"

@@ -1,0 +1,71 @@
+# Tier-2 frame-time gate (ticket T-7.2): the "60fps always" proof.
+#
+# Runs the seven scripted stress scenarios (aterm-bench `scenario_driver`) against the
+# real app loop with the T-7.1 frame recorder installed, and fails on a breach of the
+# 60fps FLOOR (16ms) - the blocking gate (owner open-question #4: hard-gate the 60Hz
+# floor, track 120Hz).
+#
+# FIDELITY CAVEAT (read before trusting a red run): a GitHub-hosted `macos-14` runner is
+# Apple Silicon but is NOT ProMotion and is timing-noisy - `09-performance-60fps.md` §9
+# explicitly warns that shared macOS runners cannot gate frame time precisely. So treat
+# this as a nightly SMOKE / regression signal on the 60fps floor, not the definitive
+# 120Hz proof:
+#   - The 120Hz target is TRACKED (in the JSON `target_120hz`), never blocked.
+#   - A lone noisy p99 spike should be RE-RUN / investigated, not blindly trusted.
+#   - The genuine 120Hz ProMotion confirmation is a MANUAL on-hardware run:
+#       cargo run -p aterm-bench --bin scenario_driver --release -- --display-link
+#   - Provisioning a dedicated ProMotion runner remains an owner/infra decision
+#     (T-7.2 out of scope); this job uses GitHub-hosted runners per the owner's call.
+#
+# Where the runner cannot present at all (no display / GPU) the driver reports every
+# scenario INCONCLUSIVE and exits 0 - it never turns a headless environment into a
+# false pass OR a false failure (the JSON + logs show which scenarios were judged).
+
+name: Nightly perf (Tier-2 60fps floor)
+
+on:
+  schedule:
+    # 08:00 UTC nightly. Adjust freely; hourly is the minimum GitHub cron interval.
+    - cron: "0 8 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  tier2-frame-gate:
+    name: Tier-2 stress scenarios (60fps floor)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nightly-perf-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the scenario driver (release)
+        run: cargo build -p aterm-bench --bin scenario_driver --release
+
+      # `--gate` fails the job on a hard breach of the 60fps floor (blocks release,
+      # AC5); `--out` writes the JSON report so a failure is always diagnosable.
+      - name: Run the seven stress scenarios (gate on the 60fps floor)
+        run: cargo run -p aterm-bench --bin scenario_driver --release -- --gate --out perf-report.json
+
+      # Always upload the per-frame JSON (percentiles, dropped, samples, verdicts) for
+      # offline histogram analysis - even (especially) when the gate failed.
+      - name: Upload the frame report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-perf-report
+          path: perf-report.json
+          if-no-files-found: warn

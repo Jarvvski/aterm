@@ -45,7 +45,8 @@ pub mod widgets;
 pub mod window;
 
 pub use app::{
-    run, run_with, AtermApp, HeadlessCallbacks, KeyPress, Mods, RenderConfig, UiCallbacks,
+    run, run_with, run_with_recorder, AtermApp, HeadlessCallbacks, KeyPress, Mods, RenderConfig,
+    ScrollCommand, UiCallbacks,
 };
 pub use atlas::GlyphAtlas;
 pub use components::{

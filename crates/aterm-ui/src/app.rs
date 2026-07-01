@@ -101,6 +101,23 @@ pub struct KeyPress<'a> {
     pub mods: Mods,
 }
 
+/// A timeline scroll command a driver/automation host asks the app to apply this
+/// frame (ticket T-7.2). The app maps it onto the renderer's scroll-lock - the same
+/// [`GpuRenderer`](crate::gpu::GpuRenderer) methods the real wheel / PageUp / PageDown
+/// bindings drive - and treats it as activity. Lets the headless scenario driver
+/// exercise the *real* scroll path without synthesizing OS input events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollCommand {
+    /// Scroll by a signed number of display rows (negative = up/older).
+    ByRows(i64),
+    /// Page by `dir` viewports (`-1` = up, `+1` = down).
+    Page(i64),
+    /// Jump to the oldest content.
+    ToTop,
+    /// Jump to the newest content (re-engages the follow-bottom lock).
+    ToBottom,
+}
+
 /// Hooks the host app implements to drive the UI. All are optional-ish: the UI
 /// crate can run standalone with a no-op implementation ([`HeadlessCallbacks`]).
 pub trait UiCallbacks {
@@ -183,6 +200,39 @@ pub trait UiCallbacks {
 
     /// The window resized to `cols` x `rows` (cells), `width` x `height` (px).
     fn on_resize(&mut self, _cols: u16, _rows: u16, _width: u32, _height: u32) {}
+
+    // --- Driver / automation seams (ticket T-7.2) -------------------------------
+    //
+    // These let the headless `scenario_driver` replay a scripted stress run against
+    // the REAL app loop (scroll the real timeline, keep presenting at vsync, receive
+    // recorded frames, and quit when done) without synthesizing OS input events. All
+    // default to inert, so a normal host (and the default no-recorder present path)
+    // pays nothing.
+
+    /// A [`ScrollCommand`] to apply to the timeline this frame, or `None`. The app
+    /// maps it onto the renderer's scroll-lock and treats it as activity. Default
+    /// `None` (real hosts scroll via the wheel / PageUp / PageDown bindings).
+    fn poll_scroll(&mut self) -> Option<ScrollCommand> {
+        None
+    }
+
+    /// When `true`, the app treats this wake as activity (re-arms keep-warm +
+    /// redraws), so a driver replaying synthetic input / streamed agent tokens keeps
+    /// presenting every vsync even with no OS input arriving. Default `false`.
+    fn wants_redraw(&mut self) -> bool {
+        false
+    }
+
+    /// A frame was just recorded (called ONLY when a [`FrameRecorder`] is installed,
+    /// so the default present path is unaffected). The scenario driver buckets the
+    /// [`FrameSample`] into the scenario currently under measurement. Default no-op.
+    fn on_frame(&mut self, _sample: crate::recorder::FrameSample) {}
+
+    /// The host asks the event loop to exit (the driver finished its scenarios).
+    /// Checked once per wake after the frame decision. Default `false`.
+    fn should_exit(&self) -> bool {
+        false
+    }
 }
 
 /// A no-op callback set so the UI runs standalone (window + clear only).
@@ -428,13 +478,17 @@ impl<C: UiCallbacks> AtermApp<C> {
                 .as_deref()
                 .map(|s| u32::try_from(s.rows.saturating_mul(s.cols)).unwrap_or(u32::MAX))
                 .unwrap_or(0);
-            recorder.record(FrameTiming {
+            let sample = recorder.record(FrameTiming {
                 cpu_frame_ms,
                 gpu_frame_ms: None,
                 present_interval_ms,
                 dirty_cells,
                 allocations: None,
             });
+            // Hand the derived sample to the host (the scenario driver buckets it per
+            // scenario). Only reachable with a recorder installed, so the default
+            // present path never calls it - the T-7.1 zero-overhead invariant holds.
+            self.callbacks.on_frame(sample);
             self.last_present_at = Some(started);
         }
 
@@ -693,6 +747,26 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                 // to the host's `InputModel` before we build the frame, so the render
                 // path only ever reads the last-good overlay. Cheap (a channel drain).
                 self.callbacks.tick();
+                // Driver/automation seam (T-7.2): apply a queued timeline scroll via
+                // the real renderer scroll-lock, and honor a forced-redraw request, so
+                // the headless driver drives the real scroll/present paths and keeps
+                // presenting at vsync while replaying a scripted run. Both count as
+                // activity (re-arm keep-warm). Inert for a normal host (default None /
+                // false).
+                if let Some(cmd) = self.callbacks.poll_scroll() {
+                    if let Some(r) = self.renderer.as_mut() {
+                        match cmd {
+                            crate::app::ScrollCommand::ByRows(d) => r.scroll_by_rows(d),
+                            crate::app::ScrollCommand::Page(d) => r.scroll_page(d),
+                            crate::app::ScrollCommand::ToTop => r.scroll_to_top(),
+                            crate::app::ScrollCommand::ToBottom => r.scroll_to_bottom(),
+                        }
+                    }
+                    self.scheduler.note_activity(now);
+                }
+                if self.callbacks.wants_redraw() {
+                    self.scheduler.note_activity(now);
+                }
                 // Cheaply notice newly published output and (re)arm keep-warm
                 // before deciding - so a frame produced by the model thread keeps
                 // the panel warm without a keystroke.
@@ -708,6 +782,11 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     // whole idle gap - which the recorder would otherwise miscount
                     // as a dropped frame (T-7.1).
                     self.last_present_at = None;
+                }
+                // The driver asks to quit once its scenarios are done (checked after
+                // the frame so the final frame is still recorded).
+                if self.callbacks.should_exit() {
+                    event_loop.exit();
                 }
             }
             _ => {}
@@ -761,6 +840,26 @@ pub fn run_with<C: UiCallbacks>(
     event_loop.run_app(&mut app)
 }
 
+/// Entry point that runs the app with a [`FrameRecorder`] pre-installed (ticket
+/// T-7.2). Identical to [`run_with`] plus [`AtermApp::with_frame_recorder`], so each
+/// presented frame is timed and the recorded [`FrameSample`](crate::recorder::FrameSample)
+/// is delivered to [`UiCallbacks::on_frame`] - how the scenario driver captures a live
+/// stress run. Blocks until the loop exits (the driver requests exit via
+/// [`UiCallbacks::should_exit`]).
+pub fn run_with_recorder<C: UiCallbacks>(
+    theme_kind: ThemeKind,
+    callbacks: C,
+    config: RenderConfig,
+    recorder: FrameRecorder,
+) -> Result<(), winit::error::EventLoopError> {
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let mut app = AtermApp::new(theme_kind, callbacks)
+        .with_render_config(config)
+        .with_frame_recorder(recorder);
+    event_loop.run_app(&mut app)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +893,18 @@ mod tests {
         for i in 0u8..=15 {
             assert_eq!(dark.ansi.by_index(i), raw.ansi.by_index(i));
         }
+    }
+
+    #[test]
+    fn driver_seams_default_to_inert() {
+        // The T-7.2 automation seams are no-ops for a normal host: a driver overrides
+        // them, but HeadlessCallbacks (and any host that doesn't) stays unaffected.
+        let mut cb = HeadlessCallbacks;
+        assert_eq!(cb.poll_scroll(), None);
+        assert!(!cb.wants_redraw());
+        assert!(!cb.should_exit());
+        // on_frame default is a no-op (must not panic).
+        cb.on_frame(crate::recorder::FrameSample::default());
     }
 
     #[test]

@@ -228,9 +228,12 @@ dependencies = [
  "aterm-core",
  "aterm-ui",
  "criterion",
+ "env_logger",
  "iai-callgrind",
+ "log",
  "serde",
  "serde_json",
+ "winit",
 ]
 
 [[package]]

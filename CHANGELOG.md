@@ -17,6 +17,13 @@ the next version (or an `## Unreleased` heading until a version is cut).
   PageUp / PageDown keys scroll up into history; the view stays locked to the newest output (so a
   running command's tail is always visible) until you scroll away, and re-locks the moment you
   scroll back to the bottom - the standard terminal scroll-follow behavior. (Ticket T-7.2.)
+- **Contributor: the "60fps always" proof now runs seven scripted stress scenarios.** A new
+  `scenario_driver` (in `aterm-bench`) replays fast-scroll, output-flood, large-scrollback,
+  agent-stream-while-typing, window-resize, fullscreen-TUI-redraw, and idle against the real app
+  loop with the frame recorder installed, then emits a JSON report + a pass/fail verdict gated on
+  the 60fps floor (16ms; 120fps tracked, non-blocking). A nightly CI job runs it and fails on a
+  breach. The scenario set + gate are a pure, headless-unit-tested module; the live driver needs
+  real hardware. (Ticket T-7.2.)
 - **The input box now highlights your command as you type and suggests completions from your
   history.** In shell mode the command line gets restrained, near-monochrome syntax tinting
   (command vs argument vs flag) plus an error underline for mistakes like an unterminated quote -
