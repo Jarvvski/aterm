@@ -6,6 +6,12 @@
 //! are reviewable *source* (not opaque checked-in binary blobs) and byte-identical
 //! across every run - the property the Tier-1 instruction-count gate depends on
 //! (ticket T-1.7).
+//!
+//! [`scenario`] declares the Tier-2 stress scenarios + the pass/fail gate (the pure,
+//! headless-tested core of the "60fps always" proof, ticket T-7.2); the on-hardware
+//! `scenario_driver` binary replays them against the real `aterm-ui` app loop.
+
+pub mod scenario;
 
 /// Deterministic VT byte payloads for the benches. Built programmatically so they
 /// are checked in, reviewable, and identical every run (no randomness, no clock,

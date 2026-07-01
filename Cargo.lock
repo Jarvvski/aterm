@@ -226,8 +226,11 @@ name = "aterm-bench"
 version = "0.1.0"
 dependencies = [
  "aterm-core",
+ "aterm-ui",
  "criterion",
  "iai-callgrind",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

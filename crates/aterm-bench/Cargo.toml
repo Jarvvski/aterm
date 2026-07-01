@@ -14,6 +14,11 @@ workspace = true
 
 [dependencies]
 aterm-core.workspace = true
+# The Tier-2 frame recorder (FrameSample/FrameStats/Refresh) + the live app loop the
+# scenario driver replays against - the allowed `aterm-bench -> aterm-ui` graph edge.
+aterm-ui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
