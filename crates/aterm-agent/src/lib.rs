@@ -33,6 +33,9 @@ pub use mcp::connector::{
     classify_mcp_tool, validate_connector_body, validate_servers, McpConfigError, McpServer,
     McpToolPolicy, MCP_CONNECTOR_BETA,
 };
+pub use mcp::stdio::{
+    McpError, McpToolRouter, McpTransport, ProcessTransport, StdioMcpClient, StdioServerConfig,
+};
 pub use policy::{Approval, ApprovalPolicy, AutonomyMode, AutonomyState};
 pub use provider::{
     AgentEvent, AgentEventMapper, AnthropicProvider, ContentBlock, Effort, LlmProvider, Message,
@@ -48,8 +51,8 @@ pub use sanitizer::OutputSanitizer;
 pub use secrets::{Secrets, SENSITIVE_PATHS};
 pub use sink::{CommandSink, FileSink, InjectDisposition, PtyInjectSink, Sinks};
 pub use tools::{
-    EditFile, Glob, Grep, ListDir, ReadFile, RunCommand, ToolDispatch, ToolError, ToolInput,
-    ToolKind, ToolOutcome, ToolRegistry, WriteFile,
+    EditFile, Glob, Grep, ListDir, McpToolCall, McpToolSpec, ReadFile, RunCommand, ToolDispatch,
+    ToolError, ToolInput, ToolKind, ToolOutcome, ToolRegistry, WriteFile,
 };
 pub use transcript::{AgentStep, AgentTranscript, ApprovalMode, ResolvedBy, TurnStatus};
 pub use turn::{

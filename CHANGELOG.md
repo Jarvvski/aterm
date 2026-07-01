@@ -13,6 +13,19 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The agent can now use local MCP servers, fully on-device.** Point aterm at a local stdio
+  MCP server (a filesystem server, a git server, your own project server) and its tools
+  become tools the agent can call, no matter which model backend you run. aterm speaks the
+  protocol itself - a small hand-rolled JSON-RPC-over-stdio client (no `rmcp` dependency) that
+  spawns the server, lists its tools, and calls them - so nothing leaves your machine. Each
+  MCP tool is registered as a first-class tool and goes through the exact same safety path as
+  a native one: because its arguments are opaque, the gate treats every MCP call as
+  needs-approval (it can never silently auto-run), its output is sanitized against your
+  `Secrets` before it re-enters the conversation, and it shows up in the timeline like any
+  other tool call. A native tool always wins a name collision, so an MCP server can never
+  shadow or hijack a gated built-in. If a server crashes or hangs, the call comes back as a
+  clean error (a closed pipe or a bounded per-call timeout) instead of wedging the turn.
+  (Auto-discovering which servers to launch is a follow-up, T-6.3.) (Ticket T-6.2.)
 - **The agent can now use remote MCP servers.** Point the Anthropic provider at a public
   HTTPS MCP server and its tools become available to the agent through the Messages-API MCP
   connector - Anthropic brokers the connection and runs the tools server-side (beta

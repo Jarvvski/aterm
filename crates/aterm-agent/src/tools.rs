@@ -329,6 +329,27 @@ impl ToolKind {
     }
 }
 
+/// A tool exposed by a local stdio MCP server (T-6.2), registered so the turn
+/// loop calls it like any other tool. `server` names the server it came from (for
+/// dispatch routing); `input_schema` is the server's `inputSchema` (advertised
+/// as-is, `strict:false`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolSpec {
+    pub server: String,
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+/// A call to a local MCP server tool (T-6.2). Its `args` are opaque JSON we cannot
+/// statically classify, so the gate over-approximates it to RequireConfirm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolCall {
+    pub server: String,
+    pub name: String,
+    pub args: Value,
+}
+
 /// A parsed, typed tool call's input. The variant identifies the tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolInput {
@@ -339,13 +360,17 @@ pub enum ToolInput {
     ListDir(ListDir),
     Glob(Glob),
     Grep(Grep),
+    /// A local stdio MCP server tool call (T-6.2). Dispatched by an
+    /// [`crate::mcp::stdio::McpToolRouter`], gated like a native mutation.
+    Mcp(McpToolCall),
 }
 
 impl ToolInput {
-    /// The kind this input belongs to.
+    /// The native kind this input belongs to, or `None` for an MCP tool (which has
+    /// no native [`ToolKind`]).
     #[must_use]
-    pub fn kind(&self) -> ToolKind {
-        match self {
+    pub fn kind(&self) -> Option<ToolKind> {
+        Some(match self {
             ToolInput::RunCommand(_) => ToolKind::RunCommand,
             ToolInput::ReadFile(_) => ToolKind::ReadFile,
             ToolInput::EditFile(_) => ToolKind::EditFile,
@@ -353,13 +378,24 @@ impl ToolInput {
             ToolInput::ListDir(_) => ToolKind::ListDir,
             ToolInput::Glob(_) => ToolKind::Glob,
             ToolInput::Grep(_) => ToolKind::Grep,
-        }
+            ToolInput::Mcp(_) => return None,
+        })
     }
 
-    /// Whether this call may run concurrently with others.
+    /// Whether this call may run concurrently with others. An MCP tool's effects
+    /// are unknown, so it never runs concurrently (serialized like a mutation).
     #[must_use]
     pub fn parallel_safe(&self) -> bool {
-        self.kind().parallel_safe()
+        match self {
+            ToolInput::ReadFile(_)
+            | ToolInput::ListDir(_)
+            | ToolInput::Glob(_)
+            | ToolInput::Grep(_) => true,
+            ToolInput::RunCommand(_)
+            | ToolInput::EditFile(_)
+            | ToolInput::WriteFile(_)
+            | ToolInput::Mcp(_) => false,
+        }
     }
 }
 
@@ -380,6 +416,11 @@ pub enum ToolError {
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
     kinds: Vec<ToolKind>,
+    /// Dynamically-registered local MCP server tools (T-6.2), advertised
+    /// alongside the native kinds. An MCP tool whose name collides with a native
+    /// tool is shadowed by the native one at parse time (it can never hijack the
+    /// gated native path).
+    mcp: Vec<McpToolSpec>,
 }
 
 impl ToolRegistry {
@@ -388,7 +429,17 @@ impl ToolRegistry {
     pub fn with_default_tools() -> Self {
         Self {
             kinds: ToolKind::ALL.to_vec(),
+            mcp: Vec::new(),
         }
+    }
+
+    /// Register local MCP server tools (T-6.2) to advertise alongside the native
+    /// set. Chainable. A registered tool whose name matches a native tool is
+    /// shadowed by the native one (both advertised once, native wins at parse).
+    #[must_use]
+    pub fn with_mcp_tools(mut self, specs: Vec<McpToolSpec>) -> Self {
+        self.mcp.extend(specs);
+        self
     }
 
     /// The enabled tool kinds, in advertised order.
@@ -397,26 +448,56 @@ impl ToolRegistry {
         &self.kinds
     }
 
-    /// The [`ToolSpec`]s to advertise to a provider (T-5.2/T-5.3).
+    /// The registered local MCP tools, in advertised order.
     #[must_use]
-    pub fn specs(&self) -> Vec<ToolSpec> {
-        self.kinds.iter().map(|k| k.spec()).collect()
+    pub fn mcp_tools(&self) -> &[McpToolSpec] {
+        &self.mcp
     }
 
-    /// Resolve an advertised tool name to its kind.
+    /// The [`ToolSpec`]s to advertise to a provider (T-5.2/T-5.3): native kinds
+    /// first, then each registered MCP tool (skipping any whose name collides with
+    /// a native tool - the native one already covers it and wins at parse).
+    #[must_use]
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs: Vec<ToolSpec> = self.kinds.iter().map(|k| k.spec()).collect();
+        for m in &self.mcp {
+            if self.kind_for(&m.name).is_some() {
+                continue;
+            }
+            specs.push(ToolSpec {
+                name: m.name.clone(),
+                description: m.description.clone(),
+                input_schema: m.input_schema.clone(),
+                // MCP schemas are not guaranteed to satisfy strict constraints.
+                strict: false,
+            });
+        }
+        specs
+    }
+
+    /// Resolve an advertised tool name to its native kind.
     #[must_use]
     pub fn kind_for(&self, name: &str) -> Option<ToolKind> {
         self.kinds.iter().copied().find(|k| k.name() == name)
     }
 
     /// Round-trip a streamed [`ToolCall`] (name + reassembled input JSON) into the
-    /// typed [`ToolInput`]. Rejects an unadvertised name and any input that does
-    /// not validate against the tool's schema.
+    /// typed [`ToolInput`]. A NATIVE tool name resolves first (an MCP server can
+    /// never shadow/hijack a gated native tool); otherwise a registered MCP tool
+    /// name maps to [`ToolInput::Mcp`]. Rejects an unknown name and any native
+    /// input that does not validate against the tool's schema.
     pub fn parse(&self, call: &ToolCall) -> Result<ToolInput, ToolError> {
-        let kind = self
-            .kind_for(&call.name)
-            .ok_or_else(|| ToolError::UnknownTool(call.name.clone()))?;
-        kind.parse_input(&call.input)
+        if let Some(kind) = self.kind_for(&call.name) {
+            return kind.parse_input(&call.input);
+        }
+        if let Some(m) = self.mcp.iter().find(|m| m.name == call.name) {
+            return Ok(ToolInput::Mcp(McpToolCall {
+                server: m.server.clone(),
+                name: m.name.clone(),
+                args: call.input.clone(),
+            }));
+        }
+        Err(ToolError::UnknownTool(call.name.clone()))
     }
 }
 

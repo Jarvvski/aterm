@@ -813,6 +813,13 @@ impl<S: Sandbox + Clone + Send + 'static> ToolDispatch for Sinks<S> {
                 let sink = self.files.clone();
                 run_blocking(move || sink.grep(&gr)).await
             }
+            // A local MCP tool call reaches the native sinks only if it was NOT
+            // wrapped in an MCP router (T-6.2). Fail closed with a clear error
+            // rather than silently dropping the call.
+            ToolInput::Mcp(call) => ToolOutcome::error(format!(
+                "mcp tool `{}` requires an McpToolRouter; native sinks cannot dispatch it",
+                call.name
+            )),
         }
     }
 }

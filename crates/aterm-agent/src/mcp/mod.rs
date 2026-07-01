@@ -17,3 +17,4 @@
 //! post-MVP and out of v1 scope (see `docs/research/06-agent-architecture.md`).
 
 pub mod connector;
+pub mod stdio;

@@ -35,7 +35,9 @@ rust-version = "1.96"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 # --- async + http (agent; no network calls yet) ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `process` + `io-util` added for the local stdio MCP client (T-6.2): spawn a
+# server child and speak newline-delimited JSON-RPC over its stdin/stdout.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

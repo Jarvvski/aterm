@@ -191,6 +191,14 @@ pub fn gate_tool(input: &ToolInput, policy: &ApprovalPolicy, secrets: &Secrets) 
         | ToolInput::ListDir(_)
         | ToolInput::Glob(_)
         | ToolInput::Grep(_) => Approval::AutoApprove,
+        // A local MCP server tool (T-6.2) has opaque args we cannot statically
+        // classify - it may run a command or write files on the machine. Over-
+        // approximate to RequireConfirm(Caution) so it can never auto-run; the
+        // user confirms each call, exactly as a native mutation would.
+        ToolInput::Mcp(_) => Approval::RequireConfirm(RiskAssessment {
+            level: Risk::Caution,
+            reasons: vec![RiskReason::McpTool],
+        }),
     }
 }
 
