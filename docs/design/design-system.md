@@ -374,6 +374,18 @@ One step in the agentic transcript.
 - **Proposed tool calls / commands**: render as nested mini command blocks
   (`font.grid`) with a risk-gate badge inline.
 
+Implementation note (T-9.6): the shipped agent turn realizes the mock's `agent`
+state directly in the block timeline rather than as a discrete `bg.surface` card - a
+turn reads as one grouped unit by SUPPRESSING the inter-step boundary hairline
+(kept only above the `◊` header and the closing summary), not by drawing a card
+edge. The header is the agent-accent `◊` glyph + request + an "agent - N steps"
+meta; the plan carries an uppercase eyebrow; tool rows are the tool name
+(`accent.primary`) + its sanitized argument (`fg.muted`) + a right-aligned "+N -M"
+on an edit; tool output sits in a hairline LEFT-bordered block with `+`/`-` diff and
+FAILED/ok coloring; the summary is `fg.primary`. The `bg.surface` card container +
+72ch prose measure remain the target for a future pass (this re-skin stays on the
+Mono grid path for pixel-parity with command output).
+
 ### Status chip (generic small pill)
 
 - `radius.sm`, `type.label` (`font.ui`), `space.1` / `space.2` padding.

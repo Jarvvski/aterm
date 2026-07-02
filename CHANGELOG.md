@@ -13,6 +13,14 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The agent turn reads like the vision mock now.** An agent turn in the timeline is styled
+  as one grouped card: an agent-accent `◊` header carrying your request and an "agent - N steps"
+  meta, an uppercase PLAN eyebrow over the opening plan, tool-call rows showing the tool name in
+  the accent color beside its argument (a path, or the command - always run through the secret
+  redactor first) with a right-aligned "+N -M" on an edit, tool output in a hairline-bordered
+  block with `+`/`-` diff lines and FAILED/ok test results colored, and a closing summary set
+  off by a hairline. A gated call still shows its `APPROVE?`/`BLOCKED` verdict inline; auto-run
+  calls stay clean. (Ticket T-9.6.)
 - **Launch + modes screens and a tab-completion popover (the vision-mock quiet states).** A
   fresh window now shows a centered "aterm" splash with a tagline instead of a blank timeline.
   Press `Cmd-?` for a one-input-two-destinations explainer (the shell/agent split). And `Tab`

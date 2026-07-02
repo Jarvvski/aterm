@@ -31,10 +31,10 @@ use std::time::{Duration, Instant};
 use aterm_agent::{
     badge_for_approval, gate_tool, gloss_for, AgentEvent, AgentTurn, AnthropicProvider, Approval,
     ApprovalPolicy, ApprovalRequest, CancelToken, ChannelConfirmHandler, Effort, LlmProvider,
-    McpServer, McpToolRouter, Message, MockProvider, OpenAiProvider, ProviderEvent, Secrets, Sinks,
-    StopReason, ToolCall, ToolRegistry, TurnRequest, Usage,
+    McpServer, McpToolRouter, Message, MockProvider, OpenAiProvider, OutputSanitizer,
+    ProviderEvent, Secrets, Sinks, StopReason, ToolCall, ToolRegistry, TurnRequest, Usage,
 };
-use aterm_core::{AgentBadge, AgentBlock, AgentBlockKind, AgentInjector};
+use aterm_core::{AgentBadge, AgentBlock, AgentBlockKind, AgentInjector, AgentTextRole};
 use tokio::sync::mpsc;
 
 use crate::mcp::{provision, McpProvision};
@@ -43,6 +43,12 @@ use crate::mcp::{provision, McpProvision};
 /// it as fast as the model thread accepts mailbox sends, and the turn loop produces
 /// human-paced steps, so it never fills in practice.
 const EVENT_CHANNEL_DEPTH: usize = 256;
+
+/// Byte cap for the sanitized tool-call ARGUMENT shown faint on a timeline row (ticket
+/// T-9.6). One line's worth of a path / argv; the full argument is never the point, and
+/// the risk gate has already inspected the real thing. Redaction runs BEFORE truncation
+/// (the `OutputSanitizer` contract), so a clipped secret can never survive.
+const TOOL_ARG_MAX: usize = 160;
 
 /// Per-turn token ceiling. A pragmatic default until the EPIC-8 config loader; the
 /// adaptive-thinking `effort` param (not `budget_tokens`) governs reasoning depth.
@@ -102,6 +108,10 @@ pub struct StreamProjector<S: BlockSink> {
     /// The kind of the currently-open streaming block (`Thinking` / `AssistantText`),
     /// or `None` when the last emitted block is not text-extendable.
     open: Option<AgentBlockKind>,
+    /// Whether a tool has been proposed yet this turn (ticket T-9.6): assistant prose
+    /// BEFORE the first tool call is the turn's PLAN; prose after reads as a SUMMARY. A
+    /// projector is built per turn, so this starts `false` and only advances.
+    seen_tool: bool,
 }
 
 impl<S: BlockSink> StreamProjector<S> {
@@ -115,6 +125,7 @@ impl<S: BlockSink> StreamProjector<S> {
             secrets,
             registry: ToolRegistry::with_default_tools(),
             open: None,
+            seen_tool: false,
         }
     }
 
@@ -125,13 +136,20 @@ impl<S: BlockSink> StreamProjector<S> {
             AgentEvent::Assistant(delta) => self.stream(AgentBlockKind::AssistantText, &delta),
             AgentEvent::ToolProposed(call) => {
                 self.open = None;
-                let (text, badge) = self.describe_tool(&call);
-                let mut block = AgentBlock::new(AgentBlockKind::ToolCall, text, Instant::now())
-                    .with_tool_use_id(call.id);
-                if let Some(badge) = badge {
+                let d = self.describe_tool(&call);
+                let mut block = AgentBlock::new(AgentBlockKind::ToolCall, d.text, Instant::now())
+                    .with_tool_use_id(call.id)
+                    .with_tool_display(d.name, d.arg);
+                if let Some(badge) = d.badge {
                     block = block.with_badge(badge);
                 }
+                if let Some((added, removed)) = d.edit_stats {
+                    block = block.with_edit_stats(added, removed);
+                }
                 self.sink.push_block(block);
+                // A tool has run: subsequent assistant prose reads as the turn SUMMARY,
+                // not the PLAN (ticket T-9.6).
+                self.seen_tool = true;
             }
             AgentEvent::ToolResult {
                 id,
@@ -204,35 +222,72 @@ impl<S: BlockSink> StreamProjector<S> {
     }
 
     /// Append a streamed text/thinking delta: extend the open block of the same kind
-    /// in place, else open a new one.
+    /// in place, else open a new one. A fresh assistant block is tagged with its
+    /// narrative role (ticket T-9.6): PLAN before the first tool call, else SUMMARY;
+    /// thinking is always plain body. The role is fixed at open time - a run of deltas
+    /// is one block, and `seen_tool` cannot flip mid-run.
     fn stream(&mut self, kind: AgentBlockKind, delta: &str) {
         if self.open == Some(kind) {
             self.sink.append_text(delta);
         } else {
-            self.sink
-                .push_block(AgentBlock::new(kind, delta, Instant::now()));
+            let mut block = AgentBlock::new(kind, delta, Instant::now());
+            if kind == AgentBlockKind::AssistantText {
+                let role = if self.seen_tool {
+                    AgentTextRole::Summary
+                } else {
+                    AgentTextRole::Plan
+                };
+                block = block.with_text_role(role);
+            }
+            self.sink.push_block(block);
             self.open = Some(kind);
         }
     }
 
-    /// The display text + risk badge for a proposed tool call. Parses the call, gates
-    /// it through [`gate_tool`] (the crown-jewel decision, shared with the loop), and
-    /// maps the verdict to an [`AgentBadge`]. A call whose arguments do not parse gets
-    /// a plain label and no badge (its failure surfaces as the `is_error` result the
-    /// loop feeds back).
-    fn describe_tool(&self, call: &ToolCall) -> (String, Option<AgentBadge>) {
+    /// The display fields for a proposed tool call. Parses the call, gates it through
+    /// [`gate_tool`] (the crown-jewel decision, shared with the loop), maps the verdict
+    /// to an [`AgentBadge`], and derives the mock's "name (accent)  arg (faint)" row
+    /// (ticket T-9.6) - the argument run through the [`OutputSanitizer`] against the same
+    /// [`Secrets`] the turn is gated with, so a secret in an argv can never reach the
+    /// renderer. A call whose arguments do not parse gets a plain label, no badge, and no
+    /// structured arg (its failure surfaces as the `is_error` result the loop feeds back).
+    fn describe_tool(&self, call: &ToolCall) -> DescribedTool {
         match self.registry.parse(call) {
             Ok(input) => {
                 let approval = gate_tool(&input, &self.policy, &self.secrets);
                 let badge = badge_for_approval(&approval);
-                (describe_call(&call.name, &approval), Some(badge))
+                let sanitizer = OutputSanitizer::new(&self.secrets);
+                let arg = input
+                    .display_arg()
+                    .map(|a| sanitizer.sanitize(&a, Some(TOOL_ARG_MAX)));
+                DescribedTool {
+                    text: describe_call(&call.name, &approval),
+                    badge: Some(badge),
+                    name: call.name.clone(),
+                    arg,
+                    edit_stats: input.edit_stats(),
+                }
             }
-            Err(error) => (
-                format!("{} (could not parse arguments: {error})", call.name),
-                None,
-            ),
+            Err(error) => DescribedTool {
+                text: format!("{} (could not parse arguments: {error})", call.name),
+                badge: None,
+                name: call.name.clone(),
+                arg: None,
+                edit_stats: None,
+            },
         }
     }
+}
+
+/// The display facts a proposed tool call projects onto its timeline block (ticket
+/// T-9.6): the one-line gloss `text` (verdict), the risk `badge`, the tool `name`
+/// (accent) + its SANITIZED `arg` (faint), and `edit_stats` for an `edit_file`.
+struct DescribedTool {
+    text: String,
+    badge: Option<AgentBadge>,
+    name: String,
+    arg: Option<String>,
+    edit_stats: Option<(u32, u32)>,
 }
 
 /// The human-facing one-line description of a gated tool call: the tool name plus the
@@ -837,6 +892,89 @@ mod tests {
         assert_eq!(blocks[1].tool_use_id.as_deref(), Some("mcp_1"));
         assert_eq!(blocks[1].text, "a doc");
         assert!(!blocks[1].is_error);
+    }
+
+    #[test]
+    fn tool_call_carries_name_sanitized_arg_and_edit_stats() {
+        // T-9.6: a proposed tool call projects the mock's "name  arg" fields (not just
+        // the gloss text), plus "+A -M" for an edit_file. The arg is run through the
+        // OutputSanitizer, so a secret in an argv is redacted before it reaches the
+        // renderer (the crown-jewel discipline: aterm-core never sees a raw secret).
+        let mut secrets = Secrets::new();
+        secrets.add_value("sk-supersecret");
+        let sink = RecordingSink::default();
+        let mut p = StreamProjector::new(&sink, ApprovalPolicy::new(), secrets);
+
+        p.apply(AgentEvent::ToolProposed(ToolCall {
+            id: "r".into(),
+            name: "read_file".into(),
+            input: json!({ "path": "src/render/blocks.rs" }),
+        }));
+        p.apply(AgentEvent::ToolProposed(ToolCall {
+            id: "e".into(),
+            name: "edit_file".into(),
+            input: json!({ "path": "a.rs", "old_str": "x", "new_str": "y\nz" }),
+        }));
+        p.apply(AgentEvent::ToolProposed(ToolCall {
+            id: "c".into(),
+            name: "run_command".into(),
+            input: json!({ "command": ["curl", "-H", "Authorization: sk-supersecret"] }),
+        }));
+
+        let blocks = sink.blocks.borrow();
+        // read_file: name + path, no edit stats.
+        assert_eq!(blocks[0].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(blocks[0].tool_arg.as_deref(), Some("src/render/blocks.rs"));
+        assert_eq!(blocks[0].edit_stats, None);
+        // edit_file: name + path + (added=2, removed=1).
+        assert_eq!(blocks[1].tool_name.as_deref(), Some("edit_file"));
+        assert_eq!(blocks[1].edit_stats, Some((2, 1)));
+        // run_command: the secret in the argv is REDACTED in the displayed arg.
+        let arg = blocks[2].tool_arg.as_deref().unwrap();
+        assert!(
+            !arg.contains("sk-supersecret"),
+            "secret leaked into arg: {arg}"
+        );
+        assert!(
+            arg.contains("[REDACTED]"),
+            "secret should be redacted: {arg}"
+        );
+    }
+
+    #[test]
+    fn assistant_prose_role_is_plan_before_tools_and_summary_after() {
+        // T-9.6: the first prose (before any tool call) is the turn PLAN; prose after a
+        // tool has run reads as the SUMMARY. A change of kind closes the open block, so
+        // the pre- and post-tool prose are distinct steps with distinct roles.
+        let sink = RecordingSink::default();
+        let mut p = projector(&sink);
+        p.apply(AgentEvent::Assistant("Here's my plan.".into()));
+        p.apply(AgentEvent::ToolProposed(ToolCall {
+            id: "t".into(),
+            name: "list_dir".into(),
+            input: json!({ "path": "." }),
+        }));
+        p.apply(AgentEvent::ToolResult {
+            id: "t".into(),
+            output: "a\nb".into(),
+            is_error: false,
+        });
+        p.apply(AgentEvent::Assistant("All done.".into()));
+        let blocks = sink.blocks.borrow();
+        assert_eq!(blocks[0].kind, AgentBlockKind::AssistantText);
+        assert_eq!(blocks[0].text_role, AgentTextRole::Plan);
+        let last = blocks.last().unwrap();
+        assert_eq!(last.kind, AgentBlockKind::AssistantText);
+        assert_eq!(last.text_role, AgentTextRole::Summary);
+    }
+
+    #[test]
+    fn thinking_prose_stays_body_role() {
+        // Thinking is never a plan/summary - it stays the default Body role.
+        let sink = RecordingSink::default();
+        let mut p = projector(&sink);
+        p.apply(AgentEvent::Thinking("hmm".into()));
+        assert_eq!(sink.blocks.borrow()[0].text_role, AgentTextRole::Body);
     }
 
     #[test]

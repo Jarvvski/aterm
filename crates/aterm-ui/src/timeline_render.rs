@@ -46,18 +46,37 @@ use aterm_tokens::{type_scale, Mode, Theme};
 
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
-use crate::components::{BlockMetaStyle, CommandBlockStyle, GutterStyle, RiskBadge, RiskState};
+use crate::components::{BlockMetaStyle, CommandBlockStyle, RiskBadge, RiskState};
 use crate::grid_render::FrameSize;
 use crate::text::{resolve_color, resolve_output_color, FontFamily, GridCell};
-use crate::timeline::{GutterMarker, TimelineLayout, TimelineMode, TimelineRow, GAP_ROWS};
+use crate::timeline::{
+    GutterMarker, TimelineLayout, TimelineMode, TimelineRow, VisibleBlock, GAP_ROWS,
+};
 use crate::window::cell_px;
-use aterm_core::AgentBadge;
+use aterm_core::{AgentBadge, AgentBlockKind, AgentTextRole, Block};
 use aterm_tokens::space;
 
 /// The shell prompt glyph drawn in the timeline gutter for a command block (the mock's
 /// accent `❯`, U+276F). Verified present in the bundled Mono Nerd Font by the input
 /// widget's `prompt_glyphs_exist_in_the_bundled_grid_font` test (same face).
 const SHELL_PROMPT_GLYPH: char = '\u{276F}';
+
+/// The agent turn's header glyph drawn in the gutter (ticket T-9.6): the diamond `◊`
+/// (U+25CA LOZENGE) in the agent accent - the SAME substitute the input box uses for
+/// the mock's `◇` (U+25C7 WHITE DIAMOND, which is `.notdef` in the bundled faces).
+/// Guarded by `agent_glyphs_exist_in_the_bundled_grid_font`.
+const AGENT_PROMPT_GLYPH: char = '\u{25CA}';
+
+/// The uppercase "plan" eyebrow above a turn's opening plan prose (ticket T-9.6). ASCII,
+/// always present; the mock renders it via `text-transform: uppercase`.
+const PLAN_EYEBROW: &str = "PLAN";
+
+/// The resolved-gate status glyphs (ticket T-9.7): a success tick / a danger cross for
+/// an approved / rejected `Approval` step. Nerd-Font PUA icons (`nf-fa-check` /
+/// `nf-fa-times`), present in the bundled Mono face - the mock's `✓` (U+2713) / `✕`
+/// (U+2715) are BMP geometrics absent from it. `nf-fa-check` is already the `Ok` gutter.
+const APPROVAL_APPROVED_GLYPH: char = '\u{f00c}';
+const APPROVAL_REJECTED_GLYPH: char = '\u{f00d}';
 
 /// The middle-dot separating "exit N" from the duration in the block-meta caption
 /// (U+00B7, present in the bundled Mono face - unlike U+2026, so this is safe).
@@ -239,9 +258,16 @@ impl TimelineRenderer {
         // The gutter marker is one Mono cell, centered horizontally in the marker band.
         let marker_x = edge + ((gutter_w - cw) * 0.5).max(0.0);
 
-        for vb in &layout.visible {
-            let gutter = GutterStyle::resolve(vb.gutter, theme);
+        // Agent-transcript palette (ticket T-9.6): the per-kind token mapping, resolved
+        // once from the theme through the pure [`AgentPalette`] (so AC2 - "colors resolve
+        // through tokens, no literals" - is asserted by a unit test, not just an any_ink
+        // pixel check).
+        let pal = AgentPalette::resolve(theme);
+        // A tool result's captured output sits in a hairline LEFT-bordered block: the
+        // rule at the content column, the text indented one intra-block step past it.
+        let result_text_x = content_x + f32::from(space::S3) * scale;
 
+        for (vi, vb) in layout.visible.iter().enumerate() {
             // Exactly ONE muted hairline per interior boundary: centered in the
             // leading-gap whitespace above every block except the first in the list
             // (index 0 has no boundary above it). No top/bottom edge line and no doubled
@@ -255,7 +281,15 @@ impl TimelineRenderer {
             // lone trailing gap; the topmost partial block is always in `visible`). When
             // EPIC-3 free scroll lands, drive emission from the boundary above the first
             // off-screen block too, and add a test at a scroll where gapped_top == vp_bottom.
-            if vb.index > 0 && vb.top_in_viewport >= GAP_ROWS as i64 {
+            // Grouping (ticket T-9.6): the boundary hairline separates TURNS, not the
+            // steps within one - an agent turn reads as one card. So it draws above
+            // command blocks and above the two turn-framing agent steps (the `◊` header
+            // and the final summary), but NOT above the plan / tool / result / body
+            // steps that sit inside a turn.
+            if vb.index > 0
+                && vb.top_in_viewport >= GAP_ROWS as i64
+                && block_draws_top_hairline(&layout.visible, vi)
+            {
                 let center_rel = vb.top_in_viewport as f32 - GAP_ROWS as f32 * 0.5;
                 let hy = (top_margin + center_rel * ch).round();
                 self.bg_instances.push(RectInstance {
@@ -268,6 +302,19 @@ impl TimelineRenderer {
             // agent step's rows draw its text (ticket T-5.10).
             let command_block = vb.block.as_command();
             let agent_block = vb.block.as_agent();
+
+            // A tool RESULT's output block carries a hairline LEFT border spanning its
+            // visible rows (the mock's `border-left`, ticket T-9.6), drawn once here.
+            if let Some(ab) = agent_block {
+                if ab.kind == AgentBlockKind::ToolResult && !vb.rows.is_empty() {
+                    let y0 = top_margin + vb.first_row_in_viewport as f32 * ch;
+                    let h = vb.rows.len() as f32 * ch;
+                    self.bg_instances.push(RectInstance {
+                        rect: [content_x, y0, hairline_h, h],
+                        color: hairline,
+                    });
+                }
+            }
 
             for (k, row) in vb.rows.iter().enumerate() {
                 let y = top_margin + (vb.first_row_in_viewport + k as i64) as f32 * ch;
@@ -399,61 +446,214 @@ impl TimelineRenderer {
                         }
                     }
                     TimelineRow::Agent(line) => {
-                        // An agent transcript step (T-5.10): draw the gutter marker on
-                        // its first line, then this line of its (pre-glossed,
-                        // pre-sanitized) text in Mono fg.primary. A gated tool-call step
-                        // ALSO draws its risk-gate badge inline at the head of line 0
-                        // (T-5.11): the badge LABEL in the saturated semantic color,
-                        // always paired with text (color-blind safety); the parsed
-                        // reason gloss is already in `ab.text`. Real card styling is
-                        // EPIC-4 (T-4.6); this is the data binding.
+                        // The agent-transcript re-skin (ticket T-9.6): each step is
+                        // styled by KIND to the vision mock's `agent` state via the token
+                        // `pal`ette. `emit_run` draws one Mono run and returns the x after
+                        // it, so a row can sequence name -> arg -> badge on one baseline.
+                        // Turn grouping (no inter-step rule) is `block_draws_top_hairline`.
                         let Some(ab) = agent_block else { continue };
-                        if *line == 0 {
-                            let marker = grid_glyph(gutter.glyph, gutter.color, canvas);
-                            emit_cell(
-                                atlas,
-                                queue,
-                                &marker,
-                                (marker_x, y),
-                                &ctx,
-                                &mut self.bg_instances,
-                                &mut self.glyph_instances,
-                            );
-                        }
-                        let mut x = content_x;
-                        // The risk-gate badge prefixes line 0 of a gated tool call.
-                        if *line == 0 {
-                            if let Some(badge) = ab.badge {
-                                let rb = RiskBadge::resolve(risk_state_for(badge), theme);
-                                for c in rb.label.chars() {
-                                    let cell = grid_glyph(c, rb.gutter_color, canvas);
-                                    emit_cell(
-                                        atlas,
-                                        queue,
-                                        &cell,
-                                        (x, y),
-                                        &ctx,
-                                        &mut self.bg_instances,
-                                        &mut self.glyph_instances,
-                                    );
-                                    x += cw;
+                        let line = *line;
+                        let text_line = ab.text.split('\n').nth(line).unwrap_or("");
+                        let bg = &mut self.bg_instances;
+                        let gl = &mut self.glyph_instances;
+                        match ab.kind {
+                            AgentBlockKind::UserPrompt => {
+                                // Turn header: agent-accent `◊` gutter glyph, the request
+                                // in fg.primary, and a right-aligned "agent - N steps" meta.
+                                if line == 0 {
+                                    let glyph = grid_glyph(AGENT_PROMPT_GLYPH, pal.header, canvas);
+                                    emit_cell(atlas, queue, &glyph, (marker_x, y), &ctx, bg, gl);
                                 }
-                                x += cw; // a space between the badge and the gloss
-                            }
-                        }
-                        if let Some(text_line) = ab.text.split('\n').nth(*line) {
-                            for c in text_line.chars() {
-                                let cell = grid_glyph(c, cmd.command_fg, canvas);
-                                emit_cell(
+                                emit_run(
                                     atlas,
                                     queue,
-                                    &cell,
-                                    (x, y),
                                     &ctx,
-                                    &mut self.bg_instances,
-                                    &mut self.glyph_instances,
+                                    text_line,
+                                    pal.emphasis,
+                                    canvas,
+                                    content_x,
+                                    y,
+                                    bg,
+                                    gl,
                                 );
-                                x += cw;
+                                if line == 0 {
+                                    let steps = turn_step_count(&layout.visible, vi);
+                                    let meta = if steps > 0 {
+                                        format!("agent {META_SEP} {steps} steps")
+                                    } else {
+                                        "agent".to_string()
+                                    };
+                                    let mx = edge + inner_w - meta.chars().count() as f32 * cw;
+                                    if mx > content_x + text_line.chars().count() as f32 * cw {
+                                        emit_run(
+                                            atlas, queue, &ctx, &meta, pal.faint, canvas, mx, y,
+                                            bg, gl,
+                                        );
+                                    }
+                                }
+                            }
+                            AgentBlockKind::Thinking => {
+                                // Model thinking: quiet faint prose (the mock keeps it low).
+                                emit_run(
+                                    atlas, queue, &ctx, text_line, pal.faint, canvas, content_x, y,
+                                    bg, gl,
+                                );
+                            }
+                            AgentBlockKind::AssistantText => {
+                                // Only the turn's FINAL assistant prose is the summary
+                                // (emphasized + framed by a rule); the projector marks
+                                // every post-tool paragraph `Summary` since it cannot know
+                                // at stream time which is last, so the renderer picks the
+                                // true final one by lookahead (review fix). A plan carries
+                                // an uppercase eyebrow in the grouped gap above it.
+                                let final_summary = is_final_summary(&layout.visible, vi);
+                                if line == 0 && ab.text_role == AgentTextRole::Plan {
+                                    let ey = y - ch;
+                                    if ey >= top_margin - 0.5 {
+                                        emit_run(
+                                            atlas,
+                                            queue,
+                                            &ctx,
+                                            PLAN_EYEBROW,
+                                            pal.faint,
+                                            canvas,
+                                            content_x,
+                                            ey,
+                                            bg,
+                                            gl,
+                                        );
+                                    }
+                                }
+                                let color = if final_summary {
+                                    pal.emphasis
+                                } else {
+                                    pal.prose
+                                };
+                                emit_run(
+                                    atlas, queue, &ctx, text_line, color, canvas, content_x, y, bg,
+                                    gl,
+                                );
+                            }
+                            AgentBlockKind::ToolCall => {
+                                // "name (accent)  arg (faint)" + a right-aligned "+A -M"
+                                // for an edit. Tool calls are one line.
+                                if line == 0 {
+                                    let mut x = content_x;
+                                    if let Some(name) = &ab.tool_name {
+                                        x = emit_run(
+                                            atlas,
+                                            queue,
+                                            &ctx,
+                                            name,
+                                            pal.tool_name,
+                                            canvas,
+                                            x,
+                                            y,
+                                            bg,
+                                            gl,
+                                        );
+                                        x += cw; // gap
+                                        if let Some(arg) = &ab.tool_arg {
+                                            x = emit_run(
+                                                atlas, queue, &ctx, arg, pal.faint, canvas, x, y,
+                                                bg, gl,
+                                            );
+                                        }
+                                    } else {
+                                        // Unparseable call: fall back to the gloss text.
+                                        x = emit_run(
+                                            atlas, queue, &ctx, text_line, pal.prose, canvas, x, y,
+                                            bg, gl,
+                                        );
+                                    }
+                                    // A gated (non-auto) call keeps a small inline verdict
+                                    // badge - the color-blind-safe safety signal; auto
+                                    // calls stay clean (matching the mock). Advance `x`
+                                    // PAST the badge so the right-aligned edit stats below
+                                    // reserve room for it too (review fix).
+                                    if let Some(badge) = ab.badge {
+                                        if badge != AgentBadge::Auto {
+                                            let rb =
+                                                RiskBadge::resolve(risk_state_for(badge), theme);
+                                            x = emit_run(
+                                                atlas,
+                                                queue,
+                                                &ctx,
+                                                rb.label,
+                                                rb.gutter_color,
+                                                canvas,
+                                                x + cw,
+                                                y,
+                                                bg,
+                                                gl,
+                                            );
+                                        }
+                                    }
+                                    // edit_file "+A -M", right-aligned (success / danger),
+                                    // only when it clears the name/arg/badge run.
+                                    if let Some((added, removed)) = ab.edit_stats {
+                                        let plus = format!("+{added}");
+                                        let minus = format!("-{removed}");
+                                        let total =
+                                            plus.chars().count() + 1 + minus.chars().count();
+                                        let sx = edge + inner_w - total as f32 * cw;
+                                        if sx > x + cw {
+                                            let after = emit_run(
+                                                atlas, queue, &ctx, &plus, pal.add, canvas, sx, y,
+                                                bg, gl,
+                                            );
+                                            emit_run(
+                                                atlas,
+                                                queue,
+                                                &ctx,
+                                                &minus,
+                                                pal.remove,
+                                                canvas,
+                                                after + cw,
+                                                y,
+                                                bg,
+                                                gl,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            AgentBlockKind::ToolResult => {
+                                // Captured output in the left-bordered block: faint text,
+                                // `+`/`-` diff lines success/danger, FAILED/ok colored.
+                                let color =
+                                    diff_line_color(text_line, pal.faint, pal.add, pal.remove);
+                                emit_run(
+                                    atlas,
+                                    queue,
+                                    &ctx,
+                                    text_line,
+                                    color,
+                                    canvas,
+                                    result_text_x,
+                                    y,
+                                    bg,
+                                    gl,
+                                );
+                            }
+                            AgentBlockKind::Approval => {
+                                // Resolved gate line (ticket T-9.7): a success ✓ / danger ✕
+                                // status glyph + the resolution text, color always paired
+                                // with the leading text label (color-blind safety).
+                                let mut x = content_x;
+                                if line == 0 {
+                                    let (glyph, gcolor) = if ab.is_error {
+                                        (APPROVAL_REJECTED_GLYPH, pal.remove)
+                                    } else {
+                                        (APPROVAL_APPROVED_GLYPH, pal.add)
+                                    };
+                                    let g = grid_glyph(glyph, gcolor, canvas);
+                                    emit_cell(atlas, queue, &g, (x, y), &ctx, bg, gl);
+                                    x += 2.0 * cw;
+                                }
+                                emit_run(
+                                    atlas, queue, &ctx, text_line, pal.faint, canvas, x, y, bg, gl,
+                                );
                             }
                         }
                     }
@@ -524,6 +724,155 @@ fn grid_glyph(ch: char, fg: aterm_tokens::Rgba, canvas: aterm_tokens::Rgba) -> G
         italic: false,
         underline: false,
         wide: false,
+    }
+}
+
+/// Draw one Mono run of `text` in `fg` starting at `(x0, y)` through the shared cell
+/// emitter, returning the x AFTER the last cell (ticket T-9.6) - so an agent row can
+/// sequence name -> arg -> badge on one baseline without recomputing widths. One cell per
+/// `char`, exactly like the command/output paths (no per-frame allocation).
+#[allow(clippy::too_many_arguments)]
+fn emit_run(
+    atlas: &mut GlyphAtlas,
+    queue: &wgpu::Queue,
+    ctx: &CellCtx,
+    text: &str,
+    fg: aterm_tokens::Rgba,
+    canvas: aterm_tokens::Rgba,
+    x0: f32,
+    y: f32,
+    bg: &mut Vec<RectInstance>,
+    glyph: &mut Vec<GlyphInstance>,
+) -> f32 {
+    let mut x = x0;
+    for c in text.chars() {
+        let cell = grid_glyph(c, fg, canvas);
+        emit_cell(atlas, queue, &cell, (x, y), ctx, bg, glyph);
+        x += ctx.cw;
+    }
+    x
+}
+
+/// The per-kind token palette for the agent-transcript re-skin (ticket T-9.6), resolved
+/// once per frame from the theme. Pulling the color choices out of the render arm makes
+/// AC2 ("colors resolve through tokens - agent = `accent.agent`, tool name =
+/// `accent.primary`; no literals") a pure, noise-immune unit test instead of a weak
+/// any_ink pixel check. Every field is a token, never a literal.
+#[derive(Debug, Clone, Copy)]
+struct AgentPalette {
+    /// The `◊` turn-header glyph - the agent mode accent (purple).
+    header: aterm_tokens::Rgba,
+    /// A tool call's name - the primary accent (blue).
+    tool_name: aterm_tokens::Rgba,
+    /// The header request + the turn's final summary - `fg.primary` emphasis.
+    emphasis: aterm_tokens::Rgba,
+    /// Plan / mid-turn body prose + the unparseable-call fallback - `fg.secondary`.
+    prose: aterm_tokens::Rgba,
+    /// Args, the step meta, thinking, the plan eyebrow, output body - `fg.muted`.
+    faint: aterm_tokens::Rgba,
+    /// A `+` diff line / "+A" edit count / the approved `✓` - `success`.
+    add: aterm_tokens::Rgba,
+    /// A `-` diff line / "-M" edit count / the rejected `✕` - `danger`.
+    remove: aterm_tokens::Rgba,
+}
+
+impl AgentPalette {
+    #[must_use]
+    fn resolve(theme: &Theme) -> Self {
+        let c = &theme.colors;
+        Self {
+            header: c.mode_accent(Mode::Agent),
+            tool_name: c.accent_primary,
+            emphasis: c.fg_primary,
+            prose: c.fg_secondary,
+            faint: c.fg_muted,
+            add: c.success,
+            remove: c.danger,
+        }
+    }
+}
+
+/// Whether a top boundary hairline draws above the visible block at `vi` (ticket T-9.6).
+/// It separates TURNS, not the steps inside one: a command block and the two turn-framing
+/// agent steps (the `◊` [`UserPrompt`](AgentBlockKind::UserPrompt) header and the turn's
+/// FINAL summary) get a rule; the plan / tool / result / mid-turn-body steps within a turn
+/// are grouped under the header with no rule between them. The "final summary" test needs
+/// turn context (a mid-turn reflection must NOT be framed), so it takes the visible slice.
+fn block_draws_top_hairline(visible: &[VisibleBlock], vi: usize) -> bool {
+    match visible[vi].block {
+        Block::Command(_) => true,
+        Block::Agent(a) => a.kind == AgentBlockKind::UserPrompt || is_final_summary(visible, vi),
+    }
+}
+
+/// Whether the visible block at `vi` is its turn's FINAL summary (ticket T-9.6, review
+/// fix): an [`AssistantText`](AgentBlockKind::AssistantText) whose projector role is
+/// [`Summary`](AgentTextRole::Summary) AND which is the last agent step before the next
+/// turn / command / end. The projector marks EVERY post-tool paragraph `Summary` (it
+/// cannot know at stream time which is last), so the renderer disambiguates here: a
+/// mid-turn reflection stays quiet body prose with no rule, only the true final summary
+/// gets the hairline + `fg.primary` emphasis. Steps are contiguous in append order, so
+/// the block immediately after `vi` decides it - O(1). Known limit (shared with
+/// [`turn_step_count`]): if the summary is the last VISIBLE block but more steps are
+/// scrolled below, it reads as final - acceptable, since scroll pins to the newest.
+fn is_final_summary(visible: &[VisibleBlock], vi: usize) -> bool {
+    let Block::Agent(a) = visible[vi].block else {
+        return false;
+    };
+    if a.kind != AgentBlockKind::AssistantText || a.text_role != AgentTextRole::Summary {
+        return false;
+    }
+    match visible.get(vi + 1) {
+        None => true, // nothing after -> the turn's last step
+        Some(next) => match next.block {
+            Block::Command(_) => true, // a human command ends the turn
+            // Another agent step in this turn means this is not the last; the next turn's
+            // header (UserPrompt) means it was.
+            Block::Agent(n) => n.kind == AgentBlockKind::UserPrompt,
+        },
+    }
+}
+
+/// The tool-call step count for a turn whose `◊` header is the visible block at index
+/// `header_vi` (ticket T-9.6): the number of [`ToolCall`](AgentBlockKind::ToolCall) steps
+/// among the VISIBLE blocks between it and the next turn / command block. O(steps in this
+/// turn), so the whole pass stays O(visible-rows). Known limit: a tool call scrolled BELOW
+/// the viewport is not counted (the header is the turn's first block, so steps above it
+/// never exist; only the tail can be clipped) - a slight undercount on a very long turn,
+/// documented rather than paid for with an O(n) full-list scan.
+fn turn_step_count(visible: &[VisibleBlock], header_vi: usize) -> u32 {
+    let mut n = 0u32;
+    for vb in &visible[header_vi + 1..] {
+        match vb.block {
+            Block::Agent(a) => match a.kind {
+                AgentBlockKind::ToolCall => n += 1,
+                AgentBlockKind::UserPrompt => break, // the next turn begins
+                _ => {}
+            },
+            Block::Command(_) => break, // a human command ends the turn
+        }
+    }
+    n
+}
+
+/// The color for one tool-result output line (ticket T-9.6): a unified-diff `+` line is
+/// `success`, a `-` line is `danger`; a failing test line ("FAILED") is `danger` and a
+/// passing one ("test result: ok") is `success`; everything else stays `base` (faint).
+/// A whole-line classifier (not per-token), so it is cheap and never mis-highlights a
+/// substring; the leading whitespace is ignored so an indented diff still colors.
+fn diff_line_color(
+    line: &str,
+    base: aterm_tokens::Rgba,
+    success: aterm_tokens::Rgba,
+    danger: aterm_tokens::Rgba,
+) -> aterm_tokens::Rgba {
+    let t = line.trim_start();
+    if t.starts_with('+') || t.contains("test result: ok") {
+        success
+    } else if t.starts_with('-') || t.contains("FAILED") {
+        danger
+    } else {
+        base
     }
 }
 
@@ -669,6 +1018,58 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
                 Some(AgentBadge::Blocked) => 3,
             },
         );
+        // The T-9.6 display fields drive the re-skin but do NOT live in `text` (the
+        // tool row draws name+arg, not the gloss) and are set once at push (version
+        // stays 0), so fold them explicitly or a change would not redraw: the tool
+        // name + sanitized arg, the edit "+A -M" counts, and the assistant-prose role
+        // (plan eyebrow / summary emphasis).
+        if let Some(a) = agent_block {
+            // The kind selects the ENTIRE agent draw (header vs tool row vs result vs
+            // approval, the left-border gate, the grouping/step-count lookahead), so it is
+            // the primary draw-affecting axis - fold it explicitly (the shared gutter code
+            // collapses every agent kind to one value, so it would not otherwise redraw).
+            s = fold_u64(
+                s,
+                match a.kind {
+                    AgentBlockKind::UserPrompt => 1,
+                    AgentBlockKind::Thinking => 2,
+                    AgentBlockKind::AssistantText => 3,
+                    AgentBlockKind::ToolCall => 4,
+                    AgentBlockKind::ToolResult => 5,
+                    AgentBlockKind::Approval => 6,
+                },
+            );
+            if let Some(name) = &a.tool_name {
+                s = fold_u64(s, name.len() as u64);
+                for ch in name.chars() {
+                    s = fold_u64(s, ch as u64);
+                }
+            }
+            if let Some(arg) = &a.tool_arg {
+                s = fold_u64(s, arg.len() as u64);
+                for ch in arg.chars() {
+                    s = fold_u64(s, ch as u64);
+                }
+            }
+            s = fold_u64(
+                s,
+                match a.edit_stats {
+                    None => 0,
+                    Some((added, removed)) => {
+                        1 ^ (u64::from(added) << 8) ^ (u64::from(removed) << 40)
+                    }
+                },
+            );
+            s = fold_u64(
+                s,
+                match a.text_role {
+                    aterm_core::AgentTextRole::Body => 0,
+                    aterm_core::AgentTextRole::Plan => 1,
+                    aterm_core::AgentTextRole::Summary => 2,
+                },
+            );
+            s = fold_u64(s, a.is_error as u64);
+        }
         // Fold the DRAWN CONTENT of each visible row - bounded by the visible rows
         // (~viewport), so it stays cheap - so an in-place redraw (a running command's
         // `\r` progress bar / spinner: row count unchanged, content changed) and a
@@ -799,6 +1200,219 @@ mod sig_tests {
             "meta separator U+{:04X} is .notdef in the bundled Mono Nerd Font",
             META_SEP as u32
         );
+    }
+
+    #[test]
+    fn agent_glyphs_exist_in_the_bundled_grid_font() {
+        // T-9.6/T-9.7: the agent header `◊`, the resolved-gate `✓`/`✕` (as Nerd-Font
+        // PUA icons), and the plan eyebrow + step-meta separator all draw through the
+        // Mono GRID face. A `.notdef` here would draw a box and silently break the
+        // re-skin - the same regression the meta/gutter glyph tests guard. Pure parse.
+        use crate::glyph::GlyphRasterizer;
+        use crate::text::FaceStyle;
+        let r = GlyphRasterizer::new();
+        for glyph in [
+            AGENT_PROMPT_GLYPH,
+            APPROVAL_APPROVED_GLYPH,
+            APPROVAL_REJECTED_GLYPH,
+        ] {
+            assert_ne!(
+                r.glyph_id(FontFamily::Grid, FaceStyle::Regular, glyph),
+                0,
+                "agent glyph U+{:04X} is .notdef in the bundled Mono Nerd Font",
+                glyph as u32
+            );
+        }
+        // The PLAN eyebrow is ASCII; every char must resolve (guards a bad edit).
+        for ch in PLAN_EYEBROW.chars() {
+            assert_ne!(
+                r.glyph_id(FontFamily::Grid, FaceStyle::Regular, ch),
+                0,
+                "plan-eyebrow char {ch:?} is .notdef"
+            );
+        }
+    }
+
+    #[test]
+    fn top_hairline_groups_a_turn_and_frames_only_the_final_summary() {
+        // T-9.6 (+ review fix): the boundary rule frames a TURN, not its steps. It draws
+        // above the `◊` header and the turn's FINAL summary, but NOT above the plan / tool
+        // / result / MID-TURN reflection steps grouped under it. The projector marks EVERY
+        // post-tool paragraph `Summary`, so this exercises the renderer's discrimination:
+        // a mid-turn Summary (another step follows) must NOT be framed; only the last one.
+        use aterm_core::{
+            AgentBlock, AgentBlockKind, AgentTextRole, BlockSegmenter, Mark, PromptKind,
+        };
+        use std::time::Instant;
+        let now = Instant::now();
+        let ai = |kind, role, text: &str| AgentBlock::new(kind, text, now).with_text_role(role);
+        let mut list = aterm_core::BlockList::new();
+        // header, plan, tool, result, MID-summary, tool, result, FINAL-summary.
+        list.push_agent(ai(AgentBlockKind::UserPrompt, AgentTextRole::Body, "req"));
+        list.push_agent(ai(
+            AgentBlockKind::AssistantText,
+            AgentTextRole::Plan,
+            "plan",
+        ));
+        list.push_agent(ai(
+            AgentBlockKind::ToolCall,
+            AgentTextRole::Body,
+            "read_file",
+        ));
+        list.push_agent(ai(AgentBlockKind::ToolResult, AgentTextRole::Body, "out"));
+        list.push_agent(ai(
+            AgentBlockKind::AssistantText,
+            AgentTextRole::Summary,
+            "mid",
+        ));
+        list.push_agent(ai(
+            AgentBlockKind::ToolCall,
+            AgentTextRole::Body,
+            "edit_file",
+        ));
+        list.push_agent(ai(AgentBlockKind::ToolResult, AgentTextRole::Body, "diff"));
+        list.push_agent(ai(
+            AgentBlockKind::AssistantText,
+            AgentTextRole::Summary,
+            "final",
+        ));
+        // A trailing human command (a real turn boundary below the final summary).
+        let mut seg = BlockSegmenter::new();
+        seg.apply(&Mark::Prompt(PromptKind::PromptStart), 0, &mut list);
+        seg.apply(&Mark::Prompt(PromptKind::OutputStart), 1, &mut list);
+        seg.apply(
+            &Mark::Prompt(PromptKind::CommandDone { exit_code: Some(0) }),
+            3,
+            &mut list,
+        );
+
+        let vis = layout(&list, false, Scroll::default(), 60).visible;
+        assert_eq!(vis.len(), 9, "all 8 agent steps + 1 command visible");
+        // Framed (a rule above): the header (0), the FINAL summary (7), the command (8).
+        for i in [0usize, 7, 8] {
+            assert!(
+                block_draws_top_hairline(&vis, i),
+                "block {i} must be framed"
+            );
+        }
+        // Grouped (no rule): plan (1), tool (2), result (3), MID-summary (4), tool (5),
+        // result (6).
+        for i in [1usize, 2, 3, 4, 5, 6] {
+            assert!(
+                !block_draws_top_hairline(&vis, i),
+                "block {i} is intra-turn and must NOT be framed"
+            );
+        }
+        // The discrimination the fix turns on: block 4 is a mid-turn Summary (not final),
+        // block 7 is the final Summary.
+        assert!(
+            !is_final_summary(&vis, 4),
+            "a mid-turn Summary is not the final one"
+        );
+        assert!(
+            is_final_summary(&vis, 7),
+            "the last post-tool prose IS the summary"
+        );
+    }
+
+    #[test]
+    fn agent_palette_maps_each_role_to_its_token_in_both_themes() {
+        // T-9.6 AC2: the per-kind colors resolve through tokens (no literals). Asserting
+        // the palette's token identities in both themes is the noise-immune replacement
+        // for the offscreen test's any_ink (which cannot tell purple from grey).
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            let theme = *Theme::for_kind(kind);
+            let c = &theme.colors;
+            let p = AgentPalette::resolve(&theme);
+            assert_eq!(
+                p.header,
+                c.mode_accent(Mode::Agent),
+                "{kind:?} header = agent accent"
+            );
+            assert_eq!(
+                p.tool_name, c.accent_primary,
+                "{kind:?} tool name = accent primary"
+            );
+            assert_eq!(p.emphasis, c.fg_primary, "{kind:?} emphasis = fg.primary");
+            assert_eq!(p.prose, c.fg_secondary, "{kind:?} prose = fg.secondary");
+            assert_eq!(p.faint, c.fg_muted, "{kind:?} faint = fg.muted");
+            assert_eq!(p.add, c.success, "{kind:?} add = success");
+            assert_eq!(p.remove, c.danger, "{kind:?} remove = danger");
+        }
+    }
+
+    #[test]
+    fn turn_step_count_counts_tool_calls_until_the_turn_ends() {
+        // T-9.6: the header meta counts the turn's tool calls among the visible blocks,
+        // stopping at the next turn (a UserPrompt) or a human command block.
+        use aterm_core::{AgentBlock, AgentBlockKind, Block};
+        use std::time::Instant;
+        let now = Instant::now();
+        let ab = |kind| Block::Agent(AgentBlock::new(kind, "x", now));
+        // header, plan, 3 tool calls (with results), summary, THEN a new turn.
+        let mut blocks = vec![
+            ab(AgentBlockKind::UserPrompt),
+            ab(AgentBlockKind::AssistantText),
+            ab(AgentBlockKind::ToolCall),
+            ab(AgentBlockKind::ToolResult),
+            ab(AgentBlockKind::ToolCall),
+            ab(AgentBlockKind::ToolResult),
+            ab(AgentBlockKind::ToolCall),
+            ab(AgentBlockKind::AssistantText),
+            ab(AgentBlockKind::UserPrompt), // next turn: must NOT be counted
+            ab(AgentBlockKind::ToolCall),
+        ];
+        let list = {
+            let mut l = aterm_core::BlockList::new();
+            for b in blocks.drain(..) {
+                match b {
+                    Block::Agent(a) => {
+                        l.push_agent(a);
+                    }
+                    Block::Command(_) => unreachable!(),
+                }
+            }
+            l
+        };
+        let lay = layout(&list, false, Scroll::default(), 40);
+        // The first turn's header is visible block 0; it has 3 tool calls.
+        assert_eq!(turn_step_count(&lay.visible, 0), 3);
+        // The second turn's header (visible index 8) has 1 tool call after it.
+        assert_eq!(turn_step_count(&lay.visible, 8), 1);
+    }
+
+    #[test]
+    fn diff_line_color_maps_diff_and_test_lines() {
+        let base = aterm_tokens::Rgba {
+            r: 1,
+            g: 1,
+            b: 1,
+            a: 255,
+        };
+        let ok = aterm_tokens::Rgba {
+            r: 2,
+            g: 2,
+            b: 2,
+            a: 255,
+        };
+        let bad = aterm_tokens::Rgba {
+            r: 3,
+            g: 3,
+            b: 3,
+            a: 255,
+        };
+        assert_eq!(diff_line_color("+ added line", base, ok, bad), ok);
+        assert_eq!(diff_line_color("-  removed", base, ok, bad), bad);
+        assert_eq!(diff_line_color("  + indented add", base, ok, bad), ok);
+        assert_eq!(
+            diff_line_color("test result: ok. 3 passed", base, ok, bad),
+            ok
+        );
+        assert_eq!(
+            diff_line_color("test result: FAILED. 1", base, ok, bad),
+            bad
+        );
+        assert_eq!(diff_line_color("plain output", base, ok, bad), base);
     }
 
     #[test]
@@ -1065,6 +1679,82 @@ mod sig_tests {
         ] {
             assert_ne!(a, b, "a badge change must invalidate the gate: {what}");
         }
+    }
+
+    #[test]
+    fn agent_kind_invalidates_the_damage_gate() {
+        // T-9.6 (review fix): the kind selects the entire Agent draw, so it must be folded
+        // - two blocks identical in every other folded field but differing in kind must
+        // produce different signatures (else a re-typed slot would render stale).
+        use aterm_core::{AgentBlock, AgentBlockKind};
+        use std::time::Instant;
+        let now = Instant::now();
+        let sig = |kind| {
+            let mut list = aterm_core::BlockList::new();
+            list.push_agent(AgentBlock::new(kind, "x", now).with_tool_use_id("t1"));
+            signature(
+                &layout(&list, false, Scroll::default(), 20),
+                800,
+                600,
+                13,
+                &dark(),
+            )
+        };
+        for (a, b) in [
+            (AgentBlockKind::UserPrompt, AgentBlockKind::Thinking),
+            (AgentBlockKind::AssistantText, AgentBlockKind::ToolCall),
+            (AgentBlockKind::ToolResult, AgentBlockKind::Approval),
+        ] {
+            assert_ne!(
+                sig(a),
+                sig(b),
+                "a kind change ({a:?} vs {b:?}) must invalidate the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn t9_6_display_fields_invalidate_the_damage_gate() {
+        // T-9.6 (review fix): tool_name / tool_arg / edit_stats / text_role are drawn but
+        // do NOT live in `text` and are set once at push (version 0), so they can only be
+        // caught by their explicit fold. Two blocks differing in exactly one must differ.
+        use aterm_core::{AgentBlock, AgentBlockKind, AgentTextRole};
+        use std::time::Instant;
+        let now = Instant::now();
+        let sig = |b: AgentBlock| {
+            let mut list = aterm_core::BlockList::new();
+            list.push_agent(b);
+            signature(
+                &layout(&list, false, Scroll::default(), 20),
+                800,
+                600,
+                13,
+                &dark(),
+            )
+        };
+        let call = || AgentBlock::new(AgentBlockKind::ToolCall, "x", now).with_tool_use_id("t1");
+        assert_ne!(
+            sig(call().with_tool_display("read_file", None)),
+            sig(call().with_tool_display("edit_file", None)),
+            "a tool_name change must invalidate the gate"
+        );
+        assert_ne!(
+            sig(call().with_tool_display("read_file", Some("a.rs".into()))),
+            sig(call().with_tool_display("read_file", Some("b.rs".into()))),
+            "a tool_arg change must invalidate the gate"
+        );
+        assert_ne!(
+            sig(call().with_edit_stats(1, 1)),
+            sig(call().with_edit_stats(2, 1)),
+            "an edit_stats change must invalidate the gate"
+        );
+        let text =
+            |role| AgentBlock::new(AgentBlockKind::AssistantText, "x", now).with_text_role(role);
+        assert_ne!(
+            sig(text(AgentTextRole::Plan)),
+            sig(text(AgentTextRole::Summary)),
+            "a text_role change must invalidate the gate"
+        );
     }
 }
 
@@ -1469,5 +2159,133 @@ mod gpu_tests {
             !tl.prepare(&device, &queue, &mut atlas, &el, 0.0, &theme, size),
             "an empty timeline draws nothing"
         );
+    }
+
+    /// A multi-step agent turn (ticket T-9.6 AC4): a `◊` header, a PLAN, a read + an
+    /// edit (with "+A -M") + a run, each with a result, and a final SUMMARY - the mock's
+    /// `agent` state, built through the real `push_agent` path.
+    fn agent_turn() -> aterm_core::BlockList {
+        use aterm_core::{AgentBlock, AgentBlockKind, AgentTextRole};
+        use std::time::Instant;
+        let now = Instant::now();
+        let mut list = aterm_core::BlockList::new();
+        list.push_agent(AgentBlock::new(
+            AgentBlockKind::UserPrompt,
+            "fix the failing block-render test",
+            now,
+        ));
+        list.push_agent(
+            AgentBlock::new(
+                AgentBlockKind::AssistantText,
+                "Read the failing test, then patch the hairline logic.",
+                now,
+            )
+            .with_text_role(AgentTextRole::Plan),
+        );
+        list.push_agent(
+            AgentBlock::new(AgentBlockKind::ToolCall, "read_file (auto)", now)
+                .with_tool_use_id("t1")
+                .with_tool_display("read_file", Some("src/render/blocks.rs".to_string()))
+                .with_badge(AgentBadge::Auto),
+        );
+        list.push_agent(
+            AgentBlock::new(AgentBlockKind::ToolResult, "fn draw(&self) { ... }", now)
+                .with_tool_use_id("t1"),
+        );
+        list.push_agent(
+            AgentBlock::new(AgentBlockKind::ToolCall, "edit_file (needs approval)", now)
+                .with_tool_use_id("t2")
+                .with_tool_display("edit_file", Some("src/render/blocks.rs".to_string()))
+                .with_edit_stats(1, 1)
+                .with_badge(AgentBadge::NeedsApproval),
+        );
+        list.push_agent(
+            AgentBlock::new(
+                AgentBlockKind::ToolResult,
+                "-        self.hairline(b.top);\n+        if i > 0 { self.hairline(b.top); }",
+                now,
+            )
+            .with_tool_use_id("t2"),
+        );
+        list.push_agent(
+            AgentBlock::new(AgentBlockKind::ToolCall, "run_command (auto)", now)
+                .with_tool_use_id("t3")
+                .with_tool_display("run_command", Some("cargo test render::blocks".to_string()))
+                .with_badge(AgentBadge::Auto),
+        );
+        list.push_agent(
+            AgentBlock::new(
+                AgentBlockKind::ToolResult,
+                "test result: ok. 3 passed; 0 failed",
+                now,
+            )
+            .with_tool_use_id("t3"),
+        );
+        list.push_agent(
+            AgentBlock::new(
+                AgentBlockKind::AssistantText,
+                "Fixed. Guarded the hairline with i > 0; all three tests pass.",
+                now,
+            )
+            .with_text_role(AgentTextRole::Summary),
+        );
+        list
+    }
+
+    #[test]
+    fn agent_turn_reskin_inks_in_both_themes() {
+        // T-9.6 AC1/AC4: the full turn (header + plan + tool rows + diff results +
+        // summary) renders in BOTH themes. The exact per-kind token colors are asserted by
+        // the pure `agent_palette_maps_each_role_to_its_token_in_both_themes`; here we
+        // prove the whole turn actually inks on screen (any_ink cannot tell the tokens
+        // apart) and stays a single glyph draw call (T-1.8), in both themes.
+        let Some((device, queue, format)) = device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (_cw, ch) = cell_px(SCALE);
+        let top = f32::from(space::S12) * SCALE;
+        let edge = f32::from(space::S8) * SCALE;
+        // 9 steps, each 1 content row + a gap between -> ~17 gapped rows; give headroom.
+        let (w, h) = (420u32, (top + 26.0 * ch) as u32);
+
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            let theme = *Theme::for_kind(kind);
+            let mut atlas = GlyphAtlas::new(&device, format);
+            let mut tl = TimelineRenderer::new(&device);
+            let blocks = agent_turn();
+            let l = layout(&blocks, false, Scroll::default(), 30);
+            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, &theme, w, h);
+
+            // The `◊` header glyph inks in the gutter marker band on the top row.
+            let gutter_w = f32::from(space::S4) * SCALE;
+            assert!(
+                rb.any_ink(
+                    edge as u32,
+                    top as u32,
+                    (edge + gutter_w) as u32,
+                    (top + ch) as u32,
+                    40
+                ),
+                "{kind:?}: the agent header glyph inks in the gutter band"
+            );
+            // The turn's body inks across the content column somewhere below the header.
+            let content_x = edge + gutter_w + f32::from(space::S4) * SCALE;
+            assert!(
+                rb.any_ink(
+                    content_x as u32,
+                    (top + ch) as u32,
+                    (w as f32 - edge) as u32,
+                    (top + 18.0 * ch) as u32,
+                    40
+                ),
+                "{kind:?}: the turn's plan / tool / result / summary rows ink"
+            );
+            assert_eq!(
+                tl.last_glyph_draw_calls(),
+                1,
+                "{kind:?}: the whole agent turn is ONE glyph draw call"
+            );
+        }
     }
 }

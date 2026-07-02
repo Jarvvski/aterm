@@ -22,8 +22,8 @@ pub mod terminal;
 
 // Re-export the load-bearing public types at the crate root for ergonomics.
 pub use block::{
-    AgentBadge, AgentBlock, AgentBlockKind, Block, BlockList, BlockSegmenter, CommandBlock,
-    HeightIndex, HeuristicSegmenter, OutputSpan, RowSnapshot, COLLAPSED_OUTPUT_ROWS,
+    AgentBadge, AgentBlock, AgentBlockKind, AgentTextRole, Block, BlockList, BlockSegmenter,
+    CommandBlock, HeightIndex, HeuristicSegmenter, OutputSpan, RowSnapshot, COLLAPSED_OUTPUT_ROWS,
 };
 pub use completion::{
     fuzzy_match, rank, Completion, CompletionItem, FuzzyMatch, DEFAULT_COMPLETION_LIMIT,

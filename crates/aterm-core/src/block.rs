@@ -220,6 +220,26 @@ pub enum AgentBlockKind {
     Approval,
 }
 
+/// The narrative role of an [`AgentBlockKind::AssistantText`] step within its turn
+/// (ticket T-9.6), so the renderer styles the vision mock's uppercase PLAN eyebrow and
+/// the final SUMMARY WITHOUT scanning sibling blocks (that would break the
+/// O(visible-rows) virtualization the timeline guarantees). The projector - which sees a
+/// turn's steps in order - sets it: the first assistant prose BEFORE any tool call is the
+/// [`Plan`](AgentTextRole::Plan); prose AFTER a tool has run reads as a reflective
+/// [`Summary`](AgentTextRole::Summary); anything else stays [`Body`](AgentTextRole::Body).
+/// It is agent-domain-free (a pure render hint), like [`AgentBadge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentTextRole {
+    /// Ordinary assistant prose (the default): no eyebrow, no summary emphasis.
+    #[default]
+    Body,
+    /// The turn's opening plan (first prose, before any tool call): an uppercase
+    /// "plan" eyebrow above de-emphasized prose.
+    Plan,
+    /// A closing reflection after tools ran: emphasized (`fg.primary`) prose.
+    Summary,
+}
+
 /// The agent-domain-FREE risk-gate verdict a tool-call step carries for the
 /// timeline badge (ticket T-5.11). Mirrors the three risk-gate badge states
 /// (`07-ia-design-language.md` §5) WITHOUT naming `aterm-agent`'s `Risk` /
@@ -267,6 +287,22 @@ pub struct AgentBlock {
     /// `aterm-agent` sets it via [`with_badge`](AgentBlock::with_badge); the
     /// renderer maps it to a chip without ever naming an agent type.
     pub badge: Option<AgentBadge>,
+    /// For a [`ToolCall`](AgentBlockKind::ToolCall): the bare tool name (e.g.
+    /// "read_file"), drawn in the accent color (ticket T-9.6). `None` for other kinds
+    /// (and for a call whose arguments did not parse, where only `text` is set).
+    pub tool_name: Option<String>,
+    /// For a [`ToolCall`](AgentBlockKind::ToolCall): the SANITIZED argument (a path, or
+    /// the redacted argv) drawn faint beside the name (ticket T-9.6). Always run through
+    /// the `OutputSanitizer` upstream so a secret value can never reach the renderer -
+    /// the same discipline as `text` (this type never sees a raw secret).
+    pub tool_arg: Option<String>,
+    /// For an `edit_file` [`ToolCall`](AgentBlockKind::ToolCall): the `(added, removed)`
+    /// line counts drawn as a right-aligned "+N -M" (ticket T-9.6). `None` otherwise.
+    pub edit_stats: Option<(u32, u32)>,
+    /// For an [`AssistantText`](AgentBlockKind::AssistantText): its narrative role in the
+    /// turn (ticket T-9.6), driving the PLAN eyebrow / SUMMARY emphasis. `Body` for
+    /// every other kind.
+    pub text_role: AgentTextRole,
 }
 
 impl AgentBlock {
@@ -281,7 +317,36 @@ impl AgentBlock {
             is_error: false,
             version: 0,
             badge: None,
+            tool_name: None,
+            tool_arg: None,
+            edit_stats: None,
+            text_role: AgentTextRole::Body,
         }
+    }
+
+    /// Attach the tool-call display name + its already-SANITIZED argument (ticket
+    /// T-9.6; chainable). Set by `aterm-agent` when projecting a `ToolCall` step so the
+    /// renderer can draw the mock's "name (accent)  arg (faint)" row. `arg` MUST have
+    /// been passed through the `OutputSanitizer` by the caller.
+    #[must_use]
+    pub fn with_tool_display(mut self, name: impl Into<String>, arg: Option<String>) -> Self {
+        self.tool_name = Some(name.into());
+        self.tool_arg = arg;
+        self
+    }
+
+    /// Attach `edit_file` line stats `(added, removed)` (ticket T-9.6; chainable).
+    #[must_use]
+    pub fn with_edit_stats(mut self, added: u32, removed: u32) -> Self {
+        self.edit_stats = Some((added, removed));
+        self
+    }
+
+    /// Set an assistant-prose step's narrative role (ticket T-9.6; chainable).
+    #[must_use]
+    pub fn with_text_role(mut self, role: AgentTextRole) -> Self {
+        self.text_role = role;
+        self
     }
 
     /// Attach the `tool_use_id` join key (chainable).

@@ -397,6 +397,43 @@ impl ToolInput {
             | ToolInput::Mcp(_) => false,
         }
     }
+
+    /// The one-line display ARGUMENT for the timeline tool-call row (ticket T-9.6): a
+    /// path for the file tools, the joined argv for `run_command`, the pattern for
+    /// `glob`/`grep`, `server/name` for an MCP tool. This is the RAW argument; the caller
+    /// MUST pass it through the `OutputSanitizer` before it reaches the renderer (a
+    /// `run_command` argv or a grep pattern can carry a secret). Returns `None` when
+    /// there is nothing terse to show.
+    #[must_use]
+    pub fn display_arg(&self) -> Option<String> {
+        let arg = match self {
+            ToolInput::RunCommand(c) => c.command.join(" "),
+            ToolInput::ReadFile(f) => f.path.clone(),
+            ToolInput::EditFile(f) => f.path.clone(),
+            ToolInput::WriteFile(f) => f.path.clone(),
+            ToolInput::ListDir(d) => d.path.clone(),
+            ToolInput::Glob(g) => g.pattern.clone(),
+            ToolInput::Grep(g) => g.pattern.clone(),
+            ToolInput::Mcp(m) => format!("{}/{}", m.server, m.name),
+        };
+        (!arg.is_empty()).then_some(arg)
+    }
+
+    /// The `(added, removed)` line counts an `edit_file` proposes (ticket T-9.6),
+    /// countable at call time from the replacement: the new text's line count is
+    /// "added", the matched text's is "removed". `None` for every other tool (the mock
+    /// shows "+N -M" only on `edit_file`).
+    #[must_use]
+    pub fn edit_stats(&self) -> Option<(u32, u32)> {
+        match self {
+            ToolInput::EditFile(e) => {
+                let added = e.new_str.lines().count() as u32;
+                let removed = e.old_str.lines().count() as u32;
+                Some((added, removed))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Why a [`ToolCall`] could not be turned into a typed [`ToolInput`].
@@ -560,6 +597,68 @@ mod tests {
             name: name.to_string(),
             input,
         }
+    }
+
+    // ---- T-9.6 timeline display fields (arg + edit stats) ----
+
+    #[test]
+    fn display_arg_is_the_terse_argument_per_tool() {
+        // The timeline tool-call row shows a path for file tools, the joined argv for
+        // run_command, the pattern for glob/grep. (The caller sanitizes it before it is
+        // shown - see the projector test that a secret in an argv is redacted.)
+        let cases = [
+            (
+                ToolKind::RunCommand,
+                json!({ "command": ["cargo", "test", "--all"] }),
+                "cargo test --all",
+            ),
+            (
+                ToolKind::ReadFile,
+                json!({ "path": "src/main.rs" }),
+                "src/main.rs",
+            ),
+            (
+                ToolKind::EditFile,
+                json!({ "path": "a.rs", "old_str": "x", "new_str": "y" }),
+                "a.rs",
+            ),
+            (ToolKind::ListDir, json!({ "path": "." }), "."),
+            (ToolKind::Glob, json!({ "pattern": "**/*.rs" }), "**/*.rs"),
+            (
+                ToolKind::Grep,
+                json!({ "pattern": "TODO", "path": "src" }),
+                "TODO",
+            ),
+        ];
+        for (kind, input, want) in cases {
+            let parsed = kind.parse_input(&input).expect("parses");
+            assert_eq!(parsed.display_arg().as_deref(), Some(want), "{kind:?}");
+        }
+
+        // A call whose terse arg is empty (empty argv / empty path) yields None, so the
+        // renderer skips the faint arg run entirely (its `if let Some(arg)` guard).
+        let empty_argv = ToolKind::RunCommand
+            .parse_input(&json!({ "command": [] }))
+            .expect("empty argv parses");
+        assert_eq!(empty_argv.display_arg(), None, "empty argv -> no arg");
+        let empty_path = ToolKind::ReadFile
+            .parse_input(&json!({ "path": "" }))
+            .expect("empty path parses");
+        assert_eq!(empty_path.display_arg(), None, "empty path -> no arg");
+    }
+
+    #[test]
+    fn edit_stats_counts_only_for_edit_file() {
+        // edit_file reports (added, removed) from the replacement text's line counts,
+        // countable at call time; every other tool reports none.
+        let edit = ToolKind::EditFile
+            .parse_input(&json!({ "path": "a", "old_str": "one\ntwo", "new_str": "1\n2\n3" }))
+            .expect("parses");
+        assert_eq!(edit.edit_stats(), Some((3, 2)));
+        let read = ToolKind::ReadFile
+            .parse_input(&json!({ "path": "a" }))
+            .expect("parses");
+        assert_eq!(read.edit_stats(), None);
     }
 
     // ---- schema shape (AC: valid JSON Schema, strict-compatible) ----
