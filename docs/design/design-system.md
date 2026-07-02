@@ -318,9 +318,11 @@ One human-entered command and its output (the mock's `shell` state; T-9.3).
   mode accent), not a status icon - the status moves to the block-meta.
 - **Block-meta** (right-aligned, `type.caption`, `fg.muted`): a status dot +
   duration. The mock reveals it on block hover; the `focus dim` slot (§6, not a
-  fourth animation) is reserved for that fade, but - like every other animation
-  today - it is not yet time-driven, so the meta currently renders always-on
-  (hover-gating lands with the frame clock + pointer plumbing).
+  fourth animation) is reserved for that fade. As of T-9.8 (pointer plumbing) the
+  meta is HOVER-GATED - hidden until the pointer is over its block, matching the
+  mock's `.block-meta { opacity:0 }` / `.block:hover { opacity:1 }`. The fade
+  itself is still not time-driven (the per-frame tween is EPIC-wide motion work);
+  the reveal is a hard show/hide for now.
   - running → pulsing `accent.primary` dot + "running";
   - exit 0 → `fg.muted` dot + duration (a longer run, ≥ ~1s, earns the loud
     `success` dot);
@@ -436,7 +438,23 @@ per-pattern "`rm -rf …`" copy is a cosmetic label, the widening is tier-scoped
 `⏎` hint symbol is spelled "enter" (also `.notdef` in the Mono face). Resolved
 states render as timeline `Approval` blocks (`✓ Approved` / `✕ Rejected`), not in
 the overlay. The card is one rect + one glyph draw, damage-gated alloc-free so a
-parked frame holds the 60fps floor.
+parked frame holds the 60fps floor. While the card is parked it is MODAL to the
+pointer too (T-9.8): the hit map is emptied so no click reaches a control behind
+it, and the hover treatments clear (nothing behind the modal reads as clickable).
+
+### Pointer & hover (T-9.8)
+
+The app has a mouse pointer. A pure `HitMap` (physical px, topmost/last-inserted
+wins) maps a pointer position to a `HitTarget`; each front-end caches its clickable
+rects and folds a hover discriminant into its damage signature. Hover treatments
+follow the mock's `:hover` idioms - the title-bar sidebar glyph brightens to
+`fg.primary`, the mode pill lifts to a stronger accent tint, a completion row takes
+the neutral `hairline` tint, and the command block-meta is revealed (above). A hover
+change repaints exactly once; a steady hover allocates nothing and forces no redraw
+(the T-1.8 floor). A click is a left press-then-release on the same target and drives
+the SAME intent as the keyboard equivalent (sidebar == `Cmd-B`, chip == `Cmd-/`, a
+completion row == `Enter`) - never a second, divergent action route. The pointer
+turns into a hand over a clickable target.
 
 ### Shell-integration indicator (3-state)
 

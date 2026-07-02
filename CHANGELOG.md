@@ -13,6 +13,14 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The mouse works now - hover and click affordances.** aterm tracked only keys and the
+  scroll wheel; it now has a pointer. Hovering the title-bar sidebar glyph brightens it, the
+  mode pill lifts its tint, a completion row tints under the cursor, and a command block reveals
+  its status/duration meta on hover (it now stays hidden until you point at it, matching the
+  mock). Clicking drives the exact same intent as the keyboard: the sidebar glyph == `Cmd-B`,
+  the mode pill == `Cmd-/`, a completion row == selecting it and pressing `Enter`. The pointer
+  turns into a hand over anything clickable. While a risk-gate approval is pending, the card is
+  modal to the mouse too - no click can slip through to a control behind it. (Ticket T-9.8.)
 - **A risk-gate approval card (the vision-mock `gate` state).** When the agent proposes a
   command the safety gate can't auto-run, a caution-bordered card now floats over the input:
   the proposed command (the argument always run through the secret redactor first), a `△` with

@@ -23,8 +23,8 @@ use aterm_core::{
     Snapshot, DEFAULT_SCROLLBACK,
 };
 use aterm_ui::{
-    ApprovalView, ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker, RiskState,
-    TitleBarView, UiCallbacks, Window, DEFAULT_DEBOUNCE,
+    ApprovalView, HitTarget, ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker,
+    RiskState, TitleBarView, UiCallbacks, Window, DEFAULT_DEBOUNCE,
 };
 
 use aterm_core::{
@@ -257,6 +257,27 @@ impl Session {
             if self.sidebar_open { "open" } else { "closed" }
         );
         self.sidebar_open
+    }
+
+    /// Flip ONLY the routing mode (ticket T-3.3); text/selection/undo are preserved by the
+    /// [`InputModel`] reducer. The single home of the mode-toggle effect, driven by BOTH the
+    /// `Cmd-/` chord ([`Disposition::ToggleMode`]) and the mode-chip pointer click
+    /// ([`aterm_ui::HitTarget::ModeChip`], T-9.8), so the two routes stay identical. It also
+    /// recomputes the mode-aware overlay at once (no debounce flicker of the old mode) and
+    /// re-ranks an open completion popover for the new mode-scoped history lens.
+    fn toggle_mode(&mut self) {
+        self.input.reduce(InputEvent::ToggleMode);
+        // The overlay is mode-aware (Shell highlights + suggests; Agent is prose):
+        // recompute at once so the toggle re-styles without a debounce lag or a flicker of
+        // the old mode's overlay (ticket T-3.5 AC4).
+        self.request_overlay(true);
+        // The completion history lens is mode-scoped, so a mode flip changes the candidate
+        // set: re-rank an open popover so it never shows stale wrong-scope candidates (T-9.5;
+        // `refresh` closes it if nothing matches the new scope).
+        if self.completion.is_open() {
+            let items = self.completion_candidates();
+            self.completion.refresh(items);
+        }
     }
 
     /// Rank the shell history against the current input line into completion candidates
@@ -989,20 +1010,10 @@ impl UiCallbacks for Session {
             // catches any raw key that still arrives mid-composition (notably Enter, so
             // it confirms the candidate instead of submitting - the Zed #23003 trap).
             Disposition::ImeComposing => None,
-            // The hotkey flips ONLY the mode; text/selection/undo preserved (T-3.1).
+            // The hotkey flips ONLY the mode; text/selection/undo preserved (T-3.1). Same
+            // effect as the mode-chip pointer click (T-9.8), via the shared `toggle_mode`.
             Disposition::ToggleMode => {
-                self.input.reduce(InputEvent::ToggleMode);
-                // The overlay is mode-aware (Shell highlights + suggests; Agent is prose):
-                // recompute at once so the toggle re-styles without a debounce lag or a
-                // flicker of the old mode's overlay (ticket T-3.5 AC4).
-                self.request_overlay(true);
-                // The completion history lens is mode-scoped, so a mode flip changes the
-                // candidate set: re-rank an open popover so it never shows stale wrong-scope
-                // candidates (T-9.5; `refresh` closes it if nothing matches the new scope).
-                if self.completion.is_open() {
-                    let items = self.completion_candidates();
-                    self.completion.refresh(items);
-                }
+                self.toggle_mode();
                 None
             }
             // Interrupt the in-flight turn (Esc): cancel it and fail-closed deny any
@@ -1102,6 +1113,32 @@ impl UiCallbacks for Session {
             self.engine.send_input(b.clone());
         }
         bytes
+    }
+
+    fn on_click(&mut self, target: HitTarget) {
+        // Pointer click dispatch (ticket T-9.8): each target routes to the SAME intent as its
+        // keyboard equivalent - no new action semantics. The renderer already suppresses all
+        // targets while a risk-gate approval is parked (a modal), so a click can never bypass
+        // a pending safety decision here.
+        match target {
+            // The title-bar sidebar glyph == `Cmd-B`.
+            HitTarget::SidebarToggle => {
+                self.toggle_sidebar();
+            }
+            // The mode pill == `Cmd-/`.
+            HitTarget::ModeChip => {
+                self.toggle_mode();
+            }
+            // A completion row == arrowing to it + `Enter`: activate that row, then accept.
+            HitTarget::CompletionRow(i) => {
+                if self.completion.is_open() {
+                    self.completion.set_index(i);
+                    self.accept_completion();
+                }
+            }
+            // The block-meta hover region has no click action yet (hover-reveal only, T-9.8).
+            HitTarget::BlockMeta(_) => {}
+        }
     }
 
     fn on_ime(&mut self, event: ImeEvent) {
@@ -1416,5 +1453,115 @@ mod tests {
             gate_key_intent(&char_key('c'), false),
             GateKeyIntent::Consume
         );
+    }
+
+    // --- T-9.8 pointer click == keyboard intent ------------------------------
+    //
+    // A completed click drives the SAME intent as its keyboard equivalent. These spawn a
+    // real Session (PTY + agent runtime), so they are macOS-gated like the other PTY tests
+    // and skip gracefully if a login shell cannot spawn (a constrained sandbox), never
+    // failing spuriously.
+
+    /// A `Cmd`-modified character chord (e.g. `Cmd-B` / `Cmd-/`), for the chord side of the
+    /// click/keyboard equivalence checks.
+    #[cfg(target_os = "macos")]
+    fn cmd_char(ch: char) -> KeyPress<'static> {
+        KeyPress {
+            named: None,
+            ch: Some(ch),
+            text: None,
+            mods: aterm_ui::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clicking_the_sidebar_glyph_matches_cmd_b() {
+        let Ok(mut s) = Session::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        assert!(!s.sidebar_open, "sidebar starts closed");
+        // The pointer click flips the intent...
+        s.on_click(HitTarget::SidebarToggle);
+        assert!(s.sidebar_open, "a sidebar-glyph click opens it (== Cmd-B)");
+        // ...and the Cmd-B chord flips it back the same way.
+        s.on_key(cmd_char('b'));
+        assert!(!s.sidebar_open, "Cmd-B toggles it, identical to the click");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clicking_the_mode_chip_matches_cmd_slash_and_preserves_text() {
+        let Ok(mut s) = Session::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        s.input.reduce(InputEvent::Insert("keep me".to_string()));
+        let start = s.input.mode();
+        // The chip click flips ONLY the mode; the typed text is preserved (T-3.1).
+        s.on_click(HitTarget::ModeChip);
+        assert_ne!(
+            s.input.mode(),
+            start,
+            "a chip click toggles the mode (== Cmd-/)"
+        );
+        assert_eq!(
+            s.input.text(),
+            "keep me",
+            "the toggle preserves the typed text"
+        );
+        // Cmd-/ flips it back to the start mode - identical to the click.
+        s.on_key(cmd_char('/'));
+        assert_eq!(
+            s.input.mode(),
+            start,
+            "Cmd-/ toggles it, identical to the click"
+        );
+        assert_eq!(s.input.text(), "keep me");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clicking_a_completion_row_selects_and_accepts_it() {
+        let Ok(mut s) = Session::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        // Open the popover with three candidates (active row 0).
+        let items = vec![
+            CompletionItem {
+                text: "git status".to_string(),
+                desc: String::new(),
+                hits: vec![false; "git status".chars().count()],
+                score: 0,
+            },
+            CompletionItem {
+                text: "git commit".to_string(),
+                desc: String::new(),
+                hits: vec![false; "git commit".chars().count()],
+                score: 0,
+            },
+            CompletionItem {
+                text: "cargo build".to_string(),
+                desc: String::new(),
+                hits: vec![false; "cargo build".chars().count()],
+                score: 0,
+            },
+        ];
+        s.completion.open_with(items);
+        assert_eq!(s.completion.index(), 0, "opens at the top row");
+        // Clicking row 2 selects AND accepts it (== arrowing to row 2 then Enter): the line
+        // becomes that candidate and the popover closes.
+        s.on_click(HitTarget::CompletionRow(2));
+        assert_eq!(
+            s.input.text(),
+            "cargo build",
+            "the clicked row fills the line"
+        );
+        assert!(!s.completion.is_open(), "accepting closes the popover");
     }
 }

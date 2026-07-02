@@ -55,14 +55,15 @@
 
 use std::mem::size_of;
 
-use aterm_tokens::{space, type_scale, Mode, Rgba, Theme};
+use aterm_tokens::{legible_against, space, type_scale, Mode, Rgba, Theme};
 
 use aterm_core::{Highlight, InputMode, InputModel, Preedit, Selection, SpanKind};
 
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
-use crate::components::{AutonomyChip, AutonomyMode, PromptChip, PromptMode};
+use crate::components::{AutonomyChip, AutonomyMode, PromptChip, PromptMode, CHIP_MIN_CONTRAST};
 use crate::grid_render::{FrameSize, INSET_LOGICAL};
+use crate::hit::{HitRect, HitTarget};
 use crate::prose::ProseShaper;
 use crate::text::{FaceStyle, FontFamily, GlyphKey, GridCell};
 use crate::window::cell_px;
@@ -71,6 +72,26 @@ use crate::window::cell_px;
 /// scrolls vertically to keep the caret's line in view. Bounds the zone height so a huge
 /// paste cannot eat the whole window (and bounds the per-frame layout cost).
 const MAX_INPUT_ROWS: u16 = 6;
+
+/// How far the mode accent is pulled toward the canvas for the mode chip's HOVER fill
+/// (ticket T-9.8): `0.74` -> ~26% accent, a clearly stronger tint than the rest chip's
+/// ~13% (`PromptChip`'s `MODE_CHIP_TINT_T`), so the pill visibly "lifts" under the pointer
+/// while staying a tint (never solid). The hover text is re-nudged for legibility on it.
+const MODE_CHIP_HOVER_TINT_T: f32 = 0.74;
+
+/// Per-channel sRGB blend `c -> bg` by `t` (`0.0` keeps `c`, `1.0` is `bg`), alpha from `c`.
+/// A local twin of the components `mix`, used for the mode chip's stronger hover fill
+/// (ticket T-9.8) - tints/remaps are a render concern, not a token edit (design-system §3).
+fn blend_to(c: Rgba, bg: Rgba, t: f32) -> Rgba {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Rgba {
+        r: f(c.r, bg.r),
+        g: f(c.g, bg.g),
+        b: f(c.b, bg.b),
+        a: c.a,
+    }
+}
 
 /// Caret width in logical px (the iA "thin 2px caret"); scaled to physical px at draw.
 const CARET_WIDTH_LOGICAL: f32 = 2.0;
@@ -485,6 +506,10 @@ pub struct InputWidgetRenderer {
     /// part of the signature, so a stale value only survives while the caret has not
     /// moved.
     last_caret_px: Option<[f32; 4]>,
+    /// The mode PILL chip's clickable region in physical px (ticket T-9.8), cached on the
+    /// rebuild path so the host's pointer path can hit-test it even on an idle frame that
+    /// early-outs. `None` until the box has drawn once.
+    chip_rect: Option<HitRect>,
 }
 
 impl InputWidgetRenderer {
@@ -505,6 +530,7 @@ impl InputWidgetRenderer {
             built: None,
             last_glyph_draw_calls: 0,
             last_caret_px: None,
+            chip_rect: None,
         }
     }
 
@@ -512,6 +538,14 @@ impl InputWidgetRenderer {
     #[must_use]
     pub fn last_glyph_draw_calls(&self) -> u32 {
         self.last_glyph_draw_calls
+    }
+
+    /// The mode PILL chip's clickable region in physical px (ticket T-9.8), or `None` before
+    /// the first draw. The host pushes this into the frame's [`crate::hit::HitMap`] as a
+    /// [`HitTarget::ModeChip`] so a pointer click drives the same intent as `Cmd-/`.
+    #[must_use]
+    pub fn chip_rect(&self) -> Option<HitRect> {
+        self.chip_rect
     }
 
     /// The caret's rect in PHYSICAL px `[x, y, w, h]` as of the last built frame, or
@@ -542,6 +576,7 @@ impl InputWidgetRenderer {
         atlas: &mut GlyphAtlas,
         input: &InputModel,
         autonomy: Option<AutonomyMode>,
+        hovered: Option<HitTarget>,
         theme: &Theme,
         size: FrameSize,
     ) -> bool {
@@ -554,6 +589,10 @@ impl InputWidgetRenderer {
         let px_key = px as u32;
         let view = InputView::from_model(input);
 
+        // The mode chip strengthens its accent tint on pointer hover (ticket T-9.8). Folded
+        // into the damage signature so a hover change forces exactly one rebuild.
+        let chip_hovered = hovered == Some(HitTarget::ModeChip);
+
         // Fold the autonomy posture (ticket T-5.11) into the damage signature so a
         // mode switch redraws the always-visible indicator even when the input buffer
         // is unchanged (AC4). `None` (a host with no agent) is its own state.
@@ -563,9 +602,10 @@ impl InputWidgetRenderer {
             Some(AutonomyMode::AutoSafe) => 2,
             Some(AutonomyMode::AutoRunInSession) => 3,
         };
-        let sig = signature(&view, width, height, px_key, theme)
+        let sig = (signature(&view, width, height, px_key, theme)
             .wrapping_mul(0x0000_0100_0000_01b3)
-            ^ autonomy_code.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            ^ autonomy_code.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .wrapping_add(u64::from(chip_hovered).wrapping_mul(0xff51_afd7_ed55_8ccd));
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
         }
@@ -648,8 +688,19 @@ impl InputWidgetRenderer {
         let chip_y = first_row_y + (ch - chip_h) * 0.5;
 
         let chip = PromptChip::resolve(prompt_mode(view.mode), theme);
+        // Cache the chip's clickable region (ticket T-9.8): the whole pill slot, physical px.
+        self.chip_rect = Some([chip_x, chip_y, slot_w, chip_h]);
+        // On pointer hover the pill "lifts" - a stronger accent tint fill with its text
+        // re-nudged to stay legible on it (ticket T-9.8). At rest it is the resolved
+        // ~13% tint. The border stays the accent either way.
+        let (chip_fill, chip_text) = if chip_hovered {
+            let fill = blend_to(mode_accent, canvas, MODE_CHIP_HOVER_TINT_T);
+            (fill, legible_against(mode_accent, fill, CHIP_MIN_CONTRAST))
+        } else {
+            (chip.chip.fill, chip.chip.text)
+        };
         // Both modes are bordered mode pills now: an outer accent-border rect + the
-        // ~13% accent tint fill inset by one hairline (the mock's `--mode` chip).
+        // accent tint fill inset by one hairline (the mock's `--mode` chip).
         if let Some(border) = chip.chip.border {
             self.bg_instances.push(RectInstance {
                 rect: [chip_x, chip_y, slot_w, chip_h],
@@ -663,12 +714,12 @@ impl InputWidgetRenderer {
                     (slot_w - 2.0 * b).max(0.0),
                     (chip_h - 2.0 * b).max(0.0),
                 ],
-                color: chip.chip.fill.to_linear_f32(),
+                color: chip_fill.to_linear_f32(),
             });
         } else {
             self.bg_instances.push(RectInstance {
                 rect: [chip_x, chip_y, slot_w, chip_h],
-                color: chip.chip.fill.to_linear_f32(),
+                color: chip_fill.to_linear_f32(),
             });
         }
         // The active content (glyph + label + `⌘I`), shaped + centered in the slot, into
@@ -683,7 +734,7 @@ impl InputWidgetRenderer {
         );
         let label_x = chip_x + (slot_w - label_layout.width) * 0.5;
         let label_y = chip_y + (chip_h - label_layout.height) * 0.5;
-        let label_color = chip.chip.text.to_linear_f32();
+        let label_color = chip_text.to_linear_f32();
         let inv = 1.0 / atlas.atlas_dim() as f32;
         for pg in &label_layout.glyphs {
             let key = GlyphKey {
@@ -1534,6 +1585,7 @@ mod gpu_tests {
         atlas: &mut GlyphAtlas,
         iw: &mut InputWidgetRenderer,
         input: &InputModel,
+        hovered: Option<HitTarget>,
         theme: &Theme,
         w: u32,
         h: u32,
@@ -1566,6 +1618,7 @@ mod gpu_tests {
             atlas,
             input,
             None,
+            hovered,
             theme,
             FrameSize {
                 width: w,
@@ -1653,7 +1706,7 @@ mod gpu_tests {
                 let mut atlas = GlyphAtlas::new(&device, format);
                 let mut iw = InputWidgetRenderer::new(&device);
                 let m = model("echo hi", mode);
-                let rb = render(&device, &queue, &mut atlas, &mut iw, &m, &theme, w, h);
+                let rb = render(&device, &queue, &mut atlas, &mut iw, &m, None, &theme, w, h);
 
                 let zone_top = (h as f32 - zone_px_for(m.text(), SCALE)) as u32;
                 let hl = (f32::from(space::HAIRLINE_WIDTH) * SCALE).round().max(1.0);
@@ -1699,12 +1752,72 @@ mod gpu_tests {
         let mut iw = InputWidgetRenderer::new(&device);
         let theme = *Theme::for_kind(ThemeKind::Dark);
         let m = model("ls -la", InputMode::Agent);
-        render(&device, &queue, &mut atlas, &mut iw, &m, &theme, 320, 160);
+        render(
+            &device, &queue, &mut atlas, &mut iw, &m, None, &theme, 320, 160,
+        );
         assert_eq!(
             iw.last_glyph_draw_calls(),
             1,
             "the whole input glyph layer (text + chip label) is ONE instanced draw"
         );
+    }
+
+    #[test]
+    fn mode_chip_re_inks_on_hover_in_both_themes() {
+        // T-9.8 AC3: a pointer hover over the mode chip drives a redraw whose pill fill
+        // strengthens its accent tint, in both themes. Sampling the exact cached chip rect
+        // (its interior, clear of the border) proves the fill re-inked, not incidental
+        // relayout. Also confirms the chip's clickable rect is cached for the host.
+        let Some((device, queue, format)) = device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (360u32, 140u32);
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            let theme = *Theme::for_kind(kind);
+            let mut atlas = GlyphAtlas::new(&device, format);
+            let m = model("echo", InputMode::Shell);
+
+            let mut rest = InputWidgetRenderer::new(&device);
+            let rb_rest = render(
+                &device, &queue, &mut atlas, &mut rest, &m, None, &theme, w, h,
+            );
+            let rect = rest
+                .chip_rect()
+                .expect("the chip rect is cached after a draw");
+
+            let mut hot = InputWidgetRenderer::new(&device);
+            let rb_hot = render(
+                &device,
+                &queue,
+                &mut atlas,
+                &mut hot,
+                &m,
+                Some(HitTarget::ModeChip),
+                &theme,
+                w,
+                h,
+            );
+
+            // Sample the pill INTERIOR (a few px inside each edge to avoid the accent border
+            // and the centered label glyphs): the fill tint changes between rest and hover.
+            let inset = 4u32;
+            let x0 = rect[0] as u32 + inset;
+            let y0 = rect[1] as u32 + inset;
+            let x1 = (rect[0] + rect[2]) as u32 - inset;
+            let y1 = (rect[1] + rect[3]) as u32 - inset;
+            let mut max_delta = 0i32;
+            for y in y0..y1.min(rb_rest.h) {
+                for x in x0..x1.min(rb_rest.w) {
+                    let d = i32::from(rb_hot.lum(x, y)) - i32::from(rb_rest.lum(x, y));
+                    max_delta = max_delta.max(d.abs());
+                }
+            }
+            assert!(
+                max_delta > 3,
+                "{kind:?}: the hovered mode chip fill re-inks (max |delta| = {max_delta})"
+            );
+        }
     }
 
     #[test]
@@ -1721,9 +1834,9 @@ mod gpu_tests {
             height: 160,
             scale: SCALE,
         };
-        iw.prepare(&device, &queue, &mut atlas, &m, None, &theme, size);
+        iw.prepare(&device, &queue, &mut atlas, &m, None, None, &theme, size);
         let allocs = crate::alloc_probe::count_allocs(|| {
-            let drew = iw.prepare(&device, &queue, &mut atlas, &m, None, &theme, size);
+            let drew = iw.prepare(&device, &queue, &mut atlas, &m, None, None, &theme, size);
             std::hint::black_box(drew);
         });
         assert_eq!(

@@ -48,6 +48,7 @@ use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
 use crate::components::{BlockMetaStyle, CommandBlockStyle, RiskBadge, RiskState};
 use crate::grid_render::FrameSize;
+use crate::hit::HitRect;
 use crate::text::{resolve_color, resolve_output_color, FontFamily, GridCell};
 use crate::timeline::{
     GutterMarker, TimelineLayout, TimelineMode, TimelineRow, VisibleBlock, GAP_ROWS,
@@ -130,6 +131,13 @@ pub struct TimelineRenderer {
     /// Glyph-layer draw calls issued by the last [`Self::draw`] (1 when the timeline has
     /// any inked glyph, else 0) - the timeline analogue of the grid's AC-c counter.
     last_glyph_draw_calls: u32,
+    /// Each visible COMMAND block's hover region in physical px, paired with its
+    /// [`crate::timeline::VisibleBlock::index`] (ticket T-9.8). Cached on the rebuild path
+    /// (reused, clear + push) so the host's pointer path can hit-test them even on an idle
+    /// frame; a [`crate::hit::HitTarget::BlockMeta`] whose block is hovered reveals its
+    /// block-meta (the mock's `.block:hover .block-meta`). Only command blocks have a meta,
+    /// so only they are registered.
+    block_meta_rects: Vec<(usize, HitRect)>,
 }
 
 impl TimelineRenderer {
@@ -153,6 +161,7 @@ impl TimelineRenderer {
             ),
             built: None,
             last_glyph_draw_calls: 0,
+            block_meta_rects: Vec::new(),
         }
     }
 
@@ -160,6 +169,14 @@ impl TimelineRenderer {
     #[must_use]
     pub fn last_glyph_draw_calls(&self) -> u32 {
         self.last_glyph_draw_calls
+    }
+
+    /// Each visible command block's hover region in physical px, paired with its block index
+    /// (ticket T-9.8), top to bottom; empty until the first draw. The host pushes each as a
+    /// [`crate::hit::HitTarget::BlockMeta`] so hovering a block reveals its block-meta.
+    #[must_use]
+    pub fn block_meta_rects(&self) -> &[(usize, HitRect)] {
+        &self.block_meta_rects
     }
 
     /// Build the frame's instances from `layout` through the shared `atlas`, reusing the
@@ -181,6 +198,7 @@ impl TimelineRenderer {
         atlas: &mut GlyphAtlas,
         layout: &TimelineLayout,
         top_inset: f32,
+        hovered_block: Option<usize>,
         theme: &Theme,
         size: FrameSize,
     ) -> bool {
@@ -196,7 +214,12 @@ impl TimelineRenderer {
         // so a title-bar toggle / DPI change that moves the timeline down forces a rebuild.
         // `signature()` itself stays inset-agnostic (its sig_tests are unchanged); the fold
         // is a separate, unit-tested step (`top_inset_is_a_folded_draw_affecting_axis`).
-        let sig = fold_top_inset(signature(layout, width, height, px_key, theme), top_inset);
+        // The hovered block (T-9.8) is folded the same way: it toggles that block's meta
+        // reveal, so a hover change must force exactly one rebuild.
+        let sig = fold_hovered_block(
+            fold_top_inset(signature(layout, width, height, px_key, theme), top_inset),
+            hovered_block,
+        );
         if self.built == Some(sig) {
             // Nothing changed: reuse the buffers verbatim (no rebuild, no allocation).
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
@@ -204,6 +227,7 @@ impl TimelineRenderer {
 
         self.bg_instances.clear();
         self.glyph_instances.clear();
+        self.block_meta_rects.clear();
 
         // Alt-screen / empty timeline: nothing to draw (the grid owns the screen).
         if layout.mode != TimelineMode::Timeline || layout.visible.is_empty() {
@@ -303,6 +327,17 @@ impl TimelineRenderer {
             let command_block = vb.block.as_command();
             let agent_block = vb.block.as_agent();
 
+            // Register the command block's pointer hover region (ticket T-9.8): the whole
+            // visible extent (command + any visible output rows), so hovering anywhere in the
+            // block reveals its meta (the mock's `.block:hover .block-meta`). Only command
+            // blocks have a meta. Physical px, cached for the host's hit map.
+            if command_block.is_some() && !vb.rows.is_empty() {
+                let block_top = top_margin + vb.first_row_in_viewport as f32 * ch;
+                let block_h = vb.rows.len() as f32 * ch;
+                self.block_meta_rects
+                    .push((vb.index, [edge, block_top, inner_w, block_h]));
+            }
+
             // A tool RESULT's output block carries a hairline LEFT border spanning its
             // visible rows (the mock's `border-left`, ticket T-9.6), drawn once here.
             if let Some(ab) = agent_block {
@@ -354,16 +389,17 @@ impl TimelineRenderer {
                         // Right-aligned block-meta: a status dot + duration / "exit N"
                         // caption, in the faint meta tone (the mock's `.block-meta`; the
                         // dot color/shape + the caption label carry the state, color is
-                        // never the only signal). Drawn only when it clears the command
-                        // text - a very narrow block hides it, matching the meta's
-                        // hover-revealed intent (hover-gating itself is a follow-up:
-                        // the reveal reuses the FocusDim slot, `BlockMetaStyle`).
+                        // never the only signal). REVEALED on pointer hover (ticket T-9.8):
+                        // the mock's `.block-meta { opacity:0 }` / `.block:hover { opacity:1 }`,
+                        // the reveal in the FocusDim slot (`BlockMetaStyle::reveal_animation`).
+                        // Still gated on clearing the command text so a very narrow hovered
+                        // block never overprints its own command.
                         let meta = BlockMetaStyle::resolve(vb.gutter, cb.duration_secs(), theme);
                         let caption = meta_caption(&meta, cb.duration_secs());
                         let meta_cols = 2 + caption.chars().count(); // dot + gap + caption
                         let meta_start = edge + inner_w - meta_cols as f32 * cw;
                         let command_end = content_x + cmd_cols as f32 * cw;
-                        if meta_start >= command_end + cw {
+                        if hovered_block == Some(vb.index) && meta_start >= command_end + cw {
                             let dot = grid_glyph(meta.dot_glyph, meta.dot_color, canvas);
                             emit_cell(
                                 atlas,
@@ -883,6 +919,18 @@ fn diff_line_color(
 /// `wrapping_mul` by an odd constant is a bijection on `u64`.
 fn fold_top_inset(base: u64, top_inset: f32) -> u64 {
     base ^ (top_inset.to_bits() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+/// Fold the hovered block index into a base signature (ticket T-9.8) so a pointer hover
+/// change forces exactly one timeline rebuild (it toggles that block's meta reveal). `None`
+/// (no hovered block) is its own state, distinct from block 0. Kept separate from
+/// [`signature`] so its sig-tests are unchanged, like [`fold_top_inset`].
+fn fold_hovered_block(base: u64, hovered_block: Option<usize>) -> u64 {
+    let v = match hovered_block {
+        None => 0u64,
+        Some(i) => (i as u64).wrapping_add(1),
+    };
+    base ^ v.wrapping_mul(0xff51_afd7_ed55_8ccd)
 }
 
 /// A stable u64 over everything the timeline draw reads: the mode + scroll geometry,
@@ -1814,6 +1862,7 @@ mod gpu_tests {
         atlas: &mut GlyphAtlas,
         tl: &mut TimelineRenderer,
         layout: &TimelineLayout,
+        hovered_block: Option<usize>,
         theme: &Theme,
         w: u32,
         h: u32,
@@ -1846,6 +1895,7 @@ mod gpu_tests {
             atlas,
             layout,
             0.0,
+            hovered_block,
             theme,
             FrameSize {
                 width: w,
@@ -1962,7 +2012,7 @@ mod gpu_tests {
             // block 1 rows [4,7). Viewport 10 shows all of it from the top.
             let blocks = two_finished_blocks(2);
             let l = layout(&blocks, false, Scroll::default(), 10);
-            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, &theme, w, h);
+            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, None, &theme, w, h);
 
             // Block 0's gutter marker inks on its command row (gapped row 0), in the
             // marker band [edge, edge + gutter_w).
@@ -2040,11 +2090,12 @@ mod gpu_tests {
     }
 
     #[test]
-    fn timeline_block_meta_inks_for_ok_failed_and_instant_in_both_themes() {
-        // T-9.3 AC4: a mixed timeline (ok / failed / instant) renders its right-aligned
-        // block-meta on EACH command row, in both themes. The exact per-state colors are
-        // asserted in the pure `block_meta_maps_state_to_token_color_shape_and_label`
-        // test; here we prove the meta actually inks on screen for all three states.
+    fn timeline_block_meta_reveals_on_hover_for_ok_failed_and_instant_in_both_themes() {
+        // T-9.3 AC4 + T-9.8 AC3: a mixed timeline (ok / failed / instant) renders its
+        // right-aligned block-meta on the HOVERED command row, in both themes (the mock's
+        // `.block-meta { opacity:0 }` / `.block:hover { opacity:1 }`). Per-state colors are
+        // asserted in `block_meta_maps_state_to_token_color_shape_and_label`; here we prove
+        // (a) with NO hover the meta is hidden, and (b) hovering each block reveals its meta.
         let Some((device, queue, format)) = device() else {
             eprintln!("no GPU adapter; skipping");
             return;
@@ -2057,25 +2108,52 @@ mod gpu_tests {
         let (w, h) = (360u32, (top + 12.0 * ch) as u32);
         // Gapped layout: block0 cmd row 0, block1 cmd row 4, block2 cmd row 8.
         let meta_rows = [0.0f32, 4.0, 8.0];
+        let mx0 = w / 2;
+        let mx1 = (w as f32 - edge) as u32;
 
         for kind in [ThemeKind::Dark, ThemeKind::Light] {
             let theme = *Theme::for_kind(kind);
             let mut atlas = GlyphAtlas::new(&device, format);
-            let mut tl = TimelineRenderer::new(&device);
             let blocks = mixed_finished_blocks();
             let l = layout(&blocks, false, Scroll::default(), 12);
-            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, &theme, w, h);
 
-            // The meta is right-aligned inside the inner canvas [edge, w-edge); sample a
-            // right-side band on each command row (clear of the left-gutter prompt glyph
-            // and the empty command text).
-            let mx0 = w / 2;
-            let mx1 = (w as f32 - edge) as u32;
+            // No hover: no meta inks on any command row (the reveal is hover-gated).
+            let mut cold = TimelineRenderer::new(&device);
+            let rb_cold = render(
+                &device, &queue, &mut atlas, &mut cold, &l, None, &theme, w, h,
+            );
             for (i, row) in meta_rows.iter().enumerate() {
                 let ry = (top + row * ch) as u32;
                 assert!(
+                    !rb_cold.any_ink(mx0, ry, mx1, ry + ch as u32, 30),
+                    "{kind:?}: block {i}'s block-meta stays hidden until hover"
+                );
+            }
+            // The renderer also cached one hover rect per command block for the host.
+            assert_eq!(
+                cold.block_meta_rects().len(),
+                3,
+                "{kind:?}: every command block registers a hover rect"
+            );
+
+            // Hover each block in turn: its meta reveals on its command row.
+            for (i, row) in meta_rows.iter().enumerate() {
+                let mut tl = TimelineRenderer::new(&device);
+                let rb = render(
+                    &device,
+                    &queue,
+                    &mut atlas,
+                    &mut tl,
+                    &l,
+                    Some(i),
+                    &theme,
+                    w,
+                    h,
+                );
+                let ry = (top + row * ch) as u32;
+                assert!(
                     rb.any_ink(mx0, ry, mx1, ry + ch as u32, 30),
-                    "{kind:?}: block {i}'s block-meta (dot + caption) inks on its command row"
+                    "{kind:?}: hovering block {i} reveals its block-meta (dot + caption)"
                 );
             }
         }
@@ -2091,7 +2169,9 @@ mod gpu_tests {
         let theme = *Theme::for_kind(ThemeKind::Dark);
         let blocks = block_with_output(2, Some(0));
         let l = layout(&blocks, false, Scroll::default(), 8);
-        render(&device, &queue, &mut atlas, &mut tl, &l, &theme, 240, 120);
+        render(
+            &device, &queue, &mut atlas, &mut tl, &l, None, &theme, 240, 120,
+        );
         assert_eq!(
             tl.last_glyph_draw_calls(),
             1,
@@ -2115,11 +2195,11 @@ mod gpu_tests {
             scale: SCALE,
         };
         // First prepare builds + caches (allocates).
-        tl.prepare(&device, &queue, &mut atlas, &l, 0.0, &theme, size);
+        tl.prepare(&device, &queue, &mut atlas, &l, 0.0, None, &theme, size);
         // An unchanged layout must early-out with NO allocation (the steady-state
         // present path; the same zero-alloc discipline as the grid).
         let allocs = crate::alloc_probe::count_allocs(|| {
-            let drew = tl.prepare(&device, &queue, &mut atlas, &l, 0.0, &theme, size);
+            let drew = tl.prepare(&device, &queue, &mut atlas, &l, 0.0, None, &theme, size);
             std::hint::black_box(drew);
         });
         assert_eq!(
@@ -2146,7 +2226,7 @@ mod gpu_tests {
         let blocks = block_with_output(3, Some(0));
         let alt = layout(&blocks, true, Scroll::default(), 12);
         assert!(
-            !tl.prepare(&device, &queue, &mut atlas, &alt, 0.0, &theme, size),
+            !tl.prepare(&device, &queue, &mut atlas, &alt, 0.0, None, &theme, size),
             "alt-screen mode draws no timeline"
         );
         assert_eq!(tl.bg_instances.len(), 0);
@@ -2156,7 +2236,7 @@ mod gpu_tests {
         let empty = aterm_core::BlockList::new();
         let el = layout(&empty, false, Scroll::default(), 12);
         assert!(
-            !tl.prepare(&device, &queue, &mut atlas, &el, 0.0, &theme, size),
+            !tl.prepare(&device, &queue, &mut atlas, &el, 0.0, None, &theme, size),
             "an empty timeline draws nothing"
         );
     }
@@ -2255,7 +2335,7 @@ mod gpu_tests {
             let mut tl = TimelineRenderer::new(&device);
             let blocks = agent_turn();
             let l = layout(&blocks, false, Scroll::default(), 30);
-            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, &theme, w, h);
+            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, None, &theme, w, h);
 
             // The `◊` header glyph inks in the gutter marker band on the top row.
             let gutter_w = f32::from(space::S4) * SCALE;
@@ -2345,7 +2425,7 @@ mod gpu_tests {
             let mut tl = TimelineRenderer::new(&device);
             let blocks = resolved_gate_turn();
             let l = layout(&blocks, false, Scroll::default(), 30);
-            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, &theme, w, h);
+            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, None, &theme, w, h);
             // The ✓ / ✕ status glyphs + resolution text ink in the content column below the
             // header + tool-call rows.
             let gutter_w = f32::from(space::S4) * SCALE;

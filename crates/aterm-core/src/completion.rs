@@ -184,6 +184,15 @@ impl Completion {
             self.index = (self.index + 1).min(self.items.len() - 1);
         }
     }
+
+    /// Set the active row directly, clamped into `items` (ticket T-9.8): the pointer path
+    /// uses this to activate the row a click landed on before accepting it, the mouse twin of
+    /// arrowing to it. A no-op when there are no items.
+    pub fn set_index(&mut self, index: usize) {
+        if !self.items.is_empty() {
+            self.index = index.min(self.items.len() - 1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +298,23 @@ mod tests {
         c.move_down(); // clamps at the bottom
         assert_eq!(c.index(), 2);
         assert_eq!(c.active().unwrap().text, "c");
+    }
+
+    #[test]
+    fn set_index_clamps_into_items() {
+        // T-9.8: the pointer-click path sets the active row directly; it clamps into range
+        // and is a no-op with no items (so a stale click index never panics).
+        let mut c = Completion::new();
+        c.set_index(3); // no items yet: no-op, stays 0
+        assert_eq!(c.index(), 0);
+        c.open_with(items(&["a", "b", "c"]));
+        c.set_index(2);
+        assert_eq!(c.index(), 2);
+        assert_eq!(c.active().unwrap().text, "c");
+        c.set_index(99); // out of range -> clamps to the last row
+        assert_eq!(c.index(), 2);
+        c.set_index(0);
+        assert_eq!(c.index(), 0);
     }
 
     #[test]

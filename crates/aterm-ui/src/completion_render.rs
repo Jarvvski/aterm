@@ -29,6 +29,7 @@ use aterm_core::Completion;
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
 use crate::grid_render::{FrameSize, INSET_LOGICAL};
+use crate::hit::{HitRect, HitTarget};
 use crate::text::{FontFamily, GridCell};
 use crate::window::cell_px;
 
@@ -46,6 +47,11 @@ pub struct CompletionRenderer {
     glyph_buf: InstanceBuffer,
     built: Option<u64>,
     last_glyph_draw_calls: u32,
+    /// Each visible row's clickable region in physical px (ticket T-9.8), one per ranked
+    /// item in draw order, cached on the rebuild path so the host's pointer path can
+    /// hit-test them even on an idle frame that early-outs. Reused (clear + push) so a
+    /// rebuild stays allocation-free. Empty when the popover is closed.
+    row_rects: Vec<HitRect>,
 }
 
 impl CompletionRenderer {
@@ -67,12 +73,21 @@ impl CompletionRenderer {
             ),
             built: None,
             last_glyph_draw_calls: 0,
+            row_rects: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn last_glyph_draw_calls(&self) -> u32 {
         self.last_glyph_draw_calls
+    }
+
+    /// Each visible completion row's clickable region in physical px (ticket T-9.8), top to
+    /// bottom, aligned with the ranked items; empty when closed. The host pushes each as a
+    /// [`HitTarget::CompletionRow`] so a pointer click accepts that row (the `Enter` path).
+    #[must_use]
+    pub fn row_rects(&self) -> &[HitRect] {
+        &self.row_rects
     }
 
     /// Build the popover for `completion` through the shared `atlas`. `input_zone_top` is the
@@ -85,6 +100,7 @@ impl CompletionRenderer {
         queue: &wgpu::Queue,
         atlas: &mut GlyphAtlas,
         completion: &Completion,
+        hovered: Option<HitTarget>,
         input_zone_top: f32,
         theme: &Theme,
         size: FrameSize,
@@ -97,13 +113,24 @@ impl CompletionRenderer {
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
 
-        let sig = signature(completion, width, input_zone_top, px_key, theme);
+        // The row the pointer is over gets a faint hover tint (ticket T-9.8), the mock's
+        // `.cmpl:hover` background. Folded into the signature so a hover change forces
+        // exactly one rebuild.
+        let hovered_row = match hovered {
+            Some(HitTarget::CompletionRow(i)) => Some(i),
+            _ => None,
+        };
+        let sig = fold_hover(
+            signature(completion, width, input_zone_top, px_key, theme),
+            hovered_row,
+        );
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
         }
 
         self.bg_instances.clear();
         self.glyph_instances.clear();
+        self.row_rects.clear();
 
         // Nothing to draw when closed / empty.
         let items = completion.items();
@@ -181,11 +208,22 @@ impl CompletionRenderer {
         // Candidate rows.
         for (i, it) in items.iter().enumerate() {
             let row_y = box_top + pad + (1 + i) as f32 * ch;
+            let row_rect: HitRect = [box_left + hairline_h, row_y, box_w - 2.0 * hairline_h, ch];
+            // Cache the clickable region (ticket T-9.8), in draw/item order.
+            self.row_rects.push(row_rect);
             let active = i == completion.index();
+            // A faint neutral hover tint under the pointer's row (the mock's `.cmpl:hover`),
+            // drawn FIRST so the active row's accent tint (pushed next) wins on overlap.
+            if hovered_row == Some(i) {
+                self.bg_instances.push(RectInstance {
+                    rect: row_rect,
+                    color: c.hairline.to_linear_f32(),
+                });
+            }
             if active {
                 // Weak accent tint behind the active row (inside the panel content width).
                 self.bg_instances.push(RectInstance {
-                    rect: [box_left + hairline_h, row_y, box_w - 2.0 * hairline_h, ch],
+                    rect: row_rect,
                     color: c.accent_primary_weak.to_linear_f32(),
                 });
             }
@@ -319,6 +357,17 @@ impl CompletionRenderer {
 /// A stable u64 over everything the popover draws: open flag, each item's text/desc/hits, the
 /// active index, the anchor, px, and the colors. Allocation-free (folds borrowed strs +
 /// bounded item counts).
+/// Fold the hovered row into a base signature (ticket T-9.8) so a pointer hover change
+/// forces exactly one popover rebuild. `None` (no hovered row) is its own state, distinct
+/// from row 0. Kept separate from [`signature`] so its sig-tests are unchanged.
+fn fold_hover(base: u64, hovered_row: Option<usize>) -> u64 {
+    let v = match hovered_row {
+        None => 0u64,
+        Some(i) => (i as u64).wrapping_add(1),
+    };
+    (base ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
 fn signature(
     completion: &Completion,
     w: u32,
@@ -499,13 +548,14 @@ mod gpu_tests {
         c
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // a test-only offscreen-render harness
     fn render(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         atlas: &mut GlyphAtlas,
         cr: &mut CompletionRenderer,
         completion: &Completion,
+        hovered: Option<HitTarget>,
         theme: &Theme,
         w: u32,
         h: u32,
@@ -538,6 +588,7 @@ mod gpu_tests {
             queue,
             atlas,
             completion,
+            hovered,
             h as f32 - 40.0,
             theme,
             FrameSize {
@@ -611,11 +662,75 @@ mod gpu_tests {
             let mut atlas = GlyphAtlas::new(&device, format);
             let mut cr = CompletionRenderer::new(&device);
             let c = cmpl();
-            let rb = render(&device, &queue, &mut atlas, &mut cr, &c, &theme, w, h);
+            let rb = render(&device, &queue, &mut atlas, &mut cr, &c, None, &theme, w, h);
             // The panel + text ink in the band above the input zone (which starts at h-40).
             assert!(
                 rb.any_ink(8, h - 160, 200, h - 40, 20),
                 "{kind:?}: the completion popover inks above the input"
+            );
+        }
+    }
+
+    #[test]
+    fn row_hover_tints_the_row_in_both_themes() {
+        // T-9.8 AC3: hovering a completion row draws a faint neutral tint behind it (the
+        // mock's `.cmpl:hover`), in both themes. Hover a NON-active row (index 1, since the
+        // active row 0 already carries the accent tint) and sample its cached rect: it inks
+        // where the un-hovered render did not. Also confirms the row rects are cached.
+        let Some((device, queue, format)) = device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (420u32, 260u32);
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            let theme = *Theme::for_kind(kind);
+            let mut atlas = GlyphAtlas::new(&device, format);
+
+            let mut rest = CompletionRenderer::new(&device);
+            let rb_rest = render(
+                &device,
+                &queue,
+                &mut atlas,
+                &mut rest,
+                &cmpl(),
+                None,
+                &theme,
+                w,
+                h,
+            );
+            let rects = rest.row_rects().to_vec();
+            assert!(rects.len() >= 2, "the popover caches one rect per row");
+            let r = rects[1];
+
+            let mut hot = CompletionRenderer::new(&device);
+            let rb_hot = render(
+                &device,
+                &queue,
+                &mut atlas,
+                &mut hot,
+                &cmpl(),
+                Some(HitTarget::CompletionRow(1)),
+                &theme,
+                w,
+                h,
+            );
+
+            // Sample the row interior clear of the leading pointer/candidate glyphs (right
+            // half of the row): the neutral hover tint fills it where rest was bare panel.
+            let x0 = (r[0] + r[2] * 0.6) as u32;
+            let y0 = (r[1] + r[3] * 0.25) as u32;
+            let x1 = (r[0] + r[2] - 2.0) as u32;
+            let y1 = (r[1] + r[3] * 0.75) as u32;
+            let mut max_delta = 0i32;
+            for y in y0..y1.min(rb_rest.h) {
+                for x in x0..x1.min(rb_rest.w) {
+                    let d = i32::from(rb_hot.lum(x, y)) - i32::from(rb_rest.lum(x, y));
+                    max_delta = max_delta.max(d.abs());
+                }
+            }
+            assert!(
+                max_delta > 3,
+                "{kind:?}: the hovered completion row re-inks (max |delta| = {max_delta})"
             );
         }
     }
@@ -635,6 +750,7 @@ mod gpu_tests {
             &queue,
             &mut atlas,
             &c,
+            None,
             220.0,
             &theme,
             FrameSize {
@@ -655,7 +771,9 @@ mod gpu_tests {
         let mut cr = CompletionRenderer::new(&device);
         let theme = *Theme::for_kind(ThemeKind::Dark);
         let c = cmpl();
-        render(&device, &queue, &mut atlas, &mut cr, &c, &theme, 420, 260);
+        render(
+            &device, &queue, &mut atlas, &mut cr, &c, None, &theme, 420, 260,
+        );
         assert_eq!(
             cr.last_glyph_draw_calls(),
             1,
@@ -677,9 +795,9 @@ mod gpu_tests {
             height: 260,
             scale: SCALE,
         };
-        cr.prepare(&device, &queue, &mut atlas, &c, 220.0, &theme, size);
+        cr.prepare(&device, &queue, &mut atlas, &c, None, 220.0, &theme, size);
         let allocs = crate::alloc_probe::count_allocs(|| {
-            let drew = cr.prepare(&device, &queue, &mut atlas, &c, 220.0, &theme, size);
+            let drew = cr.prepare(&device, &queue, &mut atlas, &c, None, 220.0, &theme, size);
             std::hint::black_box(drew);
         });
         assert_eq!(

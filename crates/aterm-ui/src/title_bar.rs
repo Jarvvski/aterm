@@ -36,6 +36,7 @@ use aterm_tokens::{space, type_scale, Rgba, Theme};
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
 use crate::grid_render::FrameSize;
+use crate::hit::{HitRect, HitTarget};
 use crate::prose::ProseShaper;
 use crate::text::{FaceStyle, FontFamily, GlyphKey, GridCell};
 use crate::window::cell_px;
@@ -89,6 +90,10 @@ pub struct TitleBarRenderer {
     shaper: ProseShaper,
     built: Option<u64>,
     last_glyph_draw_calls: u32,
+    /// The sidebar-toggle glyph's clickable region in physical px (ticket T-9.8), cached on
+    /// the rebuild path so the host's pointer path can hit-test it even on an idle frame that
+    /// early-outs. `None` until the bar has drawn once.
+    sidebar_toggle_rect: Option<HitRect>,
 }
 
 impl TitleBarRenderer {
@@ -107,6 +112,7 @@ impl TitleBarRenderer {
             shaper: ProseShaper::new(),
             built: None,
             last_glyph_draw_calls: 0,
+            sidebar_toggle_rect: None,
         }
     }
 
@@ -116,6 +122,14 @@ impl TitleBarRenderer {
         self.last_glyph_draw_calls
     }
 
+    /// The sidebar-toggle glyph's clickable region in physical px (ticket T-9.8), or `None`
+    /// before the first draw. The host pushes this into the frame's [`crate::hit::HitMap`] as
+    /// a [`HitTarget::SidebarToggle`] so a pointer click drives the same intent as `Cmd-B`.
+    #[must_use]
+    pub fn sidebar_toggle_rect(&self) -> Option<HitRect> {
+        self.sidebar_toggle_rect
+    }
+
     /// Build the frame's instances for `view` through the shared `atlas`, reusing the prior
     /// build when the signature is unchanged (the damage gate). Returns `true` if there is
     /// anything to draw. The bar occupies the TOP [`title_bar_px`] of the surface; the host
@@ -123,12 +137,14 @@ impl TitleBarRenderer {
     ///
     /// The unchanged path allocates nothing (the steady-state early-out); the changed path
     /// reuses its warm `Vec`s + the glyph cache (`queue.write_buffer` is wgpu staging).
+    #[allow(clippy::too_many_arguments)] // by-value frame-path args, like the other front-ends
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         atlas: &mut GlyphAtlas,
         view: &TitleBarView,
+        hovered: Option<HitTarget>,
         theme: &Theme,
         size: FrameSize,
     ) -> bool {
@@ -140,7 +156,11 @@ impl TitleBarRenderer {
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
 
-        let sig = signature(view, width, px_key, theme);
+        // The sidebar-toggle glyph brightens on pointer hover (ticket T-9.8), the mock's
+        // `.navitem:hover { color: var(--ink) }`. Folded into the signature so a hover
+        // change forces exactly one rebuild.
+        let toggle_hovered = hovered == Some(HitTarget::SidebarToggle);
+        let sig = fold_bool(signature(view, width, px_key, theme), toggle_hovered);
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
         }
@@ -196,10 +216,15 @@ impl TitleBarRenderer {
             );
         }
 
-        // The sidebar-toggle glyph, `fg.muted`, one cell right of the dots (the mock's
-        // ~18px margin-left). Presentation only in v1 (see the module doc).
+        // The sidebar-toggle glyph, one cell right of the dots (the mock's ~18px margin-left).
+        // `fg.muted` at rest, brightening to `fg.primary` on pointer hover (ticket T-9.8).
         let toggle_x = pad_l + 3.0 * dot_pitch + 18.0 * scale;
-        let toggle = grid_glyph(SIDEBAR_TOGGLE_GLYPH, c.fg_muted, canvas);
+        let toggle_fg = if toggle_hovered {
+            c.fg_primary
+        } else {
+            c.fg_muted
+        };
+        let toggle = grid_glyph(SIDEBAR_TOGGLE_GLYPH, toggle_fg, canvas);
         emit_cell(
             atlas,
             queue,
@@ -209,6 +234,15 @@ impl TitleBarRenderer {
             &mut self.bg_instances,
             &mut self.glyph_instances,
         );
+        // Cache its clickable region (ticket T-9.8): the glyph cell padded to a comfortable
+        // pointer target, clamped to the bar. Physical px, so the host hit-tests it directly.
+        let hit_pad = 6.0 * scale;
+        self.sidebar_toggle_rect = Some([
+            (toggle_x - hit_pad).max(0.0),
+            (row_y - hit_pad).max(0.0),
+            cw + 2.0 * hit_pad,
+            (ch + 2.0 * hit_pad).min(bar_h),
+        ]);
 
         // The absolutely-centered title (`fg.primary`) + `  -  <cwd>` (`fg.muted`), shaped
         // in the Quattro UI face. Two runs so the two colors differ; centered as one group.
@@ -365,6 +399,13 @@ fn grid_glyph(ch: char, fg: Rgba, canvas: Rgba) -> GridCell {
 /// and the colors read. Computed every frame BEFORE the rebuild gate, so it allocates
 /// nothing (folds borrowed strs + small counts only). The height is fixed
 /// ([`TITLE_BAR_LOGICAL`]) modulo the px/scale already folded, so it is not folded.
+/// Fold a hover bool into a base signature (ticket T-9.8) so a pointer hover change forces
+/// exactly one title-bar rebuild. Kept separate from [`signature`] so its sig-tests are
+/// unchanged, mirroring the timeline's `fold_top_inset`.
+fn fold_bool(base: u64, b: bool) -> u64 {
+    (base ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
 fn signature(view: &TitleBarView, w: u32, px_key: u32, theme: &Theme) -> u64 {
     fn fold_u64(h: u64, v: u64) -> u64 {
         (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
@@ -532,6 +573,7 @@ mod gpu_tests {
         atlas: &mut GlyphAtlas,
         tb: &mut TitleBarRenderer,
         view: &TitleBarView,
+        hovered: Option<HitTarget>,
         theme: &Theme,
         w: u32,
         h: u32,
@@ -563,6 +605,7 @@ mod gpu_tests {
             queue,
             atlas,
             view,
+            hovered,
             theme,
             FrameSize {
                 width: w,
@@ -638,7 +681,9 @@ mod gpu_tests {
             let theme = *Theme::for_kind(kind);
             let mut atlas = GlyphAtlas::new(&device, format);
             let mut tb = TitleBarRenderer::new(&device);
-            let rb = render(&device, &queue, &mut atlas, &mut tb, &view, &theme, w, h);
+            let rb = render(
+                &device, &queue, &mut atlas, &mut tb, &view, None, &theme, w, h,
+            );
 
             let bar_h = title_bar_px(SCALE) as u32;
             // A traffic-light dot inks near the left of the bar (the leftmost dot region).
@@ -660,6 +705,66 @@ mod gpu_tests {
     }
 
     #[test]
+    fn sidebar_toggle_re_inks_on_hover_in_both_themes() {
+        // T-9.8 AC3/AC5: a hover over the sidebar-toggle glyph drives a redraw whose toggle
+        // cell inks DIFFERENTLY (`fg.muted` -> `fg.primary`), in both themes. The offscreen
+        // target clears to black, so "brighter" is theme-direction-dependent (primary is the
+        // strongest ink: lighter on dark, near-black on light); the theme-agnostic proof of a
+        // hover-driven redraw is that the toggle region's pixels CHANGE. Sampling the exact
+        // cached hit rect keeps the check on the glyph, not incidental relayout.
+        let Some((device, queue, format)) = device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (480u32, 120u32);
+        let view = TitleBarView {
+            title: "aterm",
+            cwd: "~/p",
+        };
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            let theme = *Theme::for_kind(kind);
+            let mut atlas = GlyphAtlas::new(&device, format);
+
+            let mut rest = TitleBarRenderer::new(&device);
+            let rb_rest = render(
+                &device, &queue, &mut atlas, &mut rest, &view, None, &theme, w, h,
+            );
+            let rect = rest
+                .sidebar_toggle_rect()
+                .expect("the toggle rect is cached after a draw");
+
+            let mut hot = TitleBarRenderer::new(&device);
+            let rb_hot = render(
+                &device,
+                &queue,
+                &mut atlas,
+                &mut hot,
+                &view,
+                Some(HitTarget::SidebarToggle),
+                &theme,
+                w,
+                h,
+            );
+
+            // Max per-pixel luminance delta over the toggle cell: non-trivial iff the glyph
+            // re-inked in a different tone on hover.
+            let (x0, y0) = (rect[0] as u32, rect[1] as u32);
+            let (x1, y1) = ((rect[0] + rect[2]) as u32, (rect[1] + rect[3]) as u32);
+            let mut max_delta = 0i32;
+            for y in y0..y1.min(rb_rest.h) {
+                for x in x0..x1.min(rb_rest.w) {
+                    let d = i32::from(rb_hot.lum(x, y)) - i32::from(rb_rest.lum(x, y));
+                    max_delta = max_delta.max(d.abs());
+                }
+            }
+            assert!(
+                max_delta > 10,
+                "{kind:?}: the hovered sidebar toggle re-inks (max |delta| = {max_delta})"
+            );
+        }
+    }
+
+    #[test]
     fn title_bar_glyph_layer_is_a_single_draw_call() {
         let Some((device, queue, format)) = device() else {
             return;
@@ -672,7 +777,7 @@ mod gpu_tests {
             cwd: "~/p",
         };
         render(
-            &device, &queue, &mut atlas, &mut tb, &view, &theme, 480, 120,
+            &device, &queue, &mut atlas, &mut tb, &view, None, &theme, 480, 120,
         );
         assert_eq!(
             tb.last_glyph_draw_calls(),
@@ -698,9 +803,9 @@ mod gpu_tests {
             height: 120,
             scale: SCALE,
         };
-        tb.prepare(&device, &queue, &mut atlas, &view, &theme, size);
+        tb.prepare(&device, &queue, &mut atlas, &view, None, &theme, size);
         let allocs = crate::alloc_probe::count_allocs(|| {
-            let drew = tb.prepare(&device, &queue, &mut atlas, &view, &theme, size);
+            let drew = tb.prepare(&device, &queue, &mut atlas, &view, None, &theme, size);
             std::hint::black_box(drew);
         });
         assert_eq!(

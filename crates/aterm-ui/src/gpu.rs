@@ -32,7 +32,14 @@ use aterm_tokens::Rgba;
 
 use crate::atlas::GlyphAtlas;
 use crate::grid_render::GridRenderer;
+use crate::hit::{HitMap, HitTarget};
 use crate::renderer::{Frame, RenderError, Renderer};
+
+/// The timeline idle-gate signature (ticket T-2.7, extended by T-9.8): `(snapshot version,
+/// scroll offset, surface width, effective height, theme code, alt placeholder, hovered
+/// block)`. A tuple (not a struct) so equality is derived; aliased to keep the field type
+/// legible.
+type TimelineSig = (u64, u64, u32, u32, u8, bool, Option<usize>);
 
 /// wgpu-backed renderer with the instanced grid fast-path.
 pub struct GpuRenderer {
@@ -79,10 +86,12 @@ pub struct GpuRenderer {
     /// allocates nothing.
     approval: crate::approval_render::ApprovalRenderer,
     /// Idle gate for the timeline path: the `(snapshot version, scroll, viewport, theme,
-    /// alt)` signature last laid out + prepared. When unchanged, the per-frame
+    /// alt, hovered-block)` signature last laid out + prepared. When unchanged, the per-frame
     /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
-    /// instances are redrawn - so an idle present allocates nothing (the T-1.8 floor).
-    timeline_sig: Option<(u64, u64, u32, u32, u8, bool)>,
+    /// instances are redrawn - so an idle present allocates nothing (the T-1.8 floor). The
+    /// hovered block (T-9.8) is folded in so a pointer hover that toggles a block-meta reveal
+    /// forces exactly one relayout.
+    timeline_sig: Option<TimelineSig>,
     /// Virtualized-timeline scroll controller (ticket T-2.7). Follows the bottom (the
     /// live-terminal default) until the user scrolls; the wheel / PageUp / PageDown
     /// bindings that drive it are wired in [`crate::app`] (ticket T-7.2).
@@ -113,6 +122,15 @@ pub struct GpuRenderer {
     drew_completion: bool,
     /// Whether the risk-gate approval card drew on the last frame (T-9.7).
     drew_approval: bool,
+    /// The frame's clickable regions (ticket T-9.8), rebuilt each present from every drawn
+    /// front-end's cached geometry (in draw order, topmost last) and queried by the host's
+    /// pointer path via [`Self::hit_test`]. Reused (clear + push), so a warm present's
+    /// rebuild allocates nothing; it persists untouched across idle frames.
+    hit_map: HitMap,
+    /// The target the pointer currently hovers (ticket T-9.8), set by the host via
+    /// [`Self::set_hover`] before a redraw and read here to drive each front-end's hover
+    /// treatment. `None` when the pointer is over nothing clickable / off-window.
+    hovered: Option<HitTarget>,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -206,6 +224,8 @@ impl GpuRenderer {
             drew_screens: false,
             drew_completion: false,
             drew_approval: false,
+            hit_map: HitMap::new(),
+            hovered: None,
             _window: window,
             scale_factor,
         })
@@ -246,6 +266,34 @@ impl GpuRenderer {
     #[must_use]
     pub fn is_following_bottom(&self) -> bool {
         self.scroll.is_following_bottom()
+    }
+
+    /// The clickable target at `(x, y)` in physical px, or `None` (ticket T-9.8). Queries the
+    /// last-built hit map, so it reflects the most recent present's geometry - valid to call
+    /// between frames (the map persists across idle presents). The host's pointer path uses
+    /// this for hover tracking and click dispatch.
+    #[must_use]
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<HitTarget> {
+        self.hit_map.hit(x, y)
+    }
+
+    /// The target the pointer currently hovers (ticket T-9.8).
+    #[must_use]
+    pub fn hovered(&self) -> Option<HitTarget> {
+        self.hovered
+    }
+
+    /// Set the hovered target (ticket T-9.8) and report whether it CHANGED. The host calls
+    /// this from its `CursorMoved`/`CursorLeft` handling; on a `true` return it re-arms
+    /// keep-warm and requests a redraw so the new hover treatment paints. A `false` return
+    /// (steady hover) must NOT force a redraw - the unchanged-frame early-out then holds and
+    /// the frame allocates nothing (the T-1.8 invariant).
+    pub fn set_hover(&mut self, hovered: Option<HitTarget>) -> bool {
+        if self.hovered == hovered {
+            return false;
+        }
+        self.hovered = hovered;
+        true
     }
 
     /// The input caret's rect in PHYSICAL px `[x, y, w, h]` when the input box drew on
@@ -301,6 +349,24 @@ impl GpuRenderer {
         // Tracy frame zone (ticket T-1.8 AC4); zero-cost with no subscriber.
         let _frame_zone = tracing::trace_span!("frame").entered();
         let clear = linear_to_wgpu(frame.theme.colors.bg_canvas);
+
+        // The pointer's current hover (ticket T-9.8), read once into a local (Copy) so the
+        // disjoint front-end borrows in the build block below don't conflict with `self`.
+        // Front-ends fold their relevant slice of it into their own damage signatures.
+        // While the risk-gate approval card is up it is a MODAL over the pointer: the hit map
+        // is emptied below so nothing behind it is clickable, so the hover TREATMENTS clear
+        // too (a stale brightened glyph / lifted chip would imply a clickable target that is
+        // not) - hover implies clickable. Forcing `None` flips each front-end's folded hover
+        // bit, so they rebuild once to the resting look while the modal owns pointer input.
+        let hovered = if frame.approval.is_some() {
+            None
+        } else {
+            self.hovered
+        };
+        let hovered_block = match hovered {
+            Some(HitTarget::BlockMeta(i)) => Some(i),
+            _ => None,
+        };
 
         // Resolve the shell-integration indicator (ticket T-2.6) so the state reaches
         // the renderer and the presentation seam is exercised every frame. Drawing it
@@ -435,6 +501,7 @@ impl GpuRenderer {
                     effective_h.round() as u32,
                     theme_kind_code(frame.theme),
                     false,
+                    hovered_block,
                 );
                 if self.timeline_sig != Some(sig) {
                     let layout = crate::timeline::layout(blocks, false, scroll, viewport_rows);
@@ -444,6 +511,7 @@ impl GpuRenderer {
                         &mut self.atlas,
                         &layout,
                         title_h,
+                        hovered_block,
                         frame.theme,
                         size,
                     );
@@ -503,6 +571,7 @@ impl GpuRenderer {
                     &mut self.atlas,
                     frame.input.expect("draw_input implies input"),
                     frame.autonomy,
+                    hovered,
                     frame.theme,
                     size,
                 );
@@ -518,6 +587,7 @@ impl GpuRenderer {
                     frame
                         .completion
                         .expect("draw_completion implies completion"),
+                    hovered,
                     input_zone_top,
                     frame.theme,
                     size,
@@ -546,9 +616,41 @@ impl GpuRenderer {
                     &self.queue,
                     &mut self.atlas,
                     &frame.title_bar.expect("draw_title implies title_bar"),
+                    hovered,
                     frame.theme,
                     size,
                 );
+            }
+
+            // Rebuild the frame's hit map (ticket T-9.8) from each drawn front-end's cached
+            // geometry, in DRAW order (bottom to top) so `HitMap::hit`'s last-wins scan
+            // returns the topmost target. Reuses the map's capacity (clear + push), so a warm
+            // present allocates nothing. While the risk-gate approval card is up it is a MODAL
+            // safety overlay (T-9.7): suppress ALL pointer targets so a click can never slip
+            // through to a control behind the pending decision - the map stays empty until it
+            // resolves.
+            self.hit_map.clear();
+            if !draw_approval {
+                if draw_timeline {
+                    for &(index, rect) in self.timeline.block_meta_rects() {
+                        self.hit_map.push(rect, HitTarget::BlockMeta(index));
+                    }
+                }
+                if draw_input {
+                    if let Some(rect) = self.input.chip_rect() {
+                        self.hit_map.push(rect, HitTarget::ModeChip);
+                    }
+                }
+                if draw_completion {
+                    for (i, &rect) in self.completion.row_rects().iter().enumerate() {
+                        self.hit_map.push(rect, HitTarget::CompletionRow(i));
+                    }
+                }
+                if draw_title {
+                    if let Some(rect) = self.title.sidebar_toggle_rect() {
+                        self.hit_map.push(rect, HitTarget::SidebarToggle);
+                    }
+                }
             }
         }
 

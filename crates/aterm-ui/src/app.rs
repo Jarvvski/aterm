@@ -24,10 +24,12 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, StartCause, WindowEvent};
+use winit::event::{
+    ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use aterm_core::{BlockList, Snapshot};
 use aterm_tokens::{Theme, ThemeKind};
@@ -221,6 +223,13 @@ pub trait UiCallbacks {
     /// input box).
     fn on_ime(&mut self, _event: crate::ime::ImeEvent) {}
 
+    /// A completed pointer click landed on `target` (ticket T-9.8): a left-button press then
+    /// release on the SAME hit target (resolved against the renderer's [`crate::hit::HitMap`]).
+    /// The host maps it onto the EXISTING keyboard intent - sidebar glyph == `Cmd-B`, mode
+    /// chip == `Cmd-/`, a completion row == `Enter` - and introduces no new action route.
+    /// Default no-op (a headless host has no clickable chrome).
+    fn on_click(&mut self, _target: crate::hit::HitTarget) {}
+
     /// Called once per wake, before the frame decision, so the host can apply off-thread
     /// state that arrived since the last tick - notably the T-3.5 async highlight/ghost
     /// overlay results, which the host drains here and applies to its `InputModel` so the
@@ -362,6 +371,14 @@ pub struct AtermApp<C: UiCallbacks> {
     /// IME candidate window is only repositioned when the caret actually moves (ticket
     /// T-3.2). `None` until the first position is set.
     last_ime_area: Option<[f32; 4]>,
+    /// The pointer's last position in PHYSICAL px relative to the surface top-left (ticket
+    /// T-9.8), tracked from `CursorMoved` and cleared on `CursorLeft`. `MouseInput` carries no
+    /// position, so a click is resolved against this. `None` when the pointer is off-window.
+    pointer: Option<(f32, f32)>,
+    /// The hit target under the pointer at the last left-button PRESS (ticket T-9.8). A click
+    /// fires only when the release lands on the SAME target, so a press-drag-off never
+    /// activates. `None` between clicks.
+    press_target: Option<crate::hit::HitTarget>,
 }
 
 impl<C: UiCallbacks> AtermApp<C> {
@@ -381,6 +398,8 @@ impl<C: UiCallbacks> AtermApp<C> {
             last_present_at: None,
             mods: ModifiersState::empty(),
             last_ime_area: None,
+            pointer: None,
+            press_target: None,
         }
     }
 
@@ -687,6 +706,74 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                 self.scheduler.note_activity(Instant::now());
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                // Track the pointer (physical px, surface-relative) and update hover (ticket
+                // T-9.8). Only a hover CHANGE flags damage - a steady hover redraws nothing
+                // and allocates nothing (the T-1.8 invariant); crossing into/out of a target
+                // repaints once so its hover treatment shows. The hit map from the last
+                // present is queried (geometry is stable between presents).
+                let (x, y) = (position.x as f32, position.y as f32);
+                self.pointer = Some((x, y));
+                let new_hover = self.renderer.as_ref().and_then(|r| r.hit_test(x, y));
+                let changed = self
+                    .renderer
+                    .as_mut()
+                    .is_some_and(|r| r.set_hover(new_hover));
+                if changed {
+                    if let Some(w) = self.window.as_ref() {
+                        // A pointer cursor over a clickable target, the arrow elsewhere.
+                        w.set_cursor(if new_hover.is_some() {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        });
+                        w.request_redraw();
+                    }
+                    self.scheduler.note_activity(Instant::now());
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // The pointer left the window: clear it + any hover (ticket T-9.8), repainting
+                // once if a hover was showing so its treatment clears.
+                self.pointer = None;
+                let changed = self.renderer.as_mut().is_some_and(|r| r.set_hover(None));
+                if changed {
+                    if let Some(w) = self.window.as_ref() {
+                        w.set_cursor(CursorIcon::Default);
+                        w.request_redraw();
+                    }
+                    self.scheduler.note_activity(Instant::now());
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // Left-button click dispatch (ticket T-9.8). A click is a press then release
+                // on the SAME hit target; the release resolves against the current pointer
+                // position (winit's `MouseInput` carries none). The resolved target is handed
+                // to the host, which maps it onto the existing keyboard intent.
+                let target = self
+                    .pointer
+                    .and_then(|(x, y)| self.renderer.as_ref().and_then(|r| r.hit_test(x, y)));
+                match state {
+                    ElementState::Pressed => self.press_target = target,
+                    ElementState::Released => {
+                        if let (Some(t), Some(pressed)) = (target, self.press_target) {
+                            if t == pressed {
+                                self.callbacks.on_click(t);
+                                // A click is activity: re-arm + repaint so its effect shows.
+                                self.scheduler.note_activity(Instant::now());
+                                if let Some(w) = self.window.as_ref() {
+                                    w.request_redraw();
+                                }
+                            }
+                        }
+                        self.press_target = None;
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
