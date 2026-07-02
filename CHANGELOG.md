@@ -13,6 +13,18 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Changed
 
+- **The command timeline and input box now wear the vision-mock look.** Command blocks lead
+  with an accent `❯` prompt glyph and carry a right-aligned meta - a status dot plus the run
+  duration (a slower success turns the dot `success`-green; a failure shows "exit N · Ns" in
+  `danger`). Plain command output is dimmed one step to `fg.secondary` so a block reads
+  command-then-output, while any color a program prints is preserved. The input box gains the
+  two-accent mode model: the prompt glyph (`❯` shell / `◊` agent), the caret, and the mode
+  chip all tint to the current mode - shell blue or agent purple - and the chip is now a pill
+  in the mode color showing the glyph, label, and the `⌘I` toggle hint. State stays legible
+  without color (the "exit N" / "running" labels and distinct dot shapes). The meta renders
+  always-on for now - its hover-reveal fade reserves the existing focus-dim slot (so the
+  motion budget is unchanged), but the hover gating itself lands with the frame clock.
+  (Tickets T-9.3, T-9.4.)
 - **New warm color palette - aterm now matches its vision-mock look.** Both themes are
   reskinned to the warm two-theme palette adopted as the UI north star in ADR-0011: a warm
   "paper" light (`#FAF7EF`) and a warm near-black dark (`#1B1915`), with warmer semantic

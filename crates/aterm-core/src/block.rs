@@ -109,6 +109,16 @@ impl CommandBlock {
         self.exit_code.map(|c| c == 0)
     }
 
+    /// Wall-clock duration in seconds, once the command has finished (`D` seen);
+    /// `None` while still running. Drives the timeline block-meta's duration readout
+    /// (ticket T-9.3). Fixed the moment the block finishes, so it is stable to fold
+    /// into a render damage-signature.
+    #[must_use]
+    pub fn duration_secs(&self) -> Option<f64> {
+        self.finished_at
+            .map(|f| f.duration_since(self.started_at).as_secs_f64())
+    }
+
     /// A finished, non-interactive command that produced NO output (e.g. `true`,
     /// `cd`): the renderer collapses these to a thin marker line rather than an empty
     /// output card (ticket T-2.5, AC4).

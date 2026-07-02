@@ -58,6 +58,23 @@ pub fn resolve_color(color: CellColor, theme: &Theme, is_fg: bool) -> Rgba {
     }
 }
 
+/// Resolve a VT [`CellColor`] for TIMELINE command-block output (ticket T-9.3).
+///
+/// Identical to [`resolve_color`] with `is_fg = true`, EXCEPT the terminal's *default*
+/// foreground slots resolve to `fg_secondary` (the mock's `ink-dim` output body) rather
+/// than `fg_primary`. This dims plain, uncolored output one step below the command line
+/// (which stays `fg_primary`) so the block reads command-then-output, while any explicit
+/// ANSI / 256-color / RGB color a program emits is preserved verbatim. The raw-VT grid
+/// fast-path keeps using [`resolve_color`] (default fg = `fg_primary`), so this dimming
+/// is scoped to the block timeline only.
+#[must_use]
+pub fn resolve_output_color(color: CellColor, theme: &Theme) -> Rgba {
+    match color {
+        CellColor::Named(NAMED_FOREGROUND | NAMED_BRIGHT_FOREGROUND) => theme.colors.fg_secondary,
+        other => resolve_color(other, theme, true),
+    }
+}
+
 /// Resolve an xterm 256-color palette index: 0..=15 themed ANSI, 16..=231 the
 /// 6x6x6 color cube, 232..=255 the 24-step grayscale ramp. The full 256-color
 /// resolution lives in the leaf token crate ([`aterm_tokens::AnsiPalette::indexed`])

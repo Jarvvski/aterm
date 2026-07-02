@@ -28,7 +28,7 @@
 //! `motion.fast` [`Animation::CrossFade`] as the gate badge - it is the cross-fade
 //! animation, not a fourth kind - so the cap of three holds.
 
-use aterm_tokens::{legible_against, motion, space, type_scale, Rgba, Theme, TypeStyle};
+use aterm_tokens::{legible_against, motion, space, type_scale, Mode, Rgba, Theme, TypeStyle};
 
 use crate::timeline::GutterMarker;
 
@@ -252,10 +252,12 @@ impl GutterStyle {
     }
 }
 
-/// The flat-rectangle geometry of a command block (no heavy box; delimited by a
-/// hairline top + bottom only - [`07-ia-design-language.md`] §5). The command line is
-/// `fg.primary`; the output uses the per-theme ANSI palette on the canvas; a collapsed
-/// block's "... +N lines" affordance is `fg.muted`. All colors via tokens.
+/// The flat-rectangle geometry of a command block (no heavy box; delimited by a single
+/// `hairline` TOP rule per block, none above the first - the mock / T-9.3). The command
+/// line is `fg.primary`; DEFAULT (uncolored) output dims to `fg.secondary` via
+/// [`crate::text::resolve_output_color`] (the mock's `ink-dim` body) while explicit
+/// ANSI/RGB is preserved; a collapsed block's "... +N lines" affordance is `fg.muted`.
+/// All colors via tokens.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandBlockStyle {
     /// Left gutter width (`space.4`).
@@ -286,6 +288,90 @@ impl CommandBlockStyle {
 }
 
 // ---------------------------------------------------------------------------
+// Command-block META (right-aligned status dot + duration, the mock's block-meta)
+// ---------------------------------------------------------------------------
+
+/// The success-duration threshold in seconds (ticket T-9.3): an exit-0 command that ran
+/// at least this long earns the loud `success` dot, while a quicker one reads as a plain
+/// `fg_muted` dot - the mock's distinction between `git status` at 0.06s (faint) and
+/// `cargo build` at 12.71s (success). A tuning default, NOT a protocol constant.
+pub const META_SUCCESS_SECS: f64 = 1.0;
+
+/// The right-aligned command-block META (ticket T-9.3): a status dot + a duration /
+/// state caption, mirroring the vision mock's `.block-meta`. The dot COLOR reads the
+/// exit state; the "exit N" (failure), "running", "approx", and "tui" text labels keep
+/// every state legible WITHOUT color (color-blind safety - color is never the only
+/// signal). It is revealed on block hover via the SHARED [`Animation::FocusDim`] slot
+/// (NOT a fourth animation), so the 3-animation motion budget still holds.
+///
+/// This is the mock's reconciliation of the old gutter-status contract (T-4.6): the
+/// gutter now carries the accent `❯` prompt glyph, and the status dot + duration move
+/// here. The running pulse dot is preserved - relocated into this meta (its `pulsing`).
+#[derive(Debug, Clone, Copy)]
+pub struct BlockMetaStyle {
+    /// The status dot's glyph: a filled dot for running / exit-0 / failure, and the
+    /// distinct hollow / half / caret shapes for the other states (the shape reinforces
+    /// the color for a color-blind eye, as in [`GutterStyle`]).
+    pub dot_glyph: char,
+    pub dot_shape: GutterShape,
+    /// The dot's semantic color: accent (running), `fg_muted` (quick exit-0), `success`
+    /// (a longer exit-0), `danger` (failure), `caution` (approximate), ...
+    pub dot_color: Rgba,
+    /// The caption text color - the mock's faint meta tone (`fg_muted`) for every state.
+    pub text_color: Rgba,
+    /// The failed exit code, if any (rendered as "exit N" in the caption).
+    pub exit_code: Option<i32>,
+    /// A terse state label ("approx" / "tui") for a non-exit state; `None` otherwise.
+    pub label: Option<&'static str>,
+    /// True only for a running block - the single pulsing-dot animation.
+    pub pulsing: bool,
+    /// `type.caption` - the small meta register (the mock's ~0.82em).
+    pub type_style: TypeStyle,
+}
+
+impl BlockMetaStyle {
+    /// Resolve the meta for a block's [`GutterMarker`] and (optional, finished) duration.
+    /// Exit-0 splits by duration into a faint or a success dot; a failure is always the
+    /// `danger` dot; the other states inherit the gutter glyph / shape / color.
+    #[must_use]
+    pub fn resolve(marker: GutterMarker, duration_secs: Option<f64>, theme: &Theme) -> Self {
+        let c = &theme.colors;
+        let g = GutterStyle::resolve(marker, theme);
+        // Exit 0 splits by duration: a quick command is a faint plain dot (the mock's
+        // instant-command meta); only a longer one earns the success color. Both keep a
+        // filled-dot shape - the mock treats every finished command as a colored dot, and
+        // the "exit N" label (present only on failure) carries the color-blind distinction.
+        let (dot_glyph, dot_shape, dot_color) = match marker {
+            GutterMarker::Ok => {
+                let long = duration_secs.is_some_and(|d| d >= META_SUCCESS_SECS);
+                let color = if long { c.success } else { c.fg_muted };
+                ('\u{f111}', GutterShape::Dot, color) // nf-fa-circle (filled dot)
+            }
+            GutterMarker::Failed(_) => ('\u{f111}', GutterShape::Dot, c.danger),
+            // Running / Unknown / Interactive / Approximate keep their gutter treatment.
+            _ => (g.glyph, g.shape, g.color),
+        };
+        Self {
+            dot_glyph,
+            dot_shape,
+            dot_color,
+            text_color: c.fg_muted,
+            exit_code: g.exit_code,
+            label: g.label,
+            pulsing: g.pulsing,
+            type_style: type_scale::CAPTION,
+        }
+    }
+
+    /// The animation the meta fades in with on block hover: the SHARED `motion.slow`
+    /// [`Animation::FocusDim`] slot (NOT a fourth animation - the budget stays three).
+    #[must_use]
+    pub fn reveal_animation() -> Animation {
+        Animation::FocusDim
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Prompt routing-target chip (the unified input box)
 // ---------------------------------------------------------------------------
 
@@ -299,10 +385,21 @@ pub enum PromptMode {
     Agent,
 }
 
-/// The routing-target chip at the input's left edge. SHELL is the neutral chip; AGENT
-/// is the accent (`Info`) chip. Toggling cross-fades between the two within
-/// `motion.fast` ([`Animation::CrossFade`]); the caret stays one accent blue (the
-/// locked decision - recoloring per mode is the owner-confirm alternative).
+/// How far the mode accent is pulled toward the canvas for the mode-chip FILL - the
+/// mock's `color-mix(in srgb, var(--mode) 13%, transparent)` composited over the
+/// canvas, stored opaque. Low enough to stay a quiet tint, high enough that the
+/// same-hue accent text clears the UI contrast floor on it (guarded by
+/// [`tests::mode_chip_text_is_legible_on_its_tint`]).
+const MODE_CHIP_TINT_T: f32 = 0.87;
+
+/// The routing-target MODE CHIP at the input's right edge (ticket T-9.4). Both modes
+/// now render as a pill in the CURRENT MODE COLOR (the mock's `--mode` chip, ADR-0011):
+/// a 1px accent border, a ~13% accent tint fill, and accent text - shell blue
+/// ([`aterm_tokens::SemanticColors::accent_primary`]) / agent purple (`accent_agent`).
+/// Toggling cross-fades between the two within `motion.fast` ([`Animation::CrossFade`]);
+/// the caret + prompt glyph shift to the same mode accent (no longer one fixed blue -
+/// this realizes the two-accent model). The `label` is the mock's title-case
+/// "Shell" / "Agent".
 #[derive(Debug, Clone, Copy)]
 pub struct PromptChip {
     pub mode: PromptMode,
@@ -313,15 +410,26 @@ pub struct PromptChip {
 impl PromptChip {
     #[must_use]
     pub fn resolve(mode: PromptMode, theme: &Theme) -> Self {
-        let (label, variant) = match mode {
-            PromptMode::Shell => ("SHELL", ChipVariant::Neutral),
-            PromptMode::Agent => ("AGENT", ChipVariant::Info),
+        let c = &theme.colors;
+        let (label, accent) = match mode {
+            PromptMode::Shell => ("Shell", c.mode_accent(Mode::Shell)),
+            PromptMode::Agent => ("Agent", c.mode_accent(Mode::Agent)),
         };
-        Self {
-            mode,
-            label,
-            chip: ChipStyle::resolve(variant, theme),
-        }
+        // A pill in the current mode color: a 1px accent border, a ~13% accent tint fill
+        // over the canvas, and accent text pulled the minimal amount to clear the UI
+        // contrast floor on that tint (a near-no-op, like the Info chip).
+        let fill = mix(accent, c.bg_canvas, MODE_CHIP_TINT_T);
+        let text = legible_against(accent, fill, CHIP_MIN_CONTRAST);
+        let chip = ChipStyle {
+            fill,
+            text,
+            border: Some(accent),
+            radius_px: space::RADIUS_SM,
+            pad_x: space::S2,
+            pad_y: space::S1,
+            type_style: type_scale::LABEL,
+        };
+        Self { mode, label, chip }
     }
 
     /// The animation that plays when the routing target toggles: a `motion.fast`
@@ -731,20 +839,107 @@ mod tests {
         }
     }
 
+    // ----- command-block meta -------------------------------------------
+
+    #[test]
+    fn block_meta_maps_state_to_token_color_shape_and_label() {
+        // T-9.3 AC1/AC2: the meta dot color reads the exit state, the shape reinforces
+        // it, and the failure "exit N" / approx labels keep it legible without color.
+        // The caption text is the faint meta tone (fg_muted) in every state, both themes.
+        for theme in themes() {
+            let c = &theme.colors;
+            // Exit 0, long: the loud success dot.
+            let ok_long = BlockMetaStyle::resolve(GutterMarker::Ok, Some(12.71), &theme);
+            assert_eq!(ok_long.dot_color, c.success);
+            assert_eq!(ok_long.dot_shape, GutterShape::Dot);
+            assert_eq!(ok_long.exit_code, None);
+            assert!(!ok_long.pulsing);
+            // Exit 0, quick (< threshold): a faint plain dot (the mock's instant meta).
+            let ok_quick = BlockMetaStyle::resolve(GutterMarker::Ok, Some(0.06), &theme);
+            assert_eq!(ok_quick.dot_color, c.fg_muted);
+            assert_eq!(ok_quick.dot_shape, GutterShape::Dot);
+            // Failure: the danger dot carrying its exit code.
+            let failed = BlockMetaStyle::resolve(GutterMarker::Failed(1), Some(2.34), &theme);
+            assert_eq!(failed.dot_color, c.danger);
+            assert_eq!(failed.exit_code, Some(1));
+            // Running: the accent pulsing dot (the single running animation, relocated
+            // from the gutter into the meta).
+            let running = BlockMetaStyle::resolve(GutterMarker::Running, None, &theme);
+            assert_eq!(running.dot_color, c.accent_primary);
+            assert!(running.pulsing);
+            // Approximate: a caution half-dot, labelled so the approximation is loud.
+            let approx = BlockMetaStyle::resolve(GutterMarker::Approximate, Some(0.01), &theme);
+            assert_eq!(approx.dot_color, c.caution);
+            assert_eq!(approx.dot_shape, GutterShape::HalfDot);
+            assert_eq!(approx.label, Some("approx"));
+
+            // Every state's caption ink is the faint meta tone.
+            for meta in [ok_long, ok_quick, failed, running, approx] {
+                assert_eq!(meta.text_color, c.fg_muted);
+                assert!(matches!(meta.type_style.font, FontRole::Ui));
+            }
+        }
+    }
+
+    #[test]
+    fn block_meta_reveal_reuses_the_focus_dim_slot_not_a_fourth_animation() {
+        // T-9.3 AC3: the hover fade reuses an EXISTING animation slot (FocusDim), so the
+        // allowed set stays at three and the <=220ms motion budget holds.
+        let anim = BlockMetaStyle::reveal_animation();
+        assert_eq!(anim, Animation::FocusDim);
+        assert!(Animation::ALL.contains(&anim));
+        assert!(anim.spec().duration_ms <= motion::SLOW_MS);
+    }
+
     // ----- prompt routing chip ------------------------------------------
 
     #[test]
-    fn prompt_chip_is_neutral_for_shell_accent_for_agent() {
+    fn prompt_chip_is_mode_colored_for_both_modes() {
+        // T-9.4 / ADR-0011: both modes are a pill in the current MODE color (no longer
+        // neutral SHELL / accent AGENT). Shell = accent_primary (blue), Agent =
+        // accent_agent (purple); border + text are the accent, the fill its ~13% tint.
         for theme in themes() {
+            let c = &theme.colors;
             let shell = PromptChip::resolve(PromptMode::Shell, &theme);
-            assert_eq!(shell.label, "SHELL");
-            assert_eq!(shell.chip.fill, theme.colors.bg_surface);
-            assert_eq!(shell.chip.text, theme.colors.fg_secondary);
+            assert_eq!(shell.label, "Shell");
+            assert_eq!(shell.chip.border, Some(c.accent_primary));
+            let shell_fill = mix(c.accent_primary, c.bg_canvas, MODE_CHIP_TINT_T);
+            assert_eq!(shell.chip.fill, shell_fill);
+            assert_eq!(
+                shell.chip.text,
+                legible_against(c.accent_primary, shell_fill, CHIP_MIN_CONTRAST)
+            );
 
             let agent = PromptChip::resolve(PromptMode::Agent, &theme);
-            assert_eq!(agent.label, "AGENT");
-            assert_eq!(agent.chip.fill, theme.colors.accent_primary_weak);
-            assert_eq!(agent.chip.text, theme.colors.accent_primary_text);
+            assert_eq!(agent.label, "Agent");
+            assert_eq!(agent.chip.border, Some(c.accent_agent));
+            let agent_fill = mix(c.accent_agent, c.bg_canvas, MODE_CHIP_TINT_T);
+            assert_eq!(agent.chip.fill, agent_fill);
+            assert_eq!(
+                agent.chip.text,
+                legible_against(c.accent_agent, agent_fill, CHIP_MIN_CONTRAST)
+            );
+
+            // The two modes are visually distinct (shell blue vs agent purple).
+            assert_ne!(shell.chip.border, agent.chip.border);
+            assert_ne!(shell.chip.fill, agent.chip.fill);
+        }
+    }
+
+    #[test]
+    fn mode_chip_text_is_legible_on_its_tint() {
+        // The mode color reads as the chip TEXT on its own ~13% tint fill; it must clear
+        // the 3:1 UI-contrast floor in both themes and both modes (color-blind + a11y).
+        for theme in themes() {
+            for mode in [PromptMode::Shell, PromptMode::Agent] {
+                let chip = PromptChip::resolve(mode, &theme).chip;
+                let ratio = contrast_ratio(chip.text, chip.fill);
+                assert!(
+                    ratio >= 3.0,
+                    "{:?} {mode:?} chip: text-on-tint is {ratio:.2}:1, want >= 3:1",
+                    theme.kind
+                );
+            }
         }
     }
 

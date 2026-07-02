@@ -3,12 +3,16 @@
 //! ([`crate::prose`]).
 //!
 //! Where the grid draws the raw VT viewport, this draws the Warp-style block timeline:
-//! the virtualized [`TimelineLayout`] (ticket T-2.7) turned into on-screen command
-//! blocks styled to the iA component spec ([`crate::components`]) - a left-gutter status
-//! marker, the re-rendered command line, the captured output rows, hairline separators,
-//! and the "... +N lines" collapse affordance. Finished blocks draw from their immutable
-//! captured `output` ([`aterm_core::RowSnapshot`], byte-replayed at finish), so they are
-//! immune to the live grid's scrollback eviction.
+//! the virtualized [`TimelineLayout`] (ticket T-2.7) turned into on-screen command blocks
+//! styled to the vision mock ([`crate::components`], T-9.3) - a command block leads with
+//! the accent `❯` prompt glyph in the gutter, the re-rendered command line, a
+//! right-aligned block-meta (a [`BlockMetaStyle`] status dot + duration / "exit N"), the
+//! captured output rows (dimmed to `fg.secondary`), a single top hairline separator (none
+//! above the first block), and the "... +N lines" collapse affordance. (Agent-step rows
+//! still draw a left-gutter status marker; the agent transcript re-skin is T-9.6.)
+//! Finished blocks draw from their immutable captured `output`
+//! ([`aterm_core::RowSnapshot`], byte-replayed at finish), so they are immune to the live
+//! grid's scrollback eviction.
 //!
 //! ## One shaping engine, identical cells
 //! Output rows and the command line go through the SAME per-cell emitter the grid uses
@@ -38,17 +42,46 @@
 
 use std::mem::size_of;
 
-use aterm_tokens::{type_scale, Theme};
+use aterm_tokens::{type_scale, Mode, Theme};
 
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
-use crate::components::{CommandBlockStyle, GutterStyle, RiskBadge, RiskState};
+use crate::components::{BlockMetaStyle, CommandBlockStyle, GutterStyle, RiskBadge, RiskState};
 use crate::grid_render::FrameSize;
-use crate::text::{resolve_color, FontFamily, GridCell};
+use crate::text::{resolve_color, resolve_output_color, FontFamily, GridCell};
 use crate::timeline::{GutterMarker, TimelineLayout, TimelineMode, TimelineRow, GAP_ROWS};
 use crate::window::cell_px;
 use aterm_core::AgentBadge;
 use aterm_tokens::space;
+
+/// The shell prompt glyph drawn in the timeline gutter for a command block (the mock's
+/// accent `❯`, U+276F). Verified present in the bundled Mono Nerd Font by the input
+/// widget's `prompt_glyphs_exist_in_the_bundled_grid_font` test (same face).
+const SHELL_PROMPT_GLYPH: char = '\u{276F}';
+
+/// The middle-dot separating "exit N" from the duration in the block-meta caption
+/// (U+00B7, present in the bundled Mono face - unlike U+2026, so this is safe).
+const META_SEP: char = '\u{00B7}';
+
+/// The block-meta caption for a command block: "exit N \u{00b7} 1.23s" on failure,
+/// "running" while running, the terse state label ("approx" / "tui"), or just the
+/// duration for a plain exit-0 (the mock's `.block-meta` text). Allocates in the
+/// rebuild path only (never in the unchanged-signature early-out).
+fn meta_caption(meta: &BlockMetaStyle, duration_secs: Option<f64>) -> String {
+    let dur = duration_secs.map(|d| format!("{d:.2}s"));
+    if let Some(code) = meta.exit_code {
+        match &dur {
+            Some(d) => format!("exit {code} {META_SEP} {d}"),
+            None => format!("exit {code}"),
+        }
+    } else if let Some(label) = meta.label {
+        label.to_string()
+    } else if meta.pulsing {
+        "running".to_string()
+    } else {
+        dur.unwrap_or_default()
+    }
+}
 
 /// Map the agent-domain-free [`AgentBadge`] a tool-call block carries onto the
 /// UI-local [`RiskState`] the badge styler speaks (ticket T-5.11). This is the
@@ -167,6 +200,9 @@ impl TimelineRenderer {
         let metrics = atlas.cell_metrics(FontFamily::Grid, px);
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
         let cmd = CommandBlockStyle::resolve(theme);
+        // The gutter prompt glyph is the shell accent (a command block is always a
+        // shell prompt); the mode-tinted AGENT prompt lives in the input box (T-9.4).
+        let prompt_color = theme.colors.mode_accent(Mode::Shell);
         let canvas = theme.colors.bg_canvas;
         let ctx = CellCtx {
             cw,
@@ -228,18 +264,22 @@ impl TimelineRenderer {
                 match row {
                     TimelineRow::Command => {
                         let Some(cb) = command_block else { continue };
-                        // Gutter status marker (Mono glyph in the marker color).
-                        let marker = grid_glyph(gutter.glyph, gutter.color, canvas);
+                        // The accent `❯` prompt glyph in the gutter (the mock's shell
+                        // block; ADR-0011). The status dot + duration move to the
+                        // right-aligned block-meta below, so the gutter reads as a
+                        // prompt, not a status icon.
+                        let prompt = grid_glyph(SHELL_PROMPT_GLYPH, prompt_color, canvas);
                         emit_cell(
                             atlas,
                             queue,
-                            &marker,
+                            &prompt,
                             (marker_x, y),
                             &ctx,
                             &mut self.bg_instances,
                             &mut self.glyph_instances,
                         );
                         // The re-rendered command line (Mono fg.primary).
+                        let cmd_cols = cb.command.chars().count();
                         let mut x = content_x;
                         for c in cb.command.chars() {
                             let cell = grid_glyph(c, cmd.command_fg, canvas);
@@ -254,29 +294,42 @@ impl TimelineRenderer {
                             );
                             x += cw;
                         }
-                        // A trailing tag in the marker color: the failed exit code, or
-                        // the heuristic/interactive label - so the gutter state reads in
-                        // text too (color is never the only signal).
-                        let mut tag = String::new();
-                        if let Some(code) = gutter.exit_code {
-                            tag = format!("[{code}]");
-                        } else if let Some(label) = gutter.label {
-                            tag = format!("[{label}]");
-                        }
-                        if !tag.is_empty() {
-                            x += cw; // one-cell gap after the command
-                            for c in tag.chars() {
-                                let cell = grid_glyph(c, gutter.color, canvas);
+                        // Right-aligned block-meta: a status dot + duration / "exit N"
+                        // caption, in the faint meta tone (the mock's `.block-meta`; the
+                        // dot color/shape + the caption label carry the state, color is
+                        // never the only signal). Drawn only when it clears the command
+                        // text - a very narrow block hides it, matching the meta's
+                        // hover-revealed intent (hover-gating itself is a follow-up:
+                        // the reveal reuses the FocusDim slot, `BlockMetaStyle`).
+                        let meta = BlockMetaStyle::resolve(vb.gutter, cb.duration_secs(), theme);
+                        let caption = meta_caption(&meta, cb.duration_secs());
+                        let meta_cols = 2 + caption.chars().count(); // dot + gap + caption
+                        let meta_start = edge + inner_w - meta_cols as f32 * cw;
+                        let command_end = content_x + cmd_cols as f32 * cw;
+                        if meta_start >= command_end + cw {
+                            let dot = grid_glyph(meta.dot_glyph, meta.dot_color, canvas);
+                            emit_cell(
+                                atlas,
+                                queue,
+                                &dot,
+                                (meta_start, y),
+                                &ctx,
+                                &mut self.bg_instances,
+                                &mut self.glyph_instances,
+                            );
+                            let mut mx = meta_start + 2.0 * cw; // dot + one-cell gap
+                            for c in caption.chars() {
+                                let cell = grid_glyph(c, meta.text_color, canvas);
                                 emit_cell(
                                     atlas,
                                     queue,
                                     &cell,
-                                    (x, y),
+                                    (mx, y),
                                     &ctx,
                                     &mut self.bg_instances,
                                     &mut self.glyph_instances,
                                 );
-                                x += cw;
+                                mx += cw;
                             }
                         }
                     }
@@ -286,7 +339,9 @@ impl TimelineRenderer {
                                 if sc.wide_spacer {
                                     continue;
                                 }
-                                let mut fg = resolve_color(sc.fg, theme, true);
+                                // Default (uncolored) output dims to fg.secondary (the
+                                // mock's ink-dim body); explicit ANSI/RGB is preserved.
+                                let mut fg = resolve_output_color(sc.fg, theme);
                                 let mut bg = resolve_color(sc.bg, theme, false);
                                 if sc.inverse {
                                     std::mem::swap(&mut fg, &mut bg);
@@ -567,6 +622,15 @@ fn signature(layout: &TimelineLayout, w: u32, h: u32, px_key: u32, theme: &Theme
                 .and_then(|c| c.exit_code)
                 .map_or(u64::MAX, |c| c as i64 as u64),
         );
+        // The finished duration drives the block-meta caption + the faint/success dot
+        // split (ticket T-9.3); fold it so a block gaining a duration (or crossing the
+        // success threshold) redraws. Fixed once finished, so it stays frame-stable.
+        s = fold_u64(
+            s,
+            command_block
+                .and_then(|c| c.duration_secs())
+                .map_or(0, |d| (d * 1000.0) as u64),
+        );
         s = fold_u64(s, vb.block.is_running() as u64);
         // An agent step's version (ticket T-5.10): a streamed text delta bumps ONLY
         // this entry's version, so folding it invalidates the gate for exactly this
@@ -675,6 +739,47 @@ mod sig_tests {
 
     fn dark() -> Theme {
         *Theme::for_kind(ThemeKind::Dark)
+    }
+
+    #[test]
+    fn meta_glyphs_exist_in_the_bundled_grid_font() {
+        // T-9.3: the block-meta draws its status dot + the "\u{00b7}" separator through
+        // the Mono GRID face; a glyph missing from the bundled face renders `.notdef` (a
+        // box) and silently breaks the meta - the exact class of regression the prompt /
+        // gutter / chip glyph tests guard. This ties coverage to BlockMetaStyle's OWN dot
+        // glyphs (which already diverge from GutterStyle - the success dot is a filled dot,
+        // not the gutter's check tick) plus META_SEP, not the gutter test's glyph set.
+        // Pure font parse: runs on every platform (unlike the macOS-only GPU tests).
+        use crate::glyph::GlyphRasterizer;
+        use crate::text::FaceStyle;
+        let r = GlyphRasterizer::new();
+        let theme = dark();
+        let markers = [
+            GutterMarker::Running,
+            GutterMarker::Ok,
+            GutterMarker::Failed(1),
+            GutterMarker::Unknown,
+            GutterMarker::Interactive,
+            GutterMarker::Approximate,
+        ];
+        // Both the quick and the long Ok split (different dot color, same glyph) + none.
+        for marker in markers {
+            for dur in [Some(0.01_f64), Some(9.9), None] {
+                let meta = BlockMetaStyle::resolve(marker, dur, &theme);
+                let gid = r.glyph_id(FontFamily::Grid, FaceStyle::Regular, meta.dot_glyph);
+                assert_ne!(
+                    gid, 0,
+                    "{marker:?} meta dot glyph U+{:04X} is .notdef in the bundled Mono Nerd Font",
+                    meta.dot_glyph as u32
+                );
+            }
+        }
+        assert_ne!(
+            r.glyph_id(FontFamily::Grid, FaceStyle::Regular, META_SEP),
+            0,
+            "meta separator U+{:04X} is .notdef in the bundled Mono Nerd Font",
+            META_SEP as u32
+        );
     }
 
     #[test]
@@ -1165,6 +1270,83 @@ mod gpu_tests {
                 !rb.any_ink(hx0, 1, hx1, top as u32, 18),
                 "{kind:?}: no hairline renders above the first block (no top edge line)"
             );
+        }
+    }
+
+    /// A mixed finished timeline (ticket T-9.3 AC4): block 0 = exit 0 with output (ok),
+    /// block 1 = exit 1 with output (failed), block 2 = exit 0 with NO output (a thin,
+    /// instant command). Built through the real segmenter + `set_block_output`.
+    fn mixed_finished_blocks() -> aterm_core::BlockList {
+        use aterm_core::{BlockSegmenter, CellColor, Mark, PromptKind, RowSnapshot, SnapshotCell};
+        let mut list = aterm_core::BlockList::new();
+        let mut seg = BlockSegmenter::new();
+        for (b, exit) in [(0usize, 0i32), (1, 1), (2, 0)] {
+            let base = b * 4;
+            seg.apply(&Mark::Prompt(PromptKind::PromptStart), base, &mut list);
+            seg.apply(&Mark::Prompt(PromptKind::OutputStart), base + 1, &mut list);
+            seg.apply(
+                &Mark::Prompt(PromptKind::CommandDone {
+                    exit_code: Some(exit),
+                }),
+                base + 3,
+                &mut list,
+            );
+        }
+        let rows: Vec<RowSnapshot> = (0..2usize)
+            .map(|_| {
+                RowSnapshot::new(vec![SnapshotCell {
+                    c: 'X',
+                    fg: CellColor::Rgb(255, 255, 255),
+                    bg: CellColor::Named(257),
+                    ..Default::default()
+                }])
+            })
+            .collect();
+        list.set_block_output(0, rows.clone()); // ok: has output
+        list.set_block_output(1, rows); // failed: has output
+                                        // block 2 keeps no output -> thin/instant.
+        list
+    }
+
+    #[test]
+    fn timeline_block_meta_inks_for_ok_failed_and_instant_in_both_themes() {
+        // T-9.3 AC4: a mixed timeline (ok / failed / instant) renders its right-aligned
+        // block-meta on EACH command row, in both themes. The exact per-state colors are
+        // asserted in the pure `block_meta_maps_state_to_token_color_shape_and_label`
+        // test; here we prove the meta actually inks on screen for all three states.
+        let Some((device, queue, format)) = device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (_cw, ch) = cell_px(SCALE);
+        let top = f32::from(space::S12) * SCALE;
+        let edge = f32::from(space::S8) * SCALE;
+        // Wide enough that the meta ("exit 1 \u{00b7} 0.00s") fits to the right of the
+        // (empty) command text; 12 viewport rows show all 9 gapped display rows.
+        let (w, h) = (360u32, (top + 12.0 * ch) as u32);
+        // Gapped layout: block0 cmd row 0, block1 cmd row 4, block2 cmd row 8.
+        let meta_rows = [0.0f32, 4.0, 8.0];
+
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            let theme = *Theme::for_kind(kind);
+            let mut atlas = GlyphAtlas::new(&device, format);
+            let mut tl = TimelineRenderer::new(&device);
+            let blocks = mixed_finished_blocks();
+            let l = layout(&blocks, false, Scroll::default(), 12);
+            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, &theme, w, h);
+
+            // The meta is right-aligned inside the inner canvas [edge, w-edge); sample a
+            // right-side band on each command row (clear of the left-gutter prompt glyph
+            // and the empty command text).
+            let mx0 = w / 2;
+            let mx1 = (w as f32 - edge) as u32;
+            for (i, row) in meta_rows.iter().enumerate() {
+                let ry = (top + row * ch) as u32;
+                assert!(
+                    rb.any_ink(mx0, ry, mx1, ry + ch as u32, 30),
+                    "{kind:?}: block {i}'s block-meta (dot + caption) inks on its command row"
+                );
+            }
         }
     }
 

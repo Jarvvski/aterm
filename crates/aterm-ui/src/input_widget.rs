@@ -3,26 +3,29 @@
 //! and the block timeline ([`crate::timeline_render`]).
 //!
 //! aterm has ONE shell-first input field pinned to the bottom of the window. This draws
-//! it to the iA spec ([`05-unified-input-ux.md`] §3, [`07-ia-design-language.md`] §5): a
-//! hairline separating it from the timeline, a mode-carrying prompt glyph (`❯` Shell /
-//! a Nerd-Font "sparkles" icon Agent), the Mono command line with a 2px accent caret, a
-//! small right-aligned
-//! SHELL/AGENT chip, a fish-style muted ghost-text tail, an inline IME preedit underline,
-//! and the async syntax-highlight overlay - all reading the pure [`aterm_core::InputModel`]
-//! the host (`aterm-app` `Session`) owns and drives.
+//! it to the iA spec ([`05-unified-input-ux.md`] §3, [`07-ia-design-language.md`] §5) and
+//! the vision mock (ADR-0011): a hairline separating it from the timeline, a mode-carrying
+//! prompt glyph (`❯` Shell / `◊` Agent) tinted to the current mode accent, the Mono command
+//! line with a 2px mode-tinted caret, a right-aligned mode PILL chip (glyph + label + `⌘I`),
+//! a fish-style muted ghost-text tail, an inline IME preedit underline, and the async
+//! syntax-highlight overlay - all reading the pure [`aterm_core::InputModel`] the host
+//! (`aterm-app` `Session`) owns and drives.
 //!
-//! ## What carries the mode (locked decision)
-//! The caret stays the ONE accent blue ([`aterm_tokens`] `accent_primary`) in BOTH modes
-//! (an amber agent caret would collide with the `caution` risk color - ADR / ticket
-//! note). The mode reads from the prompt-glyph SHAPE + the chip ([`crate::components`]
-//! `PromptChip`: neutral SHELL / accent AGENT) + the empty-buffer placeholder text. The
-//! chip occupies a FIXED-WIDTH slot (the max of the two labels), so toggling swaps only
-//! the fill + label and never reflows - and, critically, the input TEXT origin is fixed,
-//! so the text never moves when the mode flips (AC2; the text itself is preserved by the
-//! `InputModel` reducer, ADR-0004). The `motion.fast` cross-fade ([`crate::components`]
-//! `Animation::CrossFade`) is the spec; like the timeline's running-pulse / block-insert /
-//! focus-dim it is not yet TIME-driven (no frame clock is plumbed into a `Frame` yet), so
-//! the swap is instant today (trivially within the 90ms budget) and reflow-free.
+//! ## What carries the mode (ADR-0011)
+//! The mode is signaled TOGETHER by three things, all in the current mode accent
+//! ([`aterm_tokens::SemanticColors::mode_accent`]: shell blue `accent_primary` / agent
+//! purple `accent_agent`): the prompt-glyph SHAPE + color (`❯` / `◊`), the CARET tint, and
+//! the mode chip ([`crate::components`] `PromptChip`). ADR-0011 relaxed the former
+//! one-accent rule (the old "caret stays one blue" note is retired - the mock recolors the
+//! caret per mode, and purple, not amber, avoids the `caution` collision). The empty-buffer
+//! placeholder text reinforces it. The chip occupies a FIXED-WIDTH slot (the max of the two
+//! modes' content), so toggling swaps only the color + label and never reflows - and,
+//! critically, the input TEXT origin is fixed, so the text never moves when the mode flips
+//! (AC2; the text itself is preserved by the `InputModel` reducer, ADR-0004). The
+//! `motion.fast` cross-fade ([`crate::components`] `Animation::CrossFade`) is the spec; like
+//! the timeline's running-pulse / block-insert / focus-dim it is not yet TIME-driven (no
+//! frame clock is plumbed into a `Frame` yet), so the swap is instant today (trivially
+//! within the 90ms budget) and reflow-free.
 //!
 //! ## One shaping engine, identical cells
 //! The command line, prompt glyph, ghost tail, and preedit all go through the SAME per-cell
@@ -52,7 +55,7 @@
 
 use std::mem::size_of;
 
-use aterm_tokens::{space, type_scale, Rgba, Theme};
+use aterm_tokens::{space, type_scale, Mode, Rgba, Theme};
 
 use aterm_core::{Highlight, InputMode, InputModel, Preedit, Selection, SpanKind};
 
@@ -75,21 +78,25 @@ const CARET_WIDTH_LOGICAL: f32 = 2.0;
 /// The Shell prompt glyph (`❯`, U+276F): the shell-first default. Verified present in the
 /// bundled Mono Nerd Font (`prompt_glyphs_exist_in_the_bundled_grid_font`).
 const SHELL_GLYPH: char = '\u{276F}';
-/// The Agent prompt glyph: the Nerd Font "sparkles" icon (`nf-md-creation`, U+F0674) - the
-/// research's "small spark" for the agent ([`05-unified-input-ux.md`] §3). It lives in the
-/// supplementary PUA, so it is auto-scaled/centered into the cell by the T-4.4 constraint
-/// table (`0xF0000..` -> FIT_CENTER) and is verified present in the bundled face. NOTE the
-/// obvious geometric "spark"/"star" BMP glyphs (U+2726 `✦`, U+2605 `★`, …) are NOT in this
-/// Mono Nerd Font - they resolve to `.notdef` - so the mode glyph MUST be a present PUA
-/// icon (this is what the `prompt_glyphs_exist_in_the_bundled_grid_font` test guards).
-const AGENT_GLYPH: char = '\u{F0674}';
+/// The Agent prompt glyph: the diamond `◊` (U+25CA LOZENGE) - the mock's `◇` (U+25C7 WHITE
+/// DIAMOND) is `.notdef` in the bundled Mono Nerd Font, so the nearest PRESENT diamond
+/// outline stands in for it (both read as "a diamond"; verified by
+/// `prompt_glyphs_exist_in_the_bundled_grid_font`). NOTE the obvious geometric shapes vary
+/// wildly in Nerd-Font coverage (U+25C7 `◇` and U+2726 `✦` are absent, U+25CA `◊` present),
+/// so the mode glyph MUST be a coverage-checked codepoint - which that test guards.
+const AGENT_GLYPH: char = '\u{25CA}';
+/// The command-key glyph in the chip's `⌘I` shortcut hint: the Nerd Font MDI
+/// `apple_keyboard_command` (U+F0633). The Unicode `⌘` (U+2318) is `.notdef` in the bundled
+/// faces, so this present PUA icon stands in (auto-centered by the T-4.4 constraint table).
+const CMD_KEY_GLYPH: char = '\u{F0633}';
 /// Empty-buffer placeholder per mode (a strong, zero-chrome onboarding + color-blind
 /// reinforcement signal; disappears as soon as the user types - [`05-unified-input-ux.md`]
-/// §3 option 4).
+/// §3 option 4). The mock's trailing "…" is dropped: U+2026 is `.notdef` in the Mono face.
 const SHELL_PLACEHOLDER: &str = "Type a command";
-const AGENT_PLACEHOLDER: &str = "Ask the agent";
+const AGENT_PLACEHOLDER: &str = "Ask the agent to do something";
 
-/// The prompt glyph for `mode` (shape carries the mode; color stays the one accent).
+/// The prompt glyph for `mode` (`❯` shell / `◊` agent): its SHAPE carries the mode and
+/// it is drawn in the current mode accent (`mode_accent`, ADR-0011 - see `prepare`).
 fn prompt_glyph(mode: InputMode) -> char {
     match mode {
         InputMode::Shell => SHELL_GLYPH,
@@ -115,15 +122,35 @@ fn prompt_mode(mode: InputMode) -> PromptMode {
     }
 }
 
-/// The label this mode's fixed-width chip slot is sized to fit both of. Sizing the slot
-/// to the WIDER of the two ("SHELL" / "AGENT") is what makes the toggle reflow-free.
-const CHIP_LABELS: [&str; 2] = ["SHELL", "AGENT"];
+/// Map the core [`InputMode`] onto the leaf-crate [`aterm_tokens::Mode`] the accent
+/// resolver speaks, so the glyph + caret can ask the theme for "the current mode color".
+fn token_mode(mode: InputMode) -> Mode {
+    match mode {
+        InputMode::Shell => Mode::Shell,
+        InputMode::Agent => Mode::Agent,
+    }
+}
+
+/// The chip's title-case mode label ("Shell" / "Agent", the mock's casing).
+const CHIP_LABELS: [&str; 2] = ["Shell", "Agent"];
 
 fn chip_label(mode: InputMode) -> &'static str {
     match mode {
         InputMode::Shell => CHIP_LABELS[0],
         InputMode::Agent => CHIP_LABELS[1],
     }
+}
+
+/// The mode chip's full content (the mock's pill): the mode glyph + label + a `⌘I`
+/// shortcut hint. Shaped in ONE Quattro pass (all three glyphs are in the UI face). The
+/// slot is sized to the WIDER of the two modes' content so a toggle never reflows.
+fn chip_content(mode: InputMode) -> String {
+    format!(
+        "{} {}  {}I",
+        prompt_glyph(mode),
+        chip_label(mode),
+        CMD_KEY_GLYPH
+    )
 }
 
 /// The autonomy-indicator labels (ticket T-5.11); the slot is sized to the WIDEST so
@@ -579,9 +606,10 @@ impl InputWidgetRenderer {
             color: theme.colors.hairline.to_linear_f32(),
         });
 
-        // The prompt glyph at the left edge (one Mono cell, the one accent color; the
-        // SHAPE carries the mode, the color stays accent in both modes).
-        let prompt = grid_glyph(prompt_glyph(view.mode), theme.colors.accent_primary, canvas);
+        // The prompt glyph at the left edge (one Mono cell), tinted to the CURRENT MODE
+        // accent (`❯` shell blue / `◊` agent purple - the mock's `--mode`, ADR-0011).
+        let mode_accent = theme.colors.mode_accent(token_mode(view.mode));
+        let prompt = grid_glyph(prompt_glyph(view.mode), mode_accent, canvas);
         emit_cell(
             atlas,
             queue,
@@ -592,17 +620,18 @@ impl InputWidgetRenderer {
             &mut self.glyph_instances,
         );
 
-        // The fixed-width SHELL/AGENT chip, right-aligned. Shape BOTH labels so the slot
-        // fits the wider, then place the active one centered - so a toggle never reflows.
+        // The fixed-width mode PILL chip, right-aligned. Shape BOTH modes' content
+        // (glyph + label + `⌘I`) so the slot fits the wider, then place the active one
+        // centered - so a toggle never reflows.
         let px_label = (type_scale::LABEL.size_pt * scale).round().max(1.0);
         let line_h_label = px_label * type_scale::LABEL.line_height;
         let pad_x = f32::from(space::S2) * scale;
         let pad_y = f32::from(space::S1) * scale;
         let mut slot_w: f32 = 0.0;
         let mut label_h: f32 = line_h_label;
-        for lbl in CHIP_LABELS {
+        for m in [InputMode::Shell, InputMode::Agent] {
             let l = self.shaper.layout(
-                lbl,
+                &chip_content(m),
                 FontFamily::Ui,
                 FaceStyle::Regular,
                 px_label,
@@ -619,7 +648,8 @@ impl InputWidgetRenderer {
         let chip_y = first_row_y + (ch - chip_h) * 0.5;
 
         let chip = PromptChip::resolve(prompt_mode(view.mode), theme);
-        // Chip fill (+ hairline border on the neutral SHELL chip only).
+        // Both modes are bordered mode pills now: an outer accent-border rect + the
+        // ~13% accent tint fill inset by one hairline (the mock's `--mode` chip).
         if let Some(border) = chip.chip.border {
             self.bg_instances.push(RectInstance {
                 rect: [chip_x, chip_y, slot_w, chip_h],
@@ -641,9 +671,10 @@ impl InputWidgetRenderer {
                 color: chip.chip.fill.to_linear_f32(),
             });
         }
-        // The active label, shaped + centered in the slot, into the shared glyph buffer.
+        // The active content (glyph + label + `⌘I`), shaped + centered in the slot, into
+        // the shared glyph buffer.
         let label_layout = self.shaper.layout(
-            chip_label(view.mode),
+            &chip_content(view.mode),
             FontFamily::Ui,
             FaceStyle::Regular,
             px_label,
@@ -811,14 +842,15 @@ impl InputWidgetRenderer {
             );
         }
 
-        // The caret: a thin accent bar at the caret column (the one accent, both modes).
+        // The caret: a thin bar at the caret column, tinted to the CURRENT MODE accent
+        // (shell blue / agent purple - the mock recolors the caret per mode, ADR-0011).
         let caret_w = (CARET_WIDTH_LOGICAL * scale).round().max(1.0);
         let caret_x = text_x + f32::from(laid.caret_col) * cw;
         let caret_y = first_row_y + f32::from(laid.caret_row) * ch + ch * 0.1;
         let caret_h = (ch * 0.8).round().max(1.0);
         self.bg_instances.push(RectInstance {
             rect: [caret_x.round(), caret_y.round(), caret_w, caret_h],
-            color: theme.colors.accent_primary.to_linear_f32(),
+            color: mode_accent.to_linear_f32(),
         });
         // Record the caret rect (physical px) so the host can position the IME candidate
         // window under it (ticket T-3.2). Kept until the next rebuild; the caret is part
@@ -1025,6 +1057,23 @@ mod layout_tests {
             assert_ne!(
                 gid, 0,
                 "{mode:?} prompt glyph U+{:04X} is .notdef in the bundled Mono Nerd Font",
+                glyph as u32
+            );
+        }
+    }
+
+    #[test]
+    fn chip_content_glyphs_exist_in_the_ui_font() {
+        // The mode chip's content (glyph + label + `⌘I`) is shaped in the Quattro/UI face,
+        // NOT the Mono grid face - so its glyphs (`❯` / `◊` / the `⌘` PUA icon) must resolve
+        // non-zero THERE, else the chip would draw `.notdef` boxes. (The mock's `◇` U+25C7
+        // and Unicode `⌘` U+2318 are both absent - the reason for the present substitutes.)
+        let r = crate::glyph::GlyphRasterizer::new();
+        for glyph in [SHELL_GLYPH, AGENT_GLYPH, CMD_KEY_GLYPH] {
+            let gid = r.glyph_id(FontFamily::Ui, FaceStyle::Regular, glyph);
+            assert_ne!(
+                gid, 0,
+                "chip glyph U+{:04X} is .notdef in the bundled Quattro/UI Nerd Font",
                 glyph as u32
             );
         }
@@ -1595,9 +1644,9 @@ mod gpu_tests {
         let (cw, ch) = cell_px(SCALE);
         let inset = INSET_LOGICAL * SCALE;
         let (w, h) = (320u32, 160u32);
-        // Both themes AND both modes - so the AGENT prompt glyph (the PUA "sparkles" icon)
-        // is proven to ink, not just Shell's `❯` (the review's `.notdef` regression was an
-        // Agent-only failure the prior Shell-only test missed).
+        // Both themes AND both modes - so the AGENT prompt glyph (`◊` U+25CA, the diamond
+        // lozenge) is proven to ink, not just Shell's `❯` (a `.notdef` mode glyph would be
+        // an Agent-only failure a Shell-only test misses).
         for kind in [ThemeKind::Dark, ThemeKind::Light] {
             for mode in [InputMode::Shell, InputMode::Agent] {
                 let theme = *Theme::for_kind(kind);

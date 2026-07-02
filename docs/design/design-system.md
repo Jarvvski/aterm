@@ -298,20 +298,30 @@ token names; resolve per active theme.
 
 ### Command block
 
-One human-entered command and its output.
+One human-entered command and its output (the mock's `shell` state; T-9.3).
 
-- **Left gutter** (~`space.4` wide): the only status iconography.
-  - running → pulsing `accent.primary` dot;
-  - exit 0 → thin `success` tick;
-  - exit≠0 → `danger` dot + exit code in `type.caption`.
-- **Delimiter**: `hairline` rules top and bottom. No box, no shadow.
-- **Command line**: `font.grid`, `fg.primary`. Re-rendered (not raw) so it can
-  carry the gutter and a timestamp (`type.caption`, `fg.secondary`).
-- **Output**: `font.grid`, theme ANSI palette, full width (no measure cap), on
-  `bg.canvas`. Prefer canvas over `bg.surface_alt` for flatness; use
-  `bg.surface_alt` only for an explicit "raised output" treatment.
+- **Left gutter** (~`space.4` wide): the accent **`❯` prompt glyph** (the shell
+  mode accent), not a status icon - the status moves to the block-meta.
+- **Block-meta** (right-aligned, `type.caption`, `fg.muted`): a status dot +
+  duration. The mock reveals it on block hover; the `focus dim` slot (§6, not a
+  fourth animation) is reserved for that fade, but - like every other animation
+  today - it is not yet time-driven, so the meta currently renders always-on
+  (hover-gating lands with the frame clock + pointer plumbing).
+  - running → pulsing `accent.primary` dot + "running";
+  - exit 0 → `fg.muted` dot + duration (a longer run, ≥ ~1s, earns the loud
+    `success` dot);
+  - exit≠0 → `danger` dot + "exit N · Ns".
+  Color is never the only signal: the "exit N" / "running" / "approx" / "tui"
+  labels and the distinct dot shapes (dot / hollow / half / caret) carry each
+  state for a color-blind eye.
+- **Delimiter**: a single `hairline` top rule per block (none above the first).
+  No box, no shadow.
+- **Command line**: `font.grid`, `fg.primary`. Re-rendered (not raw).
+- **Output**: `font.grid`, indented under the command in `fg.secondary` (the
+  mock's dimmed body); explicit ANSI / 256-color / RGB is preserved, on
+  `bg.canvas`. Prefer canvas over `bg.surface_alt` for flatness.
 - **Collapsed state**: long output collapses to N lines with a `fg.muted`
-  "… +123 lines" affordance.
+  "... +123 lines" affordance (ASCII "..."; U+2026 is `.notdef` in the Mono face).
 
 ### Prompt (the unified input box)
 
@@ -320,18 +330,18 @@ routes; typed text is preserved across the toggle (a pure `InputModel` reducer
 concern in `aterm-app`, not a UI concern).
 
 - Single full-width input, `font.grid`, `fg.primary`, caret = thin bar in the
-  current mode accent (§5). The prompt glyph is `❯` (shell) / `◇` (agent), tinted
-  to the mode accent.
-- **Routing-target indicator** — a `status chip` at the input's left edge, the
-  visible mode indicator the spec mandates (no banner):
-  - `SHELL` → neutral: `bg.surface` fill, `fg.secondary` text.
-  - `AGENT` → accent: `accent.agent` (purple) text on a low-emphasis accent-tinted
-    fill. Per ADR-0011 the mode color reads in the chip text (with the caret and
-    prompt glyph); the fill today reuses `accent.primary_weak`, a near-neutral tint
-    shared with the Info chip. Whether the agent chip earns its own purple-tinted
-    fill is a T-9.4 detail, not a token this ticket ships.
-  - Toggling cross-fades the chip (`motion.fast`) and shifts the caret + glyph to
-    the new mode accent (§5). Text is preserved across toggle.
+  current mode accent (§5). The prompt glyph (left) is `❯` (shell) / `◊` (agent -
+  the mock's `◇` U+25C7 is `.notdef` in the bundled Mono face, so the nearest
+  present diamond outline stands in), tinted to the mode accent.
+- **Mode chip** (right, T-9.4) - a pill in the CURRENT MODE color, the visible
+  mode indicator the spec mandates (no banner): a 1px accent border, a ~13%
+  accent tint fill over the canvas, and accent text; contents = the mode glyph +
+  label ("Shell" / "Agent") + a `⌘I` shortcut hint (the `⌘` is a Nerd-Font PUA
+  icon - Unicode U+2318 is `.notdef`). Shell = `accent.primary` (blue), Agent =
+  `accent.agent` (purple). The slot is sized to the wider mode so a toggle never
+  reflows.
+- Toggling cross-fades the chip (`motion.fast`) and shifts the caret + prompt
+  glyph to the new mode accent (§5). Text is preserved across toggle.
 - `hairline` above the input separates it from the timeline; the input sits in a
   persistent bottom zone with `space.4` padding.
 
