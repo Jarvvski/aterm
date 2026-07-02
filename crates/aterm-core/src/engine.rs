@@ -220,6 +220,13 @@ pub struct Engine {
     /// "why?" string (e.g. "bash 3.2 - upgrade for reliable blocks"). `None` until the
     /// shell reports it (an unintegrated shell never does).
     shell_version: Arc<Mutex<Option<String>>>,
+    /// The shell's current working directory, published by the model thread from each
+    /// OSC-7 / OSC-633-P `cwd` mark (the shim emits one every prompt, so a `cd` shows
+    /// up at the next prompt). `None` until the first report (an unintegrated shell
+    /// may never report; OSC-7 is ingested regardless of nonce - it is standard and
+    /// low-risk). `Arc<str>` so the UI's per-tick poll ([`Engine::current_cwd`]) is a
+    /// refcount bump, never a heap allocation (the T-1.8 steady-state discipline).
+    cwd: Arc<Mutex<Option<Arc<str>>>>,
     /// Whether a nonce-armed integration shim was actually installed this session.
     integration_active: bool,
     /// The current [`Integration`] state, published lock-free by the model thread as
@@ -494,6 +501,8 @@ impl Engine {
         let latest_blocks = Arc::new(Mutex::new(Arc::new(BlockList::new())));
         // The shell-version slot (T-2.3 AC2): filled from the first `aterm_ver=` mark.
         let shell_version = Arc::new(Mutex::new(None::<String>));
+        // The live-cwd slot: refreshed from every OSC-7 / 633-P cwd mark.
+        let cwd = Arc::new(Mutex::new(None::<Arc<str>>));
 
         // Integration indicator state (T-2.6). The monitor's decision logic is pure;
         // the model thread drives it (confirm on a nonce-matched A, time out the
@@ -525,6 +534,7 @@ impl Engine {
             capturing: false,
             live_capture: None,
             shell_version: Arc::clone(&shell_version),
+            cwd: Arc::clone(&cwd),
             integration: monitor,
             integration_code: Arc::clone(&integration_code),
             confirm_window,
@@ -555,6 +565,7 @@ impl Engine {
             _integration: integration,
             shell_kind,
             shell_version,
+            cwd,
             integration_code,
             reader: Some(reader_handle),
             model: Some(model_handle),
@@ -644,6 +655,15 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The shell's current working directory as last reported by an OSC-7 /
+    /// OSC-633-P `cwd` mark (the shim emits one at every prompt), or `None` before
+    /// the first report. A refcount bump under a short lock - NO allocation - so the
+    /// UI can poll it every tick to keep the title-bar cwd live across `cd`.
+    #[must_use]
+    pub fn current_cwd(&self) -> Option<Arc<str>> {
+        self.cwd.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Whether a nonce-armed integration shim was installed for this session. `false`
@@ -819,6 +839,9 @@ struct Model {
     /// The handle's shell-version slot (ticket T-2.3 AC2); filled once from the first
     /// `aterm_ver=` mark.
     shell_version: Arc<Mutex<Option<String>>>,
+    /// The handle's live-cwd slot; refreshed from every OSC-7 / 633-P `cwd` mark so
+    /// the title bar tracks `cd` (see [`Engine::current_cwd`]).
+    cwd: Arc<Mutex<Option<Arc<str>>>>,
     /// Integration-indicator decision machine (ticket T-2.6). The model confirms it
     /// on a nonce-matched `A` and times it out via the confirmation-window timer in
     /// [`run_model`], publishing the result through `integration_code`.
@@ -906,6 +929,16 @@ impl Model {
                 let mut guard = self.shell_version.lock().unwrap_or_else(|e| e.into_inner());
                 if guard.is_none() {
                     *guard = Some(ver.clone());
+                }
+            }
+            // The live cwd (OSC-7 / 633-P, emitted at every prompt): publish the LATEST
+            // so the title bar tracks `cd`. Refreshed (not filled-once) - unlike the
+            // version, the cwd changes over the session - but only on an actual change,
+            // so the every-prompt re-report of an unchanged cwd allocates nothing.
+            if let Mark::Cwd(path) = mark {
+                let mut guard = self.cwd.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.as_deref() != Some(path.as_str()) {
+                    *guard = Some(Arc::from(path.as_str()));
                 }
             }
             // Finished-block output capture (ticket T-2.7): buffer this command's clean
@@ -2710,6 +2743,30 @@ mod tests {
             engine.shell_version().as_deref(),
             Some("5.2.15"),
             "the engine should surface the shell's reported version"
+        );
+        drop(engine);
+    }
+
+    #[test]
+    fn current_cwd_tracks_the_latest_osc7_report() {
+        // The live title-bar cwd: each OSC-7 report refreshes `current_cwd()` (LATEST
+        // wins - unlike the fill-once shell version), so a `cd` reaches the title bar
+        // at the next prompt. OSC-7 is standard + low-risk, ingested regardless of
+        // nonce, so a plain un-nonced scanner surfaces it too.
+        let script = "printf '\\033]7;file://host/Users/me\\007'; printf '\\033]7;file://host/Users/me/project\\007'; sleep 2";
+        let engine = Engine::spawn_command("/bin/sh", &["-c", script], dims(), 1_000)
+            .expect("spawn sh reporting its cwd");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.current_cwd().as_deref() != Some("/Users/me/project")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            engine.current_cwd().as_deref(),
+            Some("/Users/me/project"),
+            "the engine should surface the LATEST OSC-7 cwd"
         );
         drop(engine);
     }

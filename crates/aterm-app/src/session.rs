@@ -99,9 +99,15 @@ pub struct Session {
     /// placeholder ("aterm") until EPIC-10 replaces it with the active session name.
     title: String,
     /// The current working directory shown beside the title (home abbreviated to `~`).
-    /// Sourced from the process cwd at spawn; OSC-7-driven live updates are a follow-up
-    /// (EPIC-10 owns the title-bar/session binding).
+    /// Seeded from the process cwd at spawn, then kept LIVE from the shell's OSC-7 cwd
+    /// reports (polled off [`Engine::current_cwd`] each tick), so a `cd` shows in the
+    /// title bar at the next prompt.
     cwd_display: String,
+    /// The last raw cwd taken from [`Engine::current_cwd`], so the per-tick poll only
+    /// re-abbreviates (and re-renders the bar via its damage signature) on an actual
+    /// change. `None` until the shell's first OSC-7 report. `Arc<str>` end to end, so
+    /// a steady tick is a refcount bump + a short compare - no allocation.
+    cwd_raw: Option<std::sync::Arc<str>>,
     /// The tab-completion popover state (ticket T-9.5): open flag, ranked items, active row.
     /// Tab opens it (fuzzy-ranking the shell history against the current line), up/down
     /// navigate, Enter/Tab accept (filling the input), Esc closes. Richer candidate sources
@@ -231,6 +237,7 @@ impl Session {
             sidebar_open: false,
             title: "aterm".to_string(),
             cwd_display,
+            cwd_raw: None,
             completion: Completion::new(),
             show_help: false,
             help_key: cfg.toggle_help,
@@ -1182,6 +1189,18 @@ impl UiCallbacks for Session {
         // expensive projection runs once on the park transition, then the card is only
         // borrowed each frame (a parked frame allocates nothing).
         self.refresh_pending_card();
+        // Keep the title-bar cwd live: the shell reports its cwd via OSC-7 at every
+        // prompt (the shim), published by the engine. Re-abbreviate only on an actual
+        // change, so a steady tick allocates nothing (an `Arc<str>` refcount bump + a
+        // compare) and the title bar's own damage signature sees a new string exactly
+        // when `cd` lands.
+        let live = self.engine.current_cwd();
+        if live.is_some() && live != self.cwd_raw {
+            if let Some(path) = &live {
+                self.cwd_display = abbreviate_home(std::path::Path::new(path.as_ref()));
+            }
+            self.cwd_raw = live;
+        }
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) {

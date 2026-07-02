@@ -13,6 +13,11 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **The title bar's directory is live.** The path beside the title now tracks the shell's
+  actual working directory (reported via OSC-7 at every prompt by the shell integration),
+  so a `cd` shows up in the title bar at the next prompt - previously it was frozen at
+  whatever directory aterm was launched from. Home still abbreviates to `~`; without shell
+  integration it falls back to the launch directory as before.
 - **One title bar with the native macOS transparent-titlebar chrome.** The doubled title bar
   is gone: the window now uses the same treatment as kitty/Slack/Linear - a native titled
   window whose titlebar is transparent, so aterm's slim custom bar (sidebar glyph, centered

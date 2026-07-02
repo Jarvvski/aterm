@@ -103,9 +103,11 @@ Deferred (documented, not silently dropped):
   tested (`sidebar_toggle_chord_is_cmd_b_and_distinct_from_the_other_hotkeys`).
 - The title bar was drawn in normal (non-alt-screen) mode only. *(Changed by the T-9.9
   rework: the native buttons are permanent chrome, so the band is reserved and the bar
-  drawn in alt-screen too - a full-screen TUI lays out below it.)* OSC-7-driven live cwd
-  updates + the active session name are EPIC-10 (which owns the title-bar/session binding);
-  today the cwd is the process cwd at spawn and the title is the placeholder "aterm".
+  drawn in alt-screen too - a full-screen TUI lays out below it.)* The cwd was the
+  process cwd at spawn. *(Made LIVE on owner request, 2026-07-02: the engine publishes
+  each OSC-7 report through `Engine::current_cwd` and the session re-abbreviates on
+  change, so `cd` reaches the bar at the next prompt.)* The active session name replacing
+  the placeholder "aterm" title remains EPIC-10 (which owns the title-bar/session binding).
 
 # Out of scope
 
