@@ -73,6 +73,11 @@ pub struct GpuRenderer {
     /// The tab-completion popover front-end (ticket T-9.5): the fuzzy finder drawn above the
     /// input's left edge when the host's completion state is open.
     completion: crate::completion_render::CompletionRenderer,
+    /// The risk-gate approval card front-end (ticket T-9.7): the caution card + split
+    /// Approve/Reject drawn over the input while an agent turn is parked on a
+    /// `RequireConfirm` verdict. Self-gated (its own damage signature), so a parked frame
+    /// allocates nothing.
+    approval: crate::approval_render::ApprovalRenderer,
     /// Idle gate for the timeline path: the `(snapshot version, scroll, viewport, theme,
     /// alt)` signature last laid out + prepared. When unchanged, the per-frame
     /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
@@ -106,6 +111,8 @@ pub struct GpuRenderer {
     drew_screens: bool,
     /// Whether the completion popover drew on the last frame (T-9.5).
     drew_completion: bool,
+    /// Whether the risk-gate approval card drew on the last frame (T-9.7).
+    drew_approval: bool,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -174,6 +181,7 @@ impl GpuRenderer {
         let title = crate::title_bar::TitleBarRenderer::new(&device);
         let screens = crate::screens::ScreensRenderer::new(&device);
         let completion = crate::completion_render::CompletionRenderer::new(&device);
+        let approval = crate::approval_render::ApprovalRenderer::new(&device);
 
         Ok(Self {
             surface,
@@ -187,6 +195,7 @@ impl GpuRenderer {
             title,
             screens,
             completion,
+            approval,
             timeline_sig: None,
             scroll: crate::timeline::ScrollState::default(),
             last_visible_blocks: 0,
@@ -196,6 +205,7 @@ impl GpuRenderer {
             drew_grid: false,
             drew_screens: false,
             drew_completion: false,
+            drew_approval: false,
             _window: window,
             scale_factor,
         })
@@ -276,6 +286,9 @@ impl GpuRenderer {
         if self.drew_completion {
             n += self.completion.last_glyph_draw_calls();
         }
+        if self.drew_approval {
+            n += self.approval.last_glyph_draw_calls();
+        }
         if self.drew_title {
             n += self.title.last_glyph_draw_calls();
         }
@@ -331,6 +344,14 @@ impl GpuRenderer {
             && frame
                 .completion
                 .is_some_and(aterm_core::Completion::is_open);
+        // The risk-gate approval card (T-9.7) is a MODAL SAFETY overlay: it draws whenever a
+        // turn is parked on a `RequireConfirm` verdict, INCLUDING over an alt-screen app (the
+        // agent's `run_command` runs as a separate sandboxed subprocess, independent of the
+        // hidden shell's fullscreen TUI). The keyboard resolves the decision regardless of
+        // alt-screen (see `Session::handle_gate_key`), so the card must be visible regardless
+        // too - otherwise the user could approve/reject a command they cannot see. So it is
+        // NOT `!alt_screen`-gated like the chrome layers above.
+        let draw_approval = frame.approval.is_some();
         // The custom title bar draws over a reserved TOP band in normal mode (a full-screen
         // app owns the whole surface in alt-screen, so it is hidden there, like the input
         // box). It reserves `title_h` off the top so the timeline lays out below it.
@@ -340,6 +361,7 @@ impl GpuRenderer {
         self.drew_screens = draw_screens;
         self.drew_input = draw_input;
         self.drew_completion = draw_completion;
+        self.drew_approval = draw_approval;
         self.drew_title = draw_title;
         let size = crate::grid_render::FrameSize {
             width: self.config.width,
@@ -502,6 +524,21 @@ impl GpuRenderer {
                 );
             }
 
+            // The risk-gate approval card (T-9.7): floats above the input while parked.
+            // Self-gated (its own damage signature early-outs alloc-free).
+            if draw_approval {
+                let input_zone_top = (self.config.height as f32 - input_zone).max(0.0);
+                self.approval.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.atlas,
+                    &frame.approval.expect("draw_approval implies approval"),
+                    input_zone_top,
+                    frame.theme,
+                    size,
+                );
+            }
+
             // The title bar (self-gated, like the input box).
             if draw_title {
                 self.title.prepare(
@@ -581,6 +618,11 @@ impl GpuRenderer {
                 // The completion popover floats above the input, on top of the content.
                 if draw_completion {
                     self.completion.draw(&mut pass, &self.atlas);
+                }
+                // The risk-gate approval card floats over the input while a turn is parked,
+                // above the content (a modal decision, on top like the popover).
+                if draw_approval {
+                    self.approval.draw(&mut pass, &self.atlas);
                 }
                 // The title bar draws last, over the reserved top band (its bottom hairline
                 // + dots + toggle + centered title sit on top of the cleared canvas).

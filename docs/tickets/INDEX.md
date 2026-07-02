@@ -158,7 +158,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-9.4 | Unified input bar + mode chip re-skin (mode-colored glyph/caret, pill chip) | done | T-9.1 |
 | T-9.5 | Launch + modes empty states and the tab-completion popover | done | T-9.1, T-9.4 |
 | T-9.6 | Agent transcript re-skin (agent glyph, plan header, tool-call rows, diff colors) | done | T-9.1, T-5.10 |
-| T-9.7 | Risk-gate approval UI re-skin (caution card, split Approve+menu, reject states) | ready-for-agent | T-9.1, T-5.11 |
+| T-9.7 | Risk-gate approval UI re-skin (caution card, split Approve+menu, reject states) | done | T-9.1, T-5.11 |
 | T-9.8 | Mouse-pointer plumbing + hit-testing (hover/click affordances) | ready-for-agent | T-9.1, T-9.2, T-9.3, T-9.4, T-9.5 |
 | T-9.9 | Borderless window frame (hide native titlebar, rounded corners + shadow, real window controls) | ready-for-agent | T-9.2, T-9.8 |
 

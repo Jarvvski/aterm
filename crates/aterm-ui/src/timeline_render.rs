@@ -2288,4 +2288,83 @@ mod gpu_tests {
             );
         }
     }
+
+    /// A turn whose gated call resolved to approved, plus one that resolved to rejected -
+    /// the two [`AgentBlockKind::Approval`] states the session injects (ticket T-9.7).
+    fn resolved_gate_turn() -> aterm_core::BlockList {
+        use aterm_core::{AgentBlock, AgentBlockKind};
+        use std::time::Instant;
+        let now = Instant::now();
+        let mut list = aterm_core::BlockList::new();
+        list.push_agent(AgentBlock::new(
+            AgentBlockKind::UserPrompt,
+            "free up disk space",
+            now,
+        ));
+        list.push_agent(
+            AgentBlock::new(AgentBlockKind::ToolCall, "run_command", now)
+                .with_tool_use_id("g1")
+                .with_tool_display("run_command", Some("rm -rf ./target".to_string()))
+                .with_badge(AgentBadge::Blocked),
+        );
+        // Approved: a success ✓ line.
+        list.push_agent(AgentBlock::new(
+            AgentBlockKind::Approval,
+            "Approved - the command was run.",
+            now,
+        ));
+        // Rejected: a danger ✕ line (is_error = true).
+        list.push_agent(
+            AgentBlock::new(
+                AgentBlockKind::Approval,
+                "Rejected - the command was not run.",
+                now,
+            )
+            .with_error(true),
+        );
+        list
+    }
+
+    #[test]
+    fn resolved_gate_states_ink_in_both_themes() {
+        // T-9.7 AC5 (the resolved half): the approved (✓) + rejected (✕) `Approval` states
+        // the session injects render to the timeline in BOTH themes, each a single glyph
+        // draw. The pending card is the separate `approval_render` overlay (its own test).
+        let Some((device, queue, format)) = device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (_cw, ch) = cell_px(SCALE);
+        let top = f32::from(space::S12) * SCALE;
+        let edge = f32::from(space::S8) * SCALE;
+        let (w, h) = (420u32, (top + 12.0 * ch) as u32);
+
+        for kind in [ThemeKind::Dark, ThemeKind::Light] {
+            let theme = *Theme::for_kind(kind);
+            let mut atlas = GlyphAtlas::new(&device, format);
+            let mut tl = TimelineRenderer::new(&device);
+            let blocks = resolved_gate_turn();
+            let l = layout(&blocks, false, Scroll::default(), 30);
+            let rb = render(&device, &queue, &mut atlas, &mut tl, &l, &theme, w, h);
+            // The ✓ / ✕ status glyphs + resolution text ink in the content column below the
+            // header + tool-call rows.
+            let gutter_w = f32::from(space::S4) * SCALE;
+            let content_x = edge + gutter_w;
+            assert!(
+                rb.any_ink(
+                    content_x as u32,
+                    (top + 2.0 * ch) as u32,
+                    (w as f32 - edge) as u32,
+                    (top + 10.0 * ch) as u32,
+                    40
+                ),
+                "{kind:?}: the resolved approved/rejected gate lines ink"
+            );
+            assert_eq!(
+                tl.last_glyph_draw_calls(),
+                1,
+                "{kind:?}: the resolved gate turn is ONE glyph draw call"
+            );
+        }
+    }
 }

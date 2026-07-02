@@ -15,15 +15,16 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
-use aterm_agent::{AutonomyState, Secrets};
+use aterm_agent::{AutonomyMode, AutonomyState, Secrets};
 use aterm_core::{
-    keys, BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
+    keys, AgentBlock, AgentBlockKind, BlockList, Engine, IntegrationStatus, PtyDimensions,
+    Snapshot, DEFAULT_SCROLLBACK,
 };
 use aterm_ui::{
-    ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker, TitleBarView, UiCallbacks, Window,
-    DEFAULT_DEBOUNCE,
+    ApprovalView, ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker, RiskState,
+    TitleBarView, UiCallbacks, Window, DEFAULT_DEBOUNCE,
 };
 
 use aterm_core::{
@@ -31,7 +32,7 @@ use aterm_core::{
     Motion, Preedit, DEFAULT_COMPLETION_LIMIT,
 };
 
-use crate::agent_runtime::{AgentRuntime, TurnHandle};
+use crate::agent_runtime::{AgentRuntime, PendingApproval, TurnHandle};
 use crate::config::Config;
 use crate::routing::{classify, decide, keystroke_for, Disposition, KeyBinding, RoutingContext};
 
@@ -111,7 +112,31 @@ pub struct Session {
     show_help: bool,
     /// The help/modes-explainer hotkey (ticket T-9.5). Default `Cmd-?` (Cmd-Shift-/).
     help_key: KeyBinding,
+    /// The single [`Secrets`] deny-set (ticket T-5.6), cloned from the same source the
+    /// agent runtime is gated + sandboxed with, used ONLY to sanitize the parked-approval
+    /// command before it reaches the risk-gate card (ticket T-9.7) - so no raw secret ever
+    /// crosses into `aterm-ui`.
+    secrets: Secrets,
+    /// The projected risk-gate approval card for the turn's currently-parked call (ticket
+    /// T-9.7), or `None` when nothing is parked. Recomputed ONCE on the park transition
+    /// (in [`Self::refresh_pending_card`]) and borrowed into the frame each present, so a
+    /// parked frame stays allocation-free (the T-1.8 floor). The renderer draws the caution
+    /// card + split Approve/Reject over the input.
+    pending_card: Option<PendingApproval>,
+    /// Whether the approval card's "Approve" split-button dropdown is expanded (ticket
+    /// T-9.7). Transient UI state the keyboard drives: `↓`/`Tab` opens it, `↑`/`↓` move the
+    /// selection, `Enter` activates it, `Esc` closes it (without rejecting). Reset whenever
+    /// the parked approval resolves or a fresh one parks.
+    gate_menu_open: bool,
+    /// The highlighted dropdown row when [`Self::gate_menu_open`] (ticket T-9.7): `0` =
+    /// "Approve once", `1` = "Always approve" (widen the session autonomy). Ignored while
+    /// the menu is closed (the primary `Enter` is always Approve once).
+    gate_menu_index: usize,
 }
+
+/// The dropdown row count in the approval card's split-Approve menu (ticket T-9.7):
+/// "Approve once" (0) and "Always approve" (1).
+const GATE_MENU_LEN: usize = 2;
 
 /// Apply a T-3.2 IME event to the input model. Pure (no engine / no window), so the
 /// composition semantics are unit-testable without spawning a session:
@@ -184,7 +209,11 @@ impl Session {
         // Capture the cwd display (home abbreviated to `~`) for the title bar BEFORE `root`
         // is moved into the agent runtime (which confines the agent's writes to it).
         let cwd_display = abbreviate_home(&root);
-        let agent = AgentRuntime::new(root, Secrets::new()).map_err(aterm_core::PtyError::Io)?;
+        // ONE Secrets deny-set feeds the gate, the sandbox, the sanitizer (in the agent
+        // runtime) AND the approval-card projection here - cloned, so both hold the same
+        // single source (ticket T-5.6 / T-9.7).
+        let secrets = Secrets::new();
+        let agent = AgentRuntime::new(root, secrets.clone()).map_err(aterm_core::PtyError::Io)?;
         Ok(Self {
             engine,
             input: InputModel::new(),
@@ -205,6 +234,10 @@ impl Session {
             completion: Completion::new(),
             show_help: false,
             help_key: cfg.toggle_help,
+            secrets,
+            pending_card: None,
+            gate_menu_open: false,
+            gate_menu_index: 0,
         })
     }
 
@@ -446,6 +479,250 @@ impl Session {
     fn record_history(&mut self, line: &str, mode: InputMode) {
         Arc::make_mut(&mut self.history).push(line, mode, SystemTime::now());
     }
+
+    /// Keep the risk-gate approval card (ticket T-9.7) in sync with the turn's parked
+    /// state, called each [`Self::tick`]. The expensive projection (parse + sanitize the
+    /// argv, gloss the reasons) runs ONCE on the absent -> present transition and is cached
+    /// in `pending_card`; while parked the card is only borrowed, and when the park clears
+    /// the card is dropped - so a parked frame allocates nothing (the T-1.8 floor). Also
+    /// resets the dropdown state so a fresh gate never inherits a stale open menu.
+    fn refresh_pending_card(&mut self) {
+        let parked = self
+            .turn
+            .as_ref()
+            .is_some_and(|t| t.is_active() && t.has_pending_approval());
+        if parked {
+            if self.pending_card.is_none() {
+                self.pending_card = self
+                    .turn
+                    .as_ref()
+                    .and_then(|t| t.pending_card(&self.secrets));
+                self.gate_menu_open = false;
+                self.gate_menu_index = 0;
+            }
+        } else if self.pending_card.is_some() {
+            self.pending_card = None;
+            self.gate_menu_open = false;
+            self.gate_menu_index = 0;
+        }
+    }
+
+    /// Push a resolved-gate line (ticket T-9.7) into the timeline as an [`Approval`] agent
+    /// block: a `✓` (approved) / `✕` (rejected) marker + the resolution text (styled by the
+    /// T-9.6 timeline `Approval` arm). Injected synchronously BEFORE the loop is unblocked,
+    /// so the decision line lands ahead of the tool's own result. A no-op when the engine is
+    /// shutting down (no injector).
+    ///
+    /// [`Approval`]: aterm_core::AgentBlockKind::Approval
+    fn inject_approval(&self, text: &str, is_error: bool) {
+        if let Some(injector) = self.engine.agent_injector() {
+            injector.push_block(
+                AgentBlock::new(AgentBlockKind::Approval, text.to_string(), Instant::now())
+                    .with_error(is_error),
+            );
+        }
+    }
+
+    /// Resolve the turn's parked approval with the chosen action (ticket T-9.7), the single
+    /// seam every gate button + keyboard chord funnels through. It records the decision as a
+    /// timeline [`Approval`] block, THEN answers the parked call over the T-5.11 approval
+    /// channel (approve = it runs and its result streams in; reject = it is fed back as an
+    /// error and the turn continues). [`GateAction::AlwaysApprove`] additionally WIDENS the
+    /// session autonomy through [`AutonomyState::set_mode`] - it never touches the mandatory
+    /// Seatbelt sink and never lowers the gate, so `Dangerous`/shell-active still always
+    /// confirm; the widening takes effect on FUTURE turns (this turn's policy was fixed at
+    /// start). Clears the card + dropdown so the overlay disappears at once.
+    ///
+    /// [`Approval`]: aterm_core::AgentBlockKind::Approval
+    fn resolve_gate(&mut self, action: GateAction) {
+        // Decide the decision line + whether the call runs. The autonomy widen is applied
+        // here (before borrowing `turn`) so no borrows overlap.
+        let (text, is_error, approve): (String, bool, bool) = match action {
+            GateAction::ApproveOnce => ("Approved - the command was run.".to_string(), false, true),
+            GateAction::AlwaysApprove => {
+                // Widen the SESSION autonomy tier through T-5.11 (never bypasses Seatbelt;
+                // never auto-runs Dangerous / shell-active). Effective next turn.
+                self.autonomy.set_mode(AutonomyMode::AutoRunInSession);
+                log::info!(
+                    "autonomy -> {} (always approve)",
+                    self.autonomy.mode().label()
+                );
+                (
+                    "Approved - auto-run is on for this session: Caution commands now run \
+                     without asking (Dangerous and shell commands still ask). Change in \
+                     Settings -> Autonomy."
+                        .to_string(),
+                    false,
+                    true,
+                )
+            }
+            GateAction::Reject => (
+                "Rejected - the command was not run. The agent will continue without it."
+                    .to_string(),
+                true,
+                false,
+            ),
+        };
+        self.inject_approval(&text, is_error);
+        if let Some(turn) = self.turn.as_ref() {
+            if approve {
+                turn.approve_pending();
+            } else {
+                turn.deny_pending();
+            }
+        }
+        self.pending_card = None;
+        self.gate_menu_open = false;
+        self.gate_menu_index = 0;
+    }
+
+    /// Route a keystroke while the turn is parked on an approval (ticket T-9.7). Returns
+    /// `true` if the key was consumed by the gate (the caller then swallows it, so a pending
+    /// safety decision can never be bypassed by stray input). The interaction mirrors the
+    /// mock's split-Approve control: `Enter` approves once, `Esc` rejects, and `↓`/`Tab`
+    /// opens the dropdown, where `↑`/`↓` move and `Enter` activates "Approve once" /
+    /// "Always approve" (`Esc` there just closes the menu). `y`/`n` remain quick
+    /// approve/reject aliases. IME is held to the same bar in [`Self::on_ime`].
+    fn handle_gate_key(&mut self, key: &KeyPress<'_>) -> bool {
+        // Gate on the LIVE parked state, not the cached card: a key can arrive between the
+        // loop parking and the next tick that projects the card. If so, project it now so a
+        // key never slips through to edit/submit the line in that window (fail-safe - the
+        // decision channel is answered regardless of whether the card has rendered yet).
+        let parked = self
+            .turn
+            .as_ref()
+            .is_some_and(|t| t.is_active() && t.has_pending_approval());
+        if !parked {
+            return false;
+        }
+        if self.pending_card.is_none() {
+            self.pending_card = self
+                .turn
+                .as_ref()
+                .and_then(|t| t.pending_card(&self.secrets));
+        }
+        // The key -> intent mapping is a PURE function (unit-tested); this applies its
+        // result against the live dropdown state. `SelectMenu` resolves the highlighted row.
+        match gate_key_intent(key, self.gate_menu_open) {
+            GateKeyIntent::Approve => self.resolve_gate(GateAction::ApproveOnce),
+            GateKeyIntent::Reject => self.resolve_gate(GateAction::Reject),
+            GateKeyIntent::OpenMenu => {
+                self.gate_menu_open = true;
+                self.gate_menu_index = 0;
+            }
+            GateKeyIntent::CloseMenu => self.gate_menu_open = false,
+            GateKeyIntent::MoveMenu(down) => {
+                self.gate_menu_index = if down {
+                    (self.gate_menu_index + 1).min(GATE_MENU_LEN - 1)
+                } else {
+                    self.gate_menu_index.saturating_sub(1)
+                };
+            }
+            GateKeyIntent::SelectMenu => {
+                let action = if self.gate_menu_index == 1 {
+                    GateAction::AlwaysApprove
+                } else {
+                    GateAction::ApproveOnce
+                };
+                self.resolve_gate(action);
+            }
+            GateKeyIntent::CancelTurn => {
+                // Abort the whole turn (Ctrl-C): trip the cancel token + fail-closed deny the
+                // parked call, so the loop stops instead of continuing / re-parking. The
+                // timeline simply ends; no Approval block (this is an interrupt, not a
+                // decision), mirroring the routing `InterruptAgent` path.
+                if let Some(turn) = self.turn.as_ref() {
+                    turn.cancel();
+                    log::info!("agent interrupt (Ctrl-C, during approval)");
+                }
+                self.pending_card = None;
+                self.gate_menu_open = false;
+                self.gate_menu_index = 0;
+            }
+            GateKeyIntent::Consume => {}
+        }
+        true
+    }
+}
+
+/// The three ways a parked risk-gate approval resolves (ticket T-9.7), each driving the
+/// existing T-5.11 approval + autonomy path via [`Session::resolve_gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAction {
+    /// Approve this call only; the autonomy posture is unchanged.
+    ApproveOnce,
+    /// Approve this call AND widen the session autonomy to auto-run-in-session (future
+    /// Caution commands stop asking; Dangerous / shell-active still always confirm).
+    AlwaysApprove,
+    /// Deny this call (fed back as an error; the turn continues).
+    Reject,
+}
+
+/// What a keystroke does to the risk-gate approval card (ticket T-9.7) - the PURE mapping
+/// behind [`Session::handle_gate_key`], so the whole gate keyboard contract is unit-tested
+/// with no PTY / turn / window. `menu_open` selects the two sub-maps: with the split-Approve
+/// dropdown closed the two primary actions + the open affordance apply; with it open the
+/// keys navigate / select / close it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateKeyIntent {
+    /// Approve once (menu closed): `Enter` / `y`.
+    Approve,
+    /// Reject (menu closed): `Esc` / `n`.
+    Reject,
+    /// Open the "Always approve" dropdown (menu closed): `↓` / `Tab`.
+    OpenMenu,
+    /// Close the dropdown without resolving (menu open): `Esc`.
+    CloseMenu,
+    /// Move the dropdown selection (menu open): `↓` = `true`, `↑` = `false`.
+    MoveMenu(bool),
+    /// Activate the highlighted dropdown row (menu open): `Enter` (the caller reads the
+    /// live `gate_menu_index`).
+    SelectMenu,
+    /// Abort the WHOLE turn (from either sub-state): `Ctrl-C`. Distinct from `Reject`, which
+    /// denies only the current call and lets the turn continue - this trips the cancel token
+    /// so a re-parking / runaway turn can be stopped in one keystroke. Kept OUT of the plain
+    /// `y`/`n`/`Enter`/`Esc` set so stray input can never trigger it.
+    CancelTurn,
+    /// Any other key: swallow it (a pending safety decision is never bypassable), no change.
+    Consume,
+}
+
+/// The pure key -> [`GateKeyIntent`] map for the parked approval card (ticket T-9.7). See
+/// [`GateKeyIntent`] for the two sub-maps. The `y`/`n` quick aliases fire only UNMODIFIED and
+/// only while the dropdown is closed (a modifier-chorded `y`/`n` is swallowed, never resolves
+/// - matching the Tab-popover convention); `Ctrl-C` aborts the whole turn from either state.
+fn gate_key_intent(key: &KeyPress<'_>, menu_open: bool) -> GateKeyIntent {
+    // Ctrl-C aborts the whole turn, regardless of the dropdown state.
+    if key.mods.ctrl && key.ch.is_some_and(|c| c.eq_ignore_ascii_case(&'c')) {
+        return GateKeyIntent::CancelTurn;
+    }
+    if menu_open {
+        return match key.named {
+            Some(NamedKey::ArrowDown) => GateKeyIntent::MoveMenu(true),
+            Some(NamedKey::ArrowUp) => GateKeyIntent::MoveMenu(false),
+            Some(NamedKey::Enter) => GateKeyIntent::SelectMenu,
+            Some(NamedKey::Escape) => GateKeyIntent::CloseMenu,
+            _ => GateKeyIntent::Consume,
+        };
+    }
+    match key.named {
+        Some(NamedKey::Escape) => GateKeyIntent::Reject,
+        Some(NamedKey::Enter) => GateKeyIntent::Approve,
+        Some(NamedKey::ArrowDown | NamedKey::Tab) => GateKeyIntent::OpenMenu,
+        _ => {
+            // The `y`/`n` aliases must be UNMODIFIED so a muscle-memory chord (Cmd-y, ...)
+            // can't silently resolve the gate; a modified letter falls through to Consume
+            // (still swallowed - it never edits/submits the line).
+            let unmodified = !key.mods.cmd && !key.mods.ctrl && !key.mods.alt;
+            if unmodified && key.ch.is_some_and(|c| c.eq_ignore_ascii_case(&'y')) {
+                GateKeyIntent::Approve
+            } else if unmodified && key.ch.is_some_and(|c| c.eq_ignore_ascii_case(&'n')) {
+                GateKeyIntent::Reject
+            } else {
+                GateKeyIntent::Consume
+            }
+        }
+    }
 }
 
 /// The result of applying one editing key ([`Session::apply_edit_key`]).
@@ -580,6 +857,34 @@ impl UiCallbacks for Session {
         self.show_help
     }
 
+    fn approval(&self) -> Option<ApprovalView<'_>> {
+        // The risk-gate approval card (ticket T-9.7): the renderer draws it over the input
+        // while a turn is parked. Borrowed from the cached `pending_card` (projected once on
+        // the park transition, so no per-frame allocation) + the transient dropdown state.
+        // A Dangerous verdict maps to the danger-toned `Blocked` state + the "Destructive
+        // command" title; a plain Caution gate is `NeedsApproval`. Color is always paired
+        // with the title text (color-blind safety).
+        let card = self.pending_card.as_ref()?;
+        Some(ApprovalView {
+            tool: &card.tool,
+            command: &card.command,
+            risk: if card.dangerous {
+                RiskState::Blocked
+            } else {
+                RiskState::NeedsApproval
+            },
+            title: if card.dangerous {
+                "Destructive command - needs your approval"
+            } else {
+                "This command needs your approval"
+            },
+            reason: &card.reason,
+            pattern: &card.pattern,
+            menu_open: self.gate_menu_open,
+            menu_index: self.gate_menu_index,
+        })
+    }
+
     fn on_key(&mut self, key: KeyPress<'_>) -> Option<Vec<u8>> {
         // T-3.3 routing brain. The pure `InputModel` reducer (T-3.1) owns the
         // in-progress line; this layer is the caller that decides where a key goes
@@ -616,25 +921,15 @@ impl UiCallbacks for Session {
             return None;
         }
 
-        // While the agent is parked on an approval (T-5.11), the keyboard ANSWERS it
-        // instead of editing the line: Enter / `y` approve (the gated call runs), `n`
-        // deny (it is fed back as an error result and the turn continues), Esc cancels
-        // the whole turn. Every other key is swallowed so a pending safety decision can
-        // never be bypassed by stray input. This IS the click/Esc seam the fail-closed
-        // channel-backed `ConfirmHandler` was built for - resolved on the winit thread.
-        if let Some(turn) = self.turn.as_ref() {
-            if turn.is_active() && turn.has_pending_approval() {
-                if matches!(key.named, Some(NamedKey::Escape)) {
-                    turn.cancel();
-                } else if matches!(key.named, Some(NamedKey::Enter))
-                    || key.ch.is_some_and(|c| c.eq_ignore_ascii_case(&'y'))
-                {
-                    turn.approve_pending();
-                } else if key.ch.is_some_and(|c| c.eq_ignore_ascii_case(&'n')) {
-                    turn.deny_pending();
-                }
-                return None;
-            }
+        // While the agent is parked on an approval (T-5.11 / T-9.7), the keyboard ANSWERS
+        // the risk-gate card instead of editing the line: `Enter`/`y` approve, `Esc`/`n`
+        // reject, `↓`/`Tab` open the "Always approve" dropdown. Every key is swallowed so a
+        // pending safety decision can never be bypassed by stray input. This IS the
+        // click/Esc seam the fail-closed channel-backed `ConfirmHandler` was built for -
+        // resolved on the winit thread. The card is present iff a turn is parked (kept in
+        // sync by `refresh_pending_card` each tick), so gate on it, not a fresh lock read.
+        if self.handle_gate_key(&key) {
+            return None;
         }
 
         let ctx = self.routing_context();
@@ -846,6 +1141,10 @@ impl UiCallbacks for Session {
         // T-3.5), before the frame is built - so the render path only reads the last-good
         // overlay and never blocks on the highlighter.
         self.apply_overlay();
+        // Sync the risk-gate approval card with the turn's parked state (ticket T-9.7): the
+        // expensive projection runs once on the park transition, then the card is only
+        // borrowed each frame (a parked frame allocates nothing).
+        self.refresh_pending_card();
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) {
@@ -970,5 +1269,152 @@ mod tests {
         assert!(!edit_is_immediate(Some(NamedKey::Backspace), None));
         assert!(!edit_is_immediate(Some(NamedKey::ArrowLeft), None));
         assert!(!edit_is_immediate(Some(NamedKey::ArrowUp), None));
+    }
+
+    // --- T-9.7 risk-gate approval keyboard map -------------------------------
+
+    fn named_key(named: NamedKey) -> KeyPress<'static> {
+        KeyPress {
+            named: Some(named),
+            ch: None,
+            text: None,
+            mods: aterm_ui::Mods::default(),
+        }
+    }
+
+    fn char_key(ch: char) -> KeyPress<'static> {
+        KeyPress {
+            named: None,
+            ch: Some(ch),
+            text: None,
+            mods: aterm_ui::Mods::default(),
+        }
+    }
+
+    #[test]
+    fn gate_keys_map_enter_to_approve_and_esc_to_reject_when_the_menu_is_closed() {
+        // AC3: with the dropdown closed, Enter approves and Esc rejects; `y`/`n` are the
+        // quick aliases; `↓`/`Tab` open the "Always approve" dropdown; other keys are
+        // swallowed (a pending safety decision is never bypassable).
+        assert_eq!(
+            gate_key_intent(&named_key(NamedKey::Enter), false),
+            GateKeyIntent::Approve
+        );
+        assert_eq!(
+            gate_key_intent(&named_key(NamedKey::Escape), false),
+            GateKeyIntent::Reject
+        );
+        assert_eq!(
+            gate_key_intent(&char_key('y'), false),
+            GateKeyIntent::Approve
+        );
+        assert_eq!(
+            gate_key_intent(&char_key('Y'), false),
+            GateKeyIntent::Approve
+        );
+        assert_eq!(
+            gate_key_intent(&char_key('n'), false),
+            GateKeyIntent::Reject
+        );
+        assert_eq!(
+            gate_key_intent(&named_key(NamedKey::ArrowDown), false),
+            GateKeyIntent::OpenMenu
+        );
+        assert_eq!(
+            gate_key_intent(&named_key(NamedKey::Tab), false),
+            GateKeyIntent::OpenMenu
+        );
+        // An unrelated key is swallowed, never edits the line.
+        assert_eq!(
+            gate_key_intent(&char_key('q'), false),
+            GateKeyIntent::Consume
+        );
+    }
+
+    #[test]
+    fn gate_keys_navigate_and_select_the_dropdown_when_open() {
+        // With the dropdown open, arrows move, Enter selects the highlighted row, and Esc
+        // closes the menu WITHOUT rejecting the whole gate (so a mis-open never denies).
+        assert_eq!(
+            gate_key_intent(&named_key(NamedKey::ArrowDown), true),
+            GateKeyIntent::MoveMenu(true)
+        );
+        assert_eq!(
+            gate_key_intent(&named_key(NamedKey::ArrowUp), true),
+            GateKeyIntent::MoveMenu(false)
+        );
+        assert_eq!(
+            gate_key_intent(&named_key(NamedKey::Enter), true),
+            GateKeyIntent::SelectMenu
+        );
+        assert_eq!(
+            gate_key_intent(&named_key(NamedKey::Escape), true),
+            GateKeyIntent::CloseMenu
+        );
+        // `y`/`n` are NOT shortcuts inside the menu (must choose a row explicitly).
+        assert_eq!(
+            gate_key_intent(&char_key('y'), true),
+            GateKeyIntent::Consume
+        );
+    }
+
+    #[test]
+    fn gate_y_n_aliases_require_no_modifier_so_a_chord_never_resolves() {
+        // A modifier-chorded `y`/`n` (Cmd-y, Opt-n) must NOT approve/reject; it is swallowed
+        // (Consume), matching the Tab-popover convention - so a muscle-memory accelerator can
+        // never silently resolve a pending safety decision.
+        for m in [
+            aterm_ui::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+            aterm_ui::Mods {
+                alt: true,
+                ..Default::default()
+            },
+        ] {
+            let y = KeyPress {
+                named: None,
+                ch: Some('y'),
+                text: None,
+                mods: m,
+            };
+            let n = KeyPress {
+                named: None,
+                ch: Some('n'),
+                text: None,
+                mods: m,
+            };
+            assert_eq!(gate_key_intent(&y, false), GateKeyIntent::Consume);
+            assert_eq!(gate_key_intent(&n, false), GateKeyIntent::Consume);
+        }
+        // Unmodified still resolves.
+        assert_eq!(
+            gate_key_intent(&char_key('y'), false),
+            GateKeyIntent::Approve
+        );
+    }
+
+    #[test]
+    fn ctrl_c_aborts_the_whole_turn_from_either_menu_state() {
+        // Ctrl-C is the in-park whole-turn abort (distinct from Esc = reject-this-call), and
+        // works whether or not the dropdown is open. It is NOT in the plain y/n/Enter/Esc set,
+        // so stray input can't trigger it.
+        let ctrl_c = KeyPress {
+            named: None,
+            ch: Some('c'),
+            text: None,
+            mods: aterm_ui::Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(gate_key_intent(&ctrl_c, false), GateKeyIntent::CancelTurn);
+        assert_eq!(gate_key_intent(&ctrl_c, true), GateKeyIntent::CancelTurn);
+        // A plain `c` is just swallowed (not a cancel).
+        assert_eq!(
+            gate_key_intent(&char_key('c'), false),
+            GateKeyIntent::Consume
+        );
     }
 }

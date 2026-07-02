@@ -14,6 +14,7 @@
 mod alloc_probe;
 
 pub mod app;
+pub mod approval_render;
 // The shared glyph atlas + glyph pipeline seam (T-4.3). The module is private. The
 // `GlyphAtlas` TYPE is re-exported below ONLY so the pub `ProseRenderer` can name it in
 // its signatures (like the pub `GridRenderer`); its methods and constructor are all
@@ -51,6 +52,7 @@ pub use app::{
     run, run_with, run_with_recorder, AtermApp, HeadlessCallbacks, KeyPress, Mods, RenderConfig,
     ScrollCommand, UiCallbacks,
 };
+pub use approval_render::{ApprovalRenderer, ApprovalView};
 pub use atlas::GlyphAtlas;
 pub use completion_render::CompletionRenderer;
 pub use components::{

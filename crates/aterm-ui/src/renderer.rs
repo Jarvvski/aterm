@@ -7,6 +7,7 @@
 use aterm_core::{BlockList, Completion, InputModel, Integration, Snapshot};
 use aterm_tokens::Theme;
 
+use crate::approval_render::ApprovalView;
 use crate::components::AutonomyMode;
 use crate::title_bar::TitleBarView;
 
@@ -72,6 +73,13 @@ pub struct Frame<'a> {
     /// The `launch` empty state is derived by the renderer from an empty block list, so it
     /// needs no flag. Supplied through [`crate::app::UiCallbacks::show_help`].
     pub show_help: bool,
+    /// The risk-gate approval card to draw this frame (ticket T-9.7), or `None` when no agent
+    /// turn is parked on a `RequireConfirm` verdict. When `Some`, the renderer draws the
+    /// caution card + split Approve/Reject over the input (like the completion popover). The
+    /// host projects it from the pending approval (SANITIZED in `aterm-app`, so no raw secret
+    /// crosses the arrow) via [`crate::app::UiCallbacks::approval`]. `Copy` (borrowed strs),
+    /// so it rides along with no per-frame allocation.
+    pub approval: Option<ApprovalView<'a>>,
 }
 
 /// The swappable renderer seam.

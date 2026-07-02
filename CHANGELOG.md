@@ -13,6 +13,16 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **A risk-gate approval card (the vision-mock `gate` state).** When the agent proposes a
+  command the safety gate can't auto-run, a caution-bordered card now floats over the input:
+  the proposed command (the argument always run through the secret redactor first), a `△` with
+  a plain-language title and reason, and a split **Approve** button with a dropdown, a **Reject**
+  button, and a keyboard hint. `Enter` approves once, `Esc` rejects; `↓`/`Tab` opens the
+  dropdown, where `↑`/`↓` choose and `Enter` selects "Approve once" or "Always approve".
+  "Always approve" widens this session's autonomy so future Caution commands stop asking -
+  destructive and shell commands still always ask, and everything still runs inside the
+  mandatory sandbox. The decision is recorded in the timeline as a `✓ Approved` / `✕ Rejected`
+  line. (Ticket T-9.7.)
 - **The agent turn reads like the vision mock now.** An agent turn in the timeline is styled
   as one grouped card: an agent-accent `◊` header carrying your request and an "agent - N steps"
   meta, an uppercase PLAN eyebrow over the opening plan, tool-call rows showing the tool name in

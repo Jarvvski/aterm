@@ -32,7 +32,8 @@ use aterm_agent::{
     badge_for_approval, gate_tool, gloss_for, AgentEvent, AgentTurn, AnthropicProvider, Approval,
     ApprovalPolicy, ApprovalRequest, CancelToken, ChannelConfirmHandler, Effort, LlmProvider,
     McpServer, McpToolRouter, Message, MockProvider, OpenAiProvider, OutputSanitizer,
-    ProviderEvent, Secrets, Sinks, StopReason, ToolCall, ToolRegistry, TurnRequest, Usage,
+    ProviderEvent, Risk, RiskAssessment, Secrets, Sinks, StopReason, ToolCall, ToolRegistry,
+    TurnRequest, Usage,
 };
 use aterm_core::{AgentBadge, AgentBlock, AgentBlockKind, AgentInjector, AgentTextRole};
 use tokio::sync::mpsc;
@@ -290,6 +291,94 @@ struct DescribedTool {
     edit_stats: Option<(u32, u32)>,
 }
 
+/// A UI-agnostic projection of the turn's currently-parked approval (ticket T-9.7): the
+/// facts the risk-gate approval CARD renders. Computed in `aterm-app` (which holds the
+/// single [`Secrets`] source + the tool registry) so the SANITIZED command and the
+/// plain-language reason cross the crate arrow into `aterm-ui` with NO raw argv or secret,
+/// the crown-jewel discipline the whole gate is built on. Owned strings: the session caches
+/// ONE of these on the park transition and borrows it into the frame each present, so a
+/// parked frame stays allocation-free (the T-1.8 floor).
+pub struct PendingApproval {
+    /// The gated tool's name (e.g. `run_command`) - drawn in the primary accent.
+    pub tool: String,
+    /// The SANITIZED proposed argument (e.g. `rm -rf ./target`), redacted-before-truncated
+    /// against the single [`Secrets`] deny-set. Empty when the call did not parse (only the
+    /// tool name is shown then - a raw arg is never surfaced).
+    pub command: String,
+    /// Whether the gate rated the command [`Risk::Dangerous`] (drives the "Destructive
+    /// command" title + the danger-toned `△`); otherwise it is a plain Caution gate.
+    pub dangerous: bool,
+    /// The gate's parsed reason(s) in plain English (the [`gloss_for`] gloss), joined - the
+    /// "why is this risky?" line under the title.
+    pub reason: String,
+    /// The command "family" shown faint beside the menu's "Always approve" item (e.g.
+    /// `rm -rf ...`). COSMETIC: always-approve widens the session autonomy TIER (T-5.11),
+    /// it does not install a per-pattern allow-rule, so this only labels the family.
+    pub pattern: String,
+}
+
+/// Project a parked [`ApprovalRequest`]'s call + assessment into the UI-agnostic
+/// [`PendingApproval`] card (ticket T-9.7). Parses the call with the native tool registry
+/// to derive the terse argument, then runs it through the [`OutputSanitizer`] against the
+/// same `secrets` the turn is gated with - so a secret in an argv is redacted BEFORE it
+/// leaves `aterm-app`. A call that does not parse (e.g. a dynamic MCP tool the native
+/// registry does not know) surfaces the tool name only, never a raw argument.
+fn project_pending(
+    call: &ToolCall,
+    assessment: &RiskAssessment,
+    secrets: &Secrets,
+) -> PendingApproval {
+    let registry = ToolRegistry::with_default_tools();
+    let sanitizer = OutputSanitizer::new(secrets);
+    let command = match registry.parse(call) {
+        Ok(input) => input
+            .display_arg()
+            .map(|a| sanitizer.sanitize(&a, Some(TOOL_ARG_MAX)))
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    let reason = if assessment.reasons.is_empty() {
+        "This command needs your explicit approval.".to_string()
+    } else {
+        assessment
+            .reasons
+            .iter()
+            .map(|r| gloss_for(*r))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    PendingApproval {
+        tool: call.name.clone(),
+        command: command.clone(),
+        dangerous: assessment.level == Risk::Dangerous,
+        reason,
+        pattern: approval_pattern(&command),
+    }
+}
+
+/// The terse command "family" shown beside the "Always approve" menu item (ticket T-9.7):
+/// the first two whitespace tokens of the sanitized command, with a trailing `...` when
+/// more follow (e.g. `rm -rf ./target` -> `rm -rf ...`). ASCII `...` (not U+2026, which is
+/// `.notdef` in the bundled Mono face). Purely a label - the widening is tier-scoped.
+fn approval_pattern(command: &str) -> String {
+    let mut it = command.split_whitespace();
+    let mut parts: Vec<&str> = Vec::new();
+    for _ in 0..2 {
+        if let Some(w) = it.next() {
+            parts.push(w);
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    let head = parts.join(" ");
+    if it.next().is_some() {
+        format!("{head} ...")
+    } else {
+        head
+    }
+}
+
 /// The human-facing one-line description of a gated tool call: the tool name plus the
 /// verdict, glossing the parsed risk reasons for a non-auto decision (ticket T-5.11
 /// AC3). Mirrors `transcript::render_tool_call` so the live and recorded views read
@@ -340,6 +429,18 @@ impl TurnHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
+    }
+
+    /// Project the currently-parked approval into the UI-agnostic [`PendingApproval`] card
+    /// (ticket T-9.7), sanitizing the argv against `secrets` so no raw secret crosses into
+    /// `aterm-ui`. `None` when nothing is parked. Called ONCE on the park transition (the
+    /// session caches the result), so its per-call registry build never touches the frame
+    /// path - a parked frame borrows the cached card and stays allocation-free.
+    #[must_use]
+    pub fn pending_card(&self, secrets: &Secrets) -> Option<PendingApproval> {
+        let guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let req = guard.as_ref()?;
+        Some(project_pending(&req.call, &req.assessment, secrets))
     }
 
     /// Approve the pending gated call (it runs). Returns whether there was one.
@@ -1051,6 +1152,119 @@ mod tests {
             stop_reason: StopReason::EndTurn,
         });
         assert!(sink.blocks.borrow().is_empty());
+    }
+
+    #[test]
+    fn pending_card_sanitizes_the_command_and_carries_the_risk_and_reason() {
+        // T-9.7: the approval card projection is computed in aterm-app so the SANITIZED
+        // command + glossed reason cross into aterm-ui with no raw secret (crown-jewel
+        // discipline). A dangerous command sets `dangerous`; the gloss is the plain reason.
+        let mut secrets = Secrets::new();
+        secrets.add_value("sk-supersecret");
+
+        let call = ToolCall {
+            id: "c".into(),
+            name: "run_command".into(),
+            input: json!({ "command": ["curl", "-H", "Authorization: sk-supersecret"] }),
+        };
+        let assessment = RiskAssessment {
+            level: Risk::Dangerous,
+            reasons: vec![aterm_agent::RiskReason::Network],
+        };
+        let card = project_pending(&call, &assessment, &secrets);
+
+        assert_eq!(card.tool, "run_command");
+        assert!(
+            !card.command.contains("sk-supersecret"),
+            "secret leaked into the card command: {}",
+            card.command
+        );
+        assert!(
+            card.command.contains("[REDACTED]"),
+            "the secret must be redacted: {}",
+            card.command
+        );
+        assert!(
+            card.dangerous,
+            "a Dangerous verdict sets the destructive flag"
+        );
+        assert_eq!(card.reason, gloss_for(aterm_agent::RiskReason::Network));
+    }
+
+    #[test]
+    fn pending_card_uses_a_generic_reason_when_the_gate_gives_none() {
+        // A parked call with no explicit reasons still shows a plain-language line (never
+        // an empty reason), and a non-Dangerous verdict is a plain Caution gate.
+        let call = ToolCall {
+            id: "w".into(),
+            name: "write_file".into(),
+            input: json!({ "path": "note.txt", "content": "x" }),
+        };
+        let assessment = RiskAssessment {
+            level: Risk::Caution,
+            reasons: vec![],
+        };
+        let card = project_pending(&call, &assessment, &Secrets::new());
+        assert!(!card.dangerous);
+        assert!(!card.reason.is_empty());
+        assert_eq!(card.command, "note.txt", "the file tool shows its path");
+    }
+
+    #[test]
+    fn widening_autonomy_never_swaps_out_the_seatbelt_sink() {
+        // T-9.7 AC4: "always approve" / "full auto" only WIDENS the autonomy GATE
+        // (AutonomyState -> policy); it never changes the EXECUTION sink, which is always the
+        // mandatory Seatbelt sandbox (never bypassed). The two are orthogonal: the widest
+        // tier auto-approves a non-shell-active Caution command, yet the sink a turn
+        // dispatches through (`Sinks::seatbelt`, built in `drive` from only root + secrets,
+        // never the policy) is an enforcing SeatbeltSandbox regardless of the tier.
+        use aterm_agent::{AutonomyMode, AutonomyState, RiskReason, Sandbox};
+
+        // The widen is real: the widest tier auto-approves a non-shell-active Caution.
+        let mut autonomy = AutonomyState::default();
+        autonomy.set_mode(AutonomyMode::AutoRunInSession);
+        assert_eq!(autonomy.mode(), AutonomyMode::AutoRunInSession);
+        assert!(
+            autonomy
+                .policy()
+                .decide_assessment(RiskAssessment {
+                    level: Risk::Caution,
+                    reasons: vec![RiskReason::PackageMutator],
+                })
+                .is_auto(),
+            "auto-run-in-session must auto-approve a non-shell-active Caution command"
+        );
+        // ...yet Dangerous still always confirms in EVERY tier (never bypassed).
+        assert!(
+            !autonomy
+                .policy()
+                .decide_assessment(RiskAssessment {
+                    level: Risk::Dangerous,
+                    reasons: vec![RiskReason::Destructive],
+                })
+                .is_auto(),
+            "no tier ever auto-runs a Dangerous command"
+        );
+
+        // The execution sink a turn builds (see `drive`) is the Seatbelt sandbox, and its
+        // construction reads only (root, secrets) - never the tier - so no autonomy change
+        // can produce an unsandboxed sink.
+        let sinks = Sinks::seatbelt(PathBuf::from("."), Secrets::new());
+        let sandbox = sinks.command().sandbox();
+        assert!(
+            sandbox.is_enforcing(),
+            "an auto-approved command still runs inside the enforcing Seatbelt sandbox"
+        );
+        assert_eq!(sandbox.name(), "seatbelt");
+    }
+
+    #[test]
+    fn approval_pattern_takes_the_command_family_head() {
+        // The "always approve" label is the first two tokens + "..." when more follow.
+        assert_eq!(approval_pattern("rm -rf ./target"), "rm -rf ...");
+        assert_eq!(approval_pattern("ls -la"), "ls -la");
+        assert_eq!(approval_pattern("env"), "env");
+        assert_eq!(approval_pattern(""), "");
     }
 
     #[test]

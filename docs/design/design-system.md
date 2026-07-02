@@ -417,6 +417,27 @@ to the gutter, so a scanning eye reads gutter color = safety state. How loud the
 `Caution` state is (quiet chip vs interrupting banner) is an open owner question
 (`07-ia-design-language.md` OQ3); default is the quiet chip to preserve rhythm.
 
+Implementation note (T-9.7): a parked `Caution`/`Dangerous` verdict raises the
+mock's `gate` state as an ApprovalRenderer overlay floating over the input (a
+`bg.elev` panel + hairline, like the completion popover, so it occludes the
+timeline): the proposed command (`accent.primary` tool + `fg.primary` sanitized
+argv), a `caution`-bordered card on a `caution_weak` fill with a `△`
+(`nf-fa-exclamation-triangle` - the BMP `△` is `.notdef` in the Mono face), a
+`fg.primary` title (danger-toned `△` + "Destructive command" title for a
+`Dangerous`/`Blocked` verdict), a `fg.secondary` reason (the parsed gloss), and a
+split **Approve** (accent fill, max-contrast text) with a `▾` (`nf-fa-caret-down`)
+dropdown ("Approve once" / "Always approve `<pattern>`"), a **Reject** (hairline
+border), and a `fg.faint` hint. Keyboard: `Enter` approves, `Esc` rejects (honoring
+the IME preedit gate), `↓`/`Tab` open the dropdown (`↑`/`↓` choose, `Enter`
+selects). "Always approve" widens the SESSION autonomy tier through T-5.11
+(`AutoRunInSession`, effective next turn) - it never lowers the gate or bypasses the
+Seatbelt sandbox, so `Dangerous`/shell-active still always confirm; the mock's
+per-pattern "`rm -rf …`" copy is a cosmetic label, the widening is tier-scoped. The
+`⏎` hint symbol is spelled "enter" (also `.notdef` in the Mono face). Resolved
+states render as timeline `Approval` blocks (`✓ Approved` / `✕ Rejected`), not in
+the overlay. The card is one rect + one glyph draw, damage-gated alloc-free so a
+parked frame holds the 60fps floor.
+
 ### Shell-integration indicator (3-state)
 
 aterm interprets OSC-133 / OSC-7 marks emitted by the shell-integration shim,

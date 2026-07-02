@@ -197,6 +197,15 @@ pub trait UiCallbacks {
         false
     }
 
+    /// The risk-gate approval card to draw this frame (ticket T-9.7), or `None` for a host
+    /// with no parked approval (the default; e.g. [`HeadlessCallbacks`]). A real session
+    /// projects it from the turn's pending approval, sanitizing the command in `aterm-app`
+    /// so no raw secret crosses the crate arrow. Borrowed (not cloned); the renderer only
+    /// reads it (the caution card + split Approve/Reject over the input).
+    fn approval(&self) -> Option<crate::approval_render::ApprovalView<'_>> {
+        None
+    }
+
     /// A key was pressed; return bytes to forward to the PTY (Shell mode), if any.
     /// `key` carries the named key / logical character / insertion text and the
     /// live modifier state, so the host can route the real `Cmd-/` toggle chord and
@@ -477,6 +486,7 @@ impl<C: UiCallbacks> AtermApp<C> {
                 title_bar: self.callbacks.title_bar(),
                 completion: self.callbacks.completion(),
                 show_help: self.callbacks.show_help(),
+                approval: self.callbacks.approval(),
             };
             if let Err(e) = renderer.render(frame) {
                 log::warn!("frame render error: {e}");
