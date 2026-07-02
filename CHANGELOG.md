@@ -13,12 +13,18 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
-- **One title bar, rounded corners, and real window controls.** The doubled title bar is gone:
-  macOS no longer draws its own titlebar above aterm's custom one - the window is borderless and
-  transparent, with the mock's rounded corners, a 1px hairline border, and the soft OS drop shadow.
-  The three warm traffic-light dots are now real controls: click to close, minimize, or zoom (they
-  brighten under the pointer), and `Cmd-W` / `Cmd-M` work from the keyboard. On a GPU that can't
-  give a transparent surface, the window stays square with no other change. (Ticket T-9.9.)
+- **One title bar with the native macOS transparent-titlebar chrome.** The doubled title bar
+  is gone: the window now uses the same treatment as kitty/Slack/Linear - a native titled
+  window whose titlebar is transparent, so aterm's slim custom bar (sidebar glyph, centered
+  title + cwd, hairline) is the only visible bar while the REAL traffic-light buttons float
+  over its left edge with native rounded corners and the native drop shadow. Close, minimize,
+  and zoom are the genuine native buttons (hover states, Option-click and all); `Cmd-W` /
+  `Cmd-M` also work from the keyboard, dragging the bar moves the window, and double-clicking
+  it zooms. The bar matches the native titlebar height so the buttons, glyph, and title share
+  one center line, and it stays visible even under a full-screen app (vim, htop): the terminal
+  grid now sits below the bar, so no content ever hides under the buttons - where a stray
+  click would have hit the close button. (Ticket T-9.9; reworked the same day from an initial
+  fully-custom borderless frame with drawn dots, on owner direction.)
 - **The mouse works now - hover and click affordances.** aterm tracked only keys and the
   scroll wheel; it now has a pointer. Hovering the title-bar sidebar glyph brightens it, the
   mode pill lifts its tint, a completion row tints under the cursor, and a command block reveals
@@ -53,12 +59,12 @@ the next version (or an `## Unreleased` heading until a version is cut).
   to dismiss. Completions are drawn from the commands you've run this session for now; richer
   sources ($PATH, argument specs, persisted history) come later. `Tab` still reaches the shell's
   own completer when the finder has nothing to offer. (Ticket T-9.5.)
-- **A custom window title bar (the vision-mock chrome).** The window now draws a 44px title
-  bar with three warm traffic-light dots, a sidebar-toggle glyph, and a centered active title
-  plus the current directory (home shown as `~`), over a hairline rule; the timeline lays out
-  below it. The traffic-light dots are decorative for now and the sidebar panel arrives with
-  multi-session support - `Cmd-B` flips the (stubbed) toggle-sidebar intent today. The mock's
-  rounded corners + drop shadow land with the borderless-window packaging. (Ticket T-9.2.)
+- **A custom window title bar (the vision-mock chrome).** The window now draws a slim title
+  bar with a sidebar-toggle glyph and a centered active title plus the current directory
+  (home shown as `~`), over a hairline rule; the timeline lays out below it. The sidebar
+  panel arrives with multi-session support - `Cmd-B` flips the (stubbed) toggle-sidebar
+  intent today. (Ticket T-9.2; the bar's height, window chrome, and traffic lights were
+  finalized by the T-9.9 rework above - native buttons, 28px band.)
 
 ### Changed
 

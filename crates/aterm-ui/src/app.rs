@@ -120,6 +120,24 @@ pub enum ScrollCommand {
     ToBottom,
 }
 
+/// A keyboard-driven window operation (ticket T-9.9): `Cmd-W` / `Cmd-M`, which AppKit
+/// only provides through a menu bar aterm doesn't have. Mouse close/minimize/zoom are
+/// the REAL native traffic-light buttons and never reach the event loop. Internal to
+/// the loop; the host never sees these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowControl {
+    /// Close the window (exit the event loop).
+    Close,
+    /// Minimize/miniaturize the window.
+    Minimize,
+}
+
+/// Two title-bar-band presses within this window count as a double-click and zoom
+/// (ticket T-9.9). Approximates the system double-click interval (winit exposes no
+/// `clickCount`, and the transparent titlebar routes band presses to the content view,
+/// so the native double-click-to-zoom never fires on its own).
+const BAND_DOUBLE_CLICK: Duration = Duration::from_millis(500);
+
 /// Hooks the host app implements to drive the UI. All are optional-ish: the UI
 /// crate can run standalone with a no-op implementation ([`HeadlessCallbacks`]).
 pub trait UiCallbacks {
@@ -375,6 +393,13 @@ pub struct AtermApp<C: UiCallbacks> {
     /// T-9.8), tracked from `CursorMoved` and cleared on `CursorLeft`. `MouseInput` carries no
     /// position, so a click is resolved against this. `None` when the pointer is off-window.
     pointer: Option<(f32, f32)>,
+    /// When the last left-button press landed on the title-bar band's BACKGROUND (no hit
+    /// target), for the double-click-to-zoom chord (ticket T-9.9): a second such press
+    /// within [`BAND_DOUBLE_CLICK`] zooms instead of starting another drag, approximating
+    /// the native titlebar's double-click action (macOS default `AppleActionOnDoubleClick`
+    /// = Zoom; the transparent titlebar routes these presses to our content view, so the
+    /// native handler never sees them and aterm must do it).
+    last_band_press: Option<Instant>,
     /// The hit target under the pointer at the last left-button PRESS (ticket T-9.8). A click
     /// fires only when the release lands on the SAME target, so a press-drag-off never
     /// activates. `None` between clicks.
@@ -399,6 +424,7 @@ impl<C: UiCallbacks> AtermApp<C> {
             mods: ModifiersState::empty(),
             last_ime_area: None,
             pointer: None,
+            last_band_press: None,
             press_target: None,
         }
     }
@@ -563,26 +589,18 @@ impl<C: UiCallbacks> AtermApp<C> {
         }
     }
 
-    /// Apply a borderless-window control (ticket T-9.9) against the winit window / event
-    /// loop: close exits, minimize miniaturizes, zoom toggles maximize. Driven by a click on
-    /// a traffic-light dot (via the T-9.8 hit map) and by the `Cmd-W`/`Cmd-M` chords. Window
-    /// ops live in the UI crate (they need the window + event loop), so - unlike the host
-    /// affordances - they are NOT routed through [`UiCallbacks::on_click`].
-    fn apply_window_control(
-        &self,
-        control: crate::hit::WindowControl,
-        event_loop: &ActiveEventLoop,
-    ) {
+    /// Apply a window control against the winit window / event loop: close exits, minimize
+    /// miniaturizes. Driven by the `Cmd-W`/`Cmd-M` chords (ticket T-9.9) - aterm has no
+    /// native menu bar, so AppKit does not provide these for free. The MOUSE never reaches
+    /// here: the real native traffic-light buttons handle click close/minimize/zoom
+    /// themselves (AppKit hit-tests them before our content view), which is also why there
+    /// is no Zoom arm - zoom has no conventional chord.
+    fn apply_window_control(&self, control: WindowControl, event_loop: &ActiveEventLoop) {
         match control {
-            crate::hit::WindowControl::Close => event_loop.exit(),
-            crate::hit::WindowControl::Minimize => {
+            WindowControl::Close => event_loop.exit(),
+            WindowControl::Minimize => {
                 if let Some(w) = self.window.as_ref() {
                     w.set_minimized(true);
-                }
-            }
-            crate::hit::WindowControl::Zoom => {
-                if let Some(w) = self.window.as_ref() {
-                    w.set_maximized(!w.is_maximized());
                 }
             }
         }
@@ -708,7 +726,19 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     .as_ref()
                     .map(|w| w.scale_factor() as f32)
                     .unwrap_or(1.0);
-                let (cols, rows) = grid_dims(size.width, size.height, scale);
+                // Reserve the title-bar band out of the PTY grid (ticket T-9.9): the band
+                // is permanent chrome (the native buttons + the custom bar, drawn even in
+                // alt-screen), so the shell's rows are computed from the content BELOW it
+                // and a full-screen app never lays out under the immovable buttons. The
+                // grid fast-path draws with the matching top inset. Headless hosts (no
+                // title bar) keep the full surface.
+                let band = if self.callbacks.title_bar().is_some() {
+                    crate::title_bar::title_bar_px(scale)
+                } else {
+                    0.0
+                };
+                let grid_h = ((size.height as f32) - band).max(0.0).round() as u32;
+                let (cols, rows) = grid_dims(size.width, grid_h, scale);
                 self.callbacks
                     .on_resize(cols, rows, size.width, size.height);
                 // A resize is activity: re-arm and repaint promptly.
@@ -787,18 +817,34 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                 match state {
                     ElementState::Pressed => {
                         self.press_target = target;
-                        // Drag the window from the title-bar background (ticket T-9.9): a
-                        // press in the top title-bar band that is NOT on a control starts a
-                        // native window drag. This keeps the dots clickable (they carry a hit
-                        // target, so they never trigger the drag) while making the chrome
-                        // draggable - WITHOUT `movable_by_window_background`, which would
-                        // swallow the terminating mouseUp of a drifted dot click. A still
+                        // Drag the window from the title-bar background (ticket T-9.9): under
+                        // the native TRANSPARENT titlebar, band events reach our content view
+                        // (only the real traffic-light buttons intercept), and nothing drags
+                        // automatically - so a press in the top band that is NOT on a hit
+                        // target starts an explicit native drag (the Zed pattern). This keeps
+                        // the sidebar glyph clickable (it carries a target, so it never
+                        // triggers the drag) - WITHOUT `movable_by_window_background`, which
+                        // would swallow the terminating mouseUp of a drifted click. A still
                         // press (no move) just ends without moving, so it is harmless.
+                        // A SECOND band press within the double-click window zooms instead
+                        // (the native titlebar's double-click action, which the transparent
+                        // titlebar can't fire itself - `drag_window` measurably does not
+                        // trigger it).
                         if target.is_none() {
                             if let (Some(w), Some((_, py))) = (self.window.as_ref(), self.pointer) {
                                 let band = crate::title_bar::title_bar_px(w.scale_factor() as f32);
                                 if py < band {
-                                    let _ = w.drag_window();
+                                    let now = Instant::now();
+                                    let double = self.last_band_press.is_some_and(|t| {
+                                        now.duration_since(t) <= BAND_DOUBLE_CLICK
+                                    });
+                                    if double {
+                                        self.last_band_press = None;
+                                        w.set_maximized(!w.is_maximized());
+                                    } else {
+                                        self.last_band_press = Some(now);
+                                        let _ = w.drag_window();
+                                    }
                                 }
                             }
                         }
@@ -806,14 +852,10 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     ElementState::Released => {
                         if let (Some(t), Some(pressed)) = (target, self.press_target) {
                             if t == pressed {
-                                // Window controls (T-9.9) act on the winit window / event loop
-                                // here; every other target routes to the host intent (T-9.8).
-                                match t {
-                                    crate::hit::HitTarget::WindowControl(ctrl) => {
-                                        self.apply_window_control(ctrl, event_loop)
-                                    }
-                                    other => self.callbacks.on_click(other),
-                                }
+                                // Route the click to the host, which maps it onto the matching
+                                // keyboard intent (T-9.8). The native window buttons never get
+                                // here - AppKit handles them before our view sees the event.
+                                self.callbacks.on_click(t);
                                 // A click is activity: re-arm + repaint so its effect shows.
                                 self.scheduler.note_activity(Instant::now());
                                 if let Some(w) = self.window.as_ref() {
@@ -869,13 +911,14 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     ctrl: self.mods.control_key(),
                     shift: self.mods.shift_key(),
                 };
-                // Borderless window controls by keyboard (ticket T-9.9): the conventional
-                // `Cmd-W` (close) / `Cmd-M` (minimize). Intercepted before the host - they are
-                // window ops, and the host binds neither - so a chord never reaches routing.
+                // Window controls by keyboard (ticket T-9.9): the conventional `Cmd-W`
+                // (close) / `Cmd-M` (minimize) - aterm has no native menu bar to supply
+                // them. Intercepted before the host - they are window ops, and the host
+                // binds neither - so a chord never reaches routing.
                 if mods.cmd && !mods.ctrl && !mods.alt {
                     if let Some(control) = ch.and_then(|c| match c.to_ascii_lowercase() {
-                        'w' => Some(crate::hit::WindowControl::Close),
-                        'm' => Some(crate::hit::WindowControl::Minimize),
+                        'w' => Some(WindowControl::Close),
+                        'm' => Some(WindowControl::Minimize),
                         _ => None,
                     }) {
                         self.apply_window_control(control, event_loop);

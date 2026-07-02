@@ -143,7 +143,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 ### EPIC-8 - Packaging, signing, polish (deferred)
 | id | title | status | depends_on |
 |---|---|---|---|
-| T-8.1 | cargo-packager .app + .dmg (Info.plist matches the borderless window) | ready-for-agent | T-4.3, T-9.9 |
+| T-8.1 | cargo-packager .app + .dmg (Info.plist matches the transparent-titlebar window) | ready-for-agent | T-4.3, T-9.9 |
 | T-8.2 | OFL font bundle + acknowledgements UI | ready-for-agent | T-8.1 |
 | T-8.3 | Config load + API-key Keychain custody | ready-for-agent | T-5.6 |
 | T-8.4 | Signing/notarization (when distribution matters) | needs-info | T-8.1 |
@@ -160,7 +160,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | T-9.6 | Agent transcript re-skin (agent glyph, plan header, tool-call rows, diff colors) | done | T-9.1, T-5.10 |
 | T-9.7 | Risk-gate approval UI re-skin (caution card, split Approve+menu, reject states) | done | T-9.1, T-5.11 |
 | T-9.8 | Mouse-pointer plumbing + hit-testing (hover/click affordances) | done | T-9.1, T-9.2, T-9.3, T-9.4, T-9.5 |
-| T-9.9 | Borderless window frame (hide native titlebar, rounded corners + shadow, real window controls) | done | T-9.2, T-9.8 |
+| T-9.9 | Window frame: native transparent titlebar (real traffic lights, native rounding + shadow) | done | T-9.2, T-9.8 |
 
 ### EPIC-10 - Multi-session + sessions sidebar
 | id | title | status | depends_on |

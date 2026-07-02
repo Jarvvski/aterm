@@ -1,7 +1,7 @@
 ---
 id: T-9.9
 epic: EPIC-9-vision-mock-reskin
-title: Borderless window frame - hide native titlebar, rounded corners + shadow, real window controls
+title: Window frame - native transparent titlebar (real traffic lights, native rounding + shadow)
 status: done
 labels: [ui, chrome, macos]
 depends_on: [T-9.2, T-9.8]
@@ -86,19 +86,25 @@ way, record the choice in the ticket Notes so the next agent knows why.
 # Acceptance criteria
 
 - [x] Running the app (`mise run run`) shows exactly ONE title bar - the native
-  macOS titlebar is gone and only aterm's custom bar renders. *(Borderless +
-  transparent window via `with_titlebar_hidden`; verified on hardware - CI is
-  headless. See Notes.)*
-- [x] The window has the mock's rounded corners, 1px hairline border, and soft drop
-  shadow, in both themes, resolving colors through T-9.1 tokens (completes T-9.2 AC1
-  - checkbox updated). *(Self-drawn rounded `bg.canvas` frame + hairline via the SDF
-  frame pipeline; the drop shadow is the OS window shadow hugging the drawn opaque
-  region.)*
+  macOS titlebar is gone and only aterm's custom bar renders. *(REWORKED
+  2026-07-02 to the native transparent titlebar - see Notes; verified on hardware
+  by screenshot. The `.titled` window paints no titlebar background/text/separator,
+  so the custom bar is the only visible bar.)*
+- [x] The window has rounded corners and a soft drop shadow in both themes
+  (completes T-9.2 AC1 - checkbox updated). *(Reworked: these are the NATIVE
+  `.titled` window's corners + shadow now, not drawn through tokens - the 2026-07-02
+  owner direction chose native chrome over the mock's self-drawn `.aw` frame. The
+  1px hairline border is likewise the native window border.)*
 - [x] Window controls work: close, minimize, and zoom/maximize are reachable by
-  mouse (**Option A**: the custom dots, wired via the T-9.8 hit map) AND by keyboard
-  (`Cmd-W`/`Cmd-M`). The chosen option is recorded in Notes.
-- [x] Offscreen GPU render test asserts the frame (rounded fill + hairline) inks in
-  both themes with the corners rounded away; no per-frame heap allocation introduced.
+  mouse AND close/minimize by keyboard (`Cmd-W`/`Cmd-M`). The chosen option is
+  recorded in Notes. *(Reworked: the mouse controls are the REAL native
+  traffic-light buttons - full native behavior incl. zoom, Option-click, hover
+  states - not aterm-drawn dots.)*
+- [x] Offscreen GPU render test asserts the title bar in both themes; no per-frame
+  heap allocation introduced. *(Reworked: with no drawn frame the test now asserts
+  the INVERSE - the native traffic-light inset stays EMPTY (nothing may ink under
+  the real buttons) while the toggle glyph, centered title, and hairline ink -
+  `title_bar_inks_centered_title_and_keeps_the_native_button_inset_empty`.)*
 
 # Out of scope
 
@@ -111,47 +117,71 @@ way, record the choice in the ticket Notes so the next agent knows why.
 
 ## Notes
 
-Landed 2026-07-02. **Option A** (full mock parity: the custom warm dots wired to real
-controls). The chosen mechanism differs slightly from the ticket's sketch, for a reason:
+Landed 2026-07-02 as **Option A**; **REWORKED the same day to Option B (native transparent
+titlebar) on owner direction**: "It should use the native style transparent title bar that
+other apps have - kitty, Slack, Linear" (with screenshots). Option A's fully-custom frame -
+self-drawn rounded corners, drawn hairline, aterm-drawn traffic-light dots - read as "some
+entirely custom thing" next to those apps' real native chrome. The rework:
 
-- **Borderless + transparent, not "titlebar-transparent".** winit's `with_titlebar_hidden(true)`
-  makes the window `NSWindowStyleMask::Borderless`, which - unlike `with_titlebar_transparent`
-  (which keeps a `.titled` window with a titlebar view) - lets the CONTENT view receive the clicks
-  on our custom dots (a transparent titlebar view would intercept them). The cost is that a
-  borderless window has no native rounding, so we draw it ourselves (which the AC's offscreen test
-  wants anyway). `with_fullsize_content_view(true)` + `with_transparent(true)` + `with_has_shadow(true)`
-  round it out (`window.rs`).
-- **Self-drawn rounded frame** (`window_frame.rs` + a dedicated `frame_pipeline` in `atlas.rs`): a
-  `FrameInstance` (rect + fill + border + `[radius, border_px]`) drawn through a rounded-rect SDF
-  fragment shader (`vs_frame`/`fs_frame`) so the corners fall to alpha 0. One instance covering the
-  window: `bg.canvas` fill + a 1px `hairline` ring, radius 12px (the mock's `.aw`). Damage-gated
-  alloc-free. Drawn FIRST, beneath everything - its canvas fill is the base every layer composits
-  onto (the transparent clear replaces the old opaque canvas clear).
-- **The soft drop shadow is the OS window shadow** (`with_has_shadow`), which hugs the drawn opaque
-  rounded region - higher quality than compositing a blurred rect ourselves, and it lives OUTSIDE
-  the surface where we cannot draw. (Divergence from the ticket's "draw the shadow" note.)
-- **Real controls** (`app.rs` `apply_window_control`): a click on a dot's `HitTarget::WindowControl`
-  (via the T-9.8 hit map) calls close -> `event_loop.exit()`, minimize -> `Window::set_minimized`,
-  zoom -> `Window::set_maximized` toggle; `Cmd-W`/`Cmd-M` do the same from the keyboard (intercepted
-  before host routing - the host binds neither). Dots brighten on hover (`title_bar.rs`). Window
-  controls stay live EVEN under the risk-gate approval modal (close/min/zoom can't bypass a safety
-  decision, and a window you can't close while a gate is up would feel stuck).
-- **Safety valve:** the transparent surface + rounded frame apply only when the adapter grants a
-  transparent composite alpha mode (`PostMultiplied` preferred, then `PreMultiplied`); otherwise the
-  surface stays `Opaque`, the frame clears to the canvas, and the rounded frame is skipped - a square
-  window identical to pre-T-9.9, zero regression.
+- **The window is `.titled` with a transparent titlebar** (`window.rs`):
+  `with_titlebar_transparent(true)` + `with_title_hidden(true)` +
+  `with_fullsize_content_view(true)` - byte-for-byte alacritty's `decorations =
+  "Transparent"`, and the same style wezterm's `INTEGRATED_BUTTONS` and kitty use. macOS
+  paints NO titlebar background, title text, or separator (verified by an offscreen AppKit
+  paint probe on macOS 15.7.7), so aterm's custom bar is the only visible bar - while the
+  rounded corners, drop shadow, 1px window border, and traffic-light buttons are all REAL
+  native chrome. Everything Option A hand-built (the `window_frame.rs` SDF frame renderer,
+  the `frame_pipeline` + `FrameInstance` + `vs_frame`/`fs_frame` WGSL, the transparent
+  surface/alpha-mode selection, the drawn dots + their `HitTarget::WindowControl` wiring)
+  is REMOVED; the wgpu surface is opaque again.
+- **Window controls are the native buttons.** Mouse close/minimize/zoom is AppKit's own
+  (the button widgets hit-test before our content view - native hover states, Option-click
+  zoom). `Cmd-W`/`Cmd-M` remain keyboard chords in `app.rs` (`apply_window_control`, now a
+  private two-variant enum - zoom has no conventional chord and needs no arm) since aterm
+  has no menu bar to provide them. Double-click-the-band-to-zoom is implemented in aterm
+  (a second no-target band press within 500ms toggles `set_maximized`): an adversarial
+  reviewer PROVED with an AppKit probe that `performWindowDragWithEvent` alone never fires
+  the native double-click action (the transparent titlebar routes band presses to the
+  content view, so AppKit's own handler never sees them) - this is the second half of the
+  Zed pattern (theirs reads `AppleActionOnDoubleClick`; aterm assumes the Zoom default and
+  a fixed 500ms interval - winit exposes neither the pref nor `clickCount`).
+- **The title bar aligns to the native button geometry** (`title_bar.rs`): AppKit centers
+  the buttons at y=14pt in the standard 28pt band and winit exposes no
+  `trafficLightPosition` to move them, so `TITLE_BAR_LOGICAL` goes 44 -> **28** (the band
+  IS the native band; glyph + title + buttons share one vertical center) and the sidebar
+  glyph starts at `TRAFFIC_LIGHT_INSET_LOGICAL` = **71** logical px (the cluster ends at
+  x=61pt on macOS 15; 71 is Zed's `TRAFFIC_LIGHT_PADDING` convention). The bar draws
+  NOTHING left of the inset - the GPU test asserts that region stays ink-free in both
+  themes so drawn chrome can never creep back under the real buttons.
+- **Pointer behavior in the band, measured on macOS 15.7.7** (hitTest probe): with the
+  transparent titlebar, events in the band away from the buttons reach the CONTENT view -
+  so the sidebar glyph stays hover/clickable with zero extra work - and nothing drags
+  automatically (`mouseDownCanMoveWindow` is NO for opaque views). Dragging stays the
+  explicit `Window::drag_window()` on a no-target band press (the Zed pattern), unchanged
+  from Option A's adversarial-review fix; `movable_by_window_background` stays off (it
+  swallows the mouseUp of a drifted click).
+- **The band is permanent chrome - reserved even in alt-screen** (an adversarial-review
+  catch, major): the native buttons float over the surface's top-left and are never
+  hidden, so hiding the bar in alt-screen (the pre-rework rule, written when the native
+  titlebar sat ABOVE the content) would put a full-screen TUI's top-left cells under the
+  immovable buttons - occluded, and a click aimed at them would land on the red button
+  and close the whole app. Now: the bar draws whenever the host supplies it (including
+  alt-screen), the PTY grid is sized from the surface MINUS the band (`app.rs` resize),
+  and the grid fast-path lays out below a matching `top_inset`
+  (`grid_render.rs::prepare`, folded into its damage key).
+- **Verified on hardware by screenshot** (this session, `screencapture -l` of the running
+  window): one title bar, real colored traffic lights centered in the 28px band with the
+  glyph + title, native rounded corners + shadow. CI keeps proving the drawn bar (title +
+  hairline ink, inset empty, both themes) + the pure hit/intent wiring; the native chrome
+  itself is AppKit's.
 
-Adversarial-review fix (a find->verify workflow: 4 raw -> 1 confirmed, 3 refuted): `movable_by_window_background`
-made macOS start a background-drag loop on any press-with-drift, swallowing the terminating `mouseUp` -
-so a dot click that drifted a few px was silently lost (the dots ARE the drag region). Replaced with an
-EXPLICIT `Window::drag_window()` started only on a title-bar-band press that carries NO hit target - the
-dots (which carry a target) stay clickable, and the chrome is still draggable, with no mouseUp race. A
-separate WGSL fix landed during implementation: the frame shader's `half` field collided with Metal's
-`half` type name (whole shader module failed to compile) -> renamed `half_size`.
+History (Option A, superseded but kept for the record): borderless `NSWindowStyleMask::Borderless`
+window + self-drawn SDF rounded frame + drawn dots wired through the T-9.8 hit map; a WGSL
+`half` -> `half_size` Metal-reserved-word fix; a `movable_by_window_background` mouseUp-race
+fix (the drag_window pattern above survives from it). Superseded because the owner wants the
+native chrome, which is also strictly less code: the rework deletes ~500 lines (frame renderer,
+frame pipeline, dot drawing/hover/wiring) and removes the transparency safety-valve complexity.
 
-**On-hardware residuals (CI is headless - `GpuRenderer::new`/the surface are never built in tests):**
-the actual transparency, the OS drop shadow, the single-bar / no-native-titlebar result, and live
-window dragging are verified on hardware (`mise run run`); CI proves the drawn rounded frame (fill +
-hairline + rounded-away corners, both themes) + the pure hit/intent wiring. Deferred (per out-of-scope):
-edge-resize affordances beyond the native Borderless resize; a richer drag region; the `.app` Info.plist
-must agree with these window attributes ([T-8.1](../EPIC-8-packaging/TICKET-8.1-cargo-packager-titlebar.md)).
+Deferred (per out-of-scope): the `.app` Info.plist must agree with these window attributes
+([T-8.1](../EPIC-8-packaging/TICKET-8.1-cargo-packager-titlebar.md)); kitty-style fullscreen
+button-visibility quirks are native-handled here (buttons are never hidden).

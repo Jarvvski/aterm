@@ -4,21 +4,23 @@
 //! surface) so window construction and the cell-size arithmetic are in one place.
 //! The geometry helpers are pure and unit-tested.
 //!
-//! ## Borderless window (ticket T-9.9)
-//! On macOS the window is created BORDERLESS + TRANSPARENT so aterm's custom title bar
-//! (T-9.2) is the ONLY bar - the native titlebar (and its buttons) are gone, and the
-//! surface's transparent corners let the mock's rounded [`crate::window_frame`] + the OS
-//! drop shadow show. `with_titlebar_hidden` drops the native chrome AND lets the content
-//! view receive clicks on the custom traffic-light dots (a titlebar-*transparent* window
-//! would keep a titlebar view that intercepts them); `with_has_shadow` keeps the soft OS
-//! shadow (it hugs the drawn opaque rounded region). The custom window CONTROLS
-//! (close/min/zoom) are wired to the dots in [`crate::app`] via the T-9.8 hit map, and the
-//! window is dragged by a press on the title-bar background (also [`crate::app`], via
-//! `Window::drag_window`). NOTE we deliberately do NOT set `movable_by_window_background`:
-//! on macOS that starts an AppKit background-drag loop on any press-with-drift and swallows
-//! the terminating `mouseUp`, so a dot click that drifts a few px would be lost (the dots
-//! ARE the drag region). Explicit `drag_window` on a no-control press avoids that race and
-//! keeps the dots clickable. Edge-resize stays native (the Borderless mask is resizable).
+//! ## Native transparent titlebar (ticket T-9.9)
+//! On macOS the window is the standard "transparent titlebar" style every native-feeling
+//! app uses (kitty, Slack, Linear; alacritty's `decorations = "Transparent"` sets the
+//! identical trio): the window stays `.titled` - native rounded corners, the native drop
+//! shadow, and the REAL traffic-light buttons - while `titlebar_transparent` +
+//! `title_hidden` + `fullsize_content_view` make macOS paint NO titlebar background, no
+//! title text, and no separator, so aterm's custom bar (T-9.2) is the only visible bar and
+//! the native buttons float over it. Measured on macOS 15 (see the T-9.9 ticket notes):
+//! pointer events in the titlebar band reach the CONTENT view (only the button widgets
+//! themselves intercept), so the bar's sidebar glyph stays hover/clickable; nothing drags
+//! automatically, so [`crate::app`] starts an explicit `Window::drag_window` on a
+//! title-bar-band press that hits no target (the Zed pattern). We deliberately do NOT set
+//! `movable_by_window_background`: on macOS that starts an AppKit background-drag loop on
+//! any press-with-drift and swallows the terminating `mouseUp`, losing a drifted click.
+//! The buttons sit at AppKit's fixed geometry - centered in the standard 28pt band, the
+//! cluster ending at x=61pt - which [`crate::title_bar`] aligns to (bar height 28,
+//! content inset 71).
 
 use winit::dpi::LogicalSize;
 use winit::window::{Window, WindowAttributes};
@@ -29,23 +31,23 @@ use winit::platform::macos::WindowAttributesExtMacOS;
 /// Default window size in logical points (matches the old inline scaffold value).
 pub const DEFAULT_LOGICAL_SIZE: (f64, f64) = (960.0, 600.0);
 
-/// Build the winit attributes for the main window: title + size + (on macOS) the
-/// borderless + transparent chrome (ticket T-9.9). Non-macOS keeps the plain titled
-/// window (v1 is macOS-first); `with_transparent` is a best-effort request there.
+/// Build the winit attributes for the main window: title + size + (on macOS) the native
+/// transparent-titlebar chrome (ticket T-9.9). The title still names the window in the
+/// app switcher / Mission Control even though the titlebar draws no text. Non-macOS keeps
+/// the plain titled window (v1 is macOS-first).
 #[must_use]
 pub fn window_attributes(title: &str) -> WindowAttributes {
     let attrs = Window::default_attributes()
         .with_title(title)
-        .with_transparent(true)
         .with_inner_size(LogicalSize::new(
             DEFAULT_LOGICAL_SIZE.0,
             DEFAULT_LOGICAL_SIZE.1,
         ));
     #[cfg(target_os = "macos")]
     let attrs = attrs
-        .with_titlebar_hidden(true)
-        .with_fullsize_content_view(true)
-        .with_has_shadow(true);
+        .with_titlebar_transparent(true)
+        .with_title_hidden(true)
+        .with_fullsize_content_view(true);
     attrs
 }
 

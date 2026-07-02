@@ -48,7 +48,6 @@ pub mod timeline_render;
 pub mod title_bar;
 pub mod widgets;
 pub mod window;
-pub mod window_frame;
 
 pub use app::{
     run, run_with, run_with_recorder, AtermApp, HeadlessCallbacks, KeyPress, Mods, RenderConfig,
@@ -66,7 +65,7 @@ pub use constraint::{Align, Constraint, Placed, Sizing};
 pub use glyph::{CellMetrics, GlyphRasterizer, RasterGlyph};
 pub use gpu::GpuRenderer;
 pub use grid_render::{FrameSize, GridRenderer};
-pub use hit::{HitMap, HitRect, HitTarget, WindowControl};
+pub use hit::{HitMap, HitRect, HitTarget};
 pub use ime::{ImeEvent, NativeTextInput};
 pub use indicator::IntegrationIndicator;
 pub use input_widget::InputWidgetRenderer;
@@ -89,7 +88,6 @@ pub use timeline::{
 };
 pub use timeline_render::TimelineRenderer;
 pub use title_bar::{TitleBarRenderer, TitleBarView, TITLE_BAR_LOGICAL};
-pub use window_frame::{WindowFrameRenderer, WINDOW_RADIUS_LOGICAL};
 
 // Re-export the winit key types the host app needs for input routing.
 pub use winit::keyboard::NamedKey;

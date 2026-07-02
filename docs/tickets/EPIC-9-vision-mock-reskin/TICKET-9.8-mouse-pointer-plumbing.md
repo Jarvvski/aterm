@@ -98,10 +98,11 @@ name in their Notes.
 - The T-9.7 approval card's split "Approve + menu" button and the T-9.6 tool-call
   rows are their OWN re-skin tickets; they may ADOPT this hit-testing once it lands
   but are not hard-blocked by it (both ship keyboard-first).
-- Real window-control (close/min/zoom) behavior on the traffic-light dots - a
-  packaging concern ([T-8.1](../EPIC-8-packaging/TICKET-8.1-cargo-packager-titlebar.md)).
-- Drag-to-resize / drag-the-title-bar-to-move (native titlebar handles these until
-  the borderless window lands in T-8.1).
+- Real window-control (close/min/zoom) behavior - landed with
+  [T-9.9](TICKET-9.9-borderless-window-frame.md), which (after its 2026-07-02 rework)
+  resolves them as the REAL native traffic-light buttons, not hit-map targets.
+- Drag-to-resize / drag-the-title-bar-to-move - drag-to-move also landed with T-9.9
+  (an explicit `drag_window()` on a title-bar-band press); edge resize stays native.
 
 ## Notes
 
@@ -153,6 +154,8 @@ adversarial-review fix - hover must imply clickable).
   match the mock exactly. The dot color/shape + the "exit N" label still carry the state without
   color when revealed (color-blind safety).
 
-Deferred (documented): the traffic-light dots' hover + real window controls ride in
-[T-9.9](TICKET-9.9-borderless-window-frame.md) (which extends `HitTarget` with the window controls);
-text selection by mouse drag is its own future ticket (out of scope above).
+Deferred (documented): real window controls rode in
+[T-9.9](TICKET-9.9-borderless-window-frame.md) - whose 2026-07-02 rework resolved them as the
+REAL native traffic-light buttons (AppKit hit-tests them before the content view), so
+`HitTarget` gained no window-control variant after all; text selection by mouse drag is its
+own future ticket (out of scope above).

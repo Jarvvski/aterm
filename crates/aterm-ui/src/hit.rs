@@ -25,23 +25,12 @@
 //! region that contains the point - the topmost one - so a target drawn over another
 //! (a popover row over a timeline block) wins, matching what the user sees.
 
-/// A borderless-window control dot (ticket T-9.9): the mock's warm traffic-light dots,
-/// now wired to real window operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WindowControl {
-    /// Close the window (the red dot).
-    Close,
-    /// Minimize/miniaturize the window (the amber dot).
-    Minimize,
-    /// Zoom/maximize toggle (the green dot).
-    Zoom,
-}
-
 /// A clickable / hoverable UI target the pointer can land on. Carries only the
 /// identity the host needs to map a click onto its EXISTING keyboard intent - never
-/// any action semantics (those live in `aterm-app`, ticket T-9.8). The
-/// borderless-window controls (T-9.9) are handled in `aterm-ui` itself (the winit
-/// window + event loop), not forwarded to the host.
+/// any action semantics (those live in `aterm-app`, ticket T-9.8). The window's
+/// close/minimize/zoom are NOT targets: they are the real native traffic-light
+/// buttons, which AppKit hit-tests before our content view ever sees the event
+/// (ticket T-9.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
     /// The custom title bar's sidebar-toggle glyph - the pointer twin of `Cmd-B`
@@ -60,9 +49,6 @@ pub enum HitTarget {
     /// the pointer twin of moving to that row and pressing `Enter`
     /// ([`crate::completion_render`]).
     CompletionRow(usize),
-    /// A borderless-window control dot (ticket T-9.9). Handled in [`crate::app`] against
-    /// the winit window / event loop (close / minimize / zoom), not the host.
-    WindowControl(WindowControl),
 }
 
 /// A rect in physical px: `[x, y, w, h]`.

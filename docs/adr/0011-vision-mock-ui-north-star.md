@@ -126,3 +126,27 @@ The translation of the mock into the live UI is organized as four epics:
 - **Rewrite the tokens inline in this ADR.** Rejected: an ADR records the
   decision; the concrete hex propagation into `tokens.toml` + `design-system.md`
   is implementation (T-9.1), tested and landed as code.
+
+## Amendment (2026-07-02): native window chrome, not mock-drawn chrome
+
+Owner direction during the T-9.9 landing (with kitty/Slack/Linear screenshots): the
+window must use **the native macOS transparent-titlebar style**, not a fully custom
+frame. The mock's `.aw` container remains the north star for the bar's CONTENT
+(sidebar toggle glyph, centered title + cwd, hairline), but the window CHROME is
+native:
+
+- The window is `.titled` with `titlebarAppearsTransparent` + hidden title +
+  `fullSizeContentView` (alacritty's "Transparent" decorations trio). Rounded
+  corners, the drop shadow, the 1px window border, and the traffic-light buttons
+  are the REAL native ones; aterm draws none of them.
+- The mock's drawn traffic-light dots (and the `chrome.*` dot tokens' on-screen
+  use) are superseded by the real buttons. The tokens remain as the palette
+  record.
+- The bar is 28px (the native titlebar band, whose button geometry is immovable
+  from winit), not the mock's 44px; the first custom control starts at a 71px
+  left inset (the Zed convention). Decision point 3's "hidden native titlebar +
+  44px bar" wording is amended accordingly; the Consequences bullet "the custom
+  bar is drawn inside a titlebar-less window" now reads "inside a native
+  transparent-titlebar window".
+
+Recorded in the T-9.9 ticket Notes; implemented the same day.

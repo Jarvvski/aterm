@@ -75,7 +75,7 @@ pub struct GridRenderer {
     /// Rebuild gate: `(version, vw, vh, px, theme_sig)` currently built, or `None`.
     /// `theme_sig` is a hash over every theme color the build reads (see
     /// [`theme_signature`]), so a theme change always invalidates the build.
-    built: Option<(u64, u32, u32, u32, u64)>,
+    built: Option<(u64, u32, u32, u32, u32, u64)>,
     /// Glyph-layer draw calls issued by the last [`Self::draw`] (the T-1.6 AC c
     /// counter: exactly 1 when the grid has any inked cell, else 0).
     last_glyph_draw_calls: u32,
@@ -115,20 +115,29 @@ impl GridRenderer {
     }
 
     /// Build the frame's instances from `snap` through the shared `atlas`, reusing the
-    /// prior build when the `(version, viewport, px, theme)` signature is unchanged (the
-    /// damage gate). Returns `true` if there is anything to draw.
+    /// prior build when the `(version, viewport, top inset, px, theme)` signature is
+    /// unchanged (the damage gate). Returns `true` if there is anything to draw.
+    ///
+    /// `top_inset` (physical px) shifts the whole grid down below the reserved title-bar
+    /// band (ticket T-9.9): the native traffic-light buttons are PERMANENT window chrome
+    /// floating over the surface's top-left, so even the alt-screen grid must lay out
+    /// below them - content under the immovable buttons would be occluded AND a click
+    /// aimed at it would land on the buttons (the red one closes the app). The host
+    /// shrinks the PTY row count by the same band ([`crate::app`]), so nothing clips.
     ///
     /// The unchanged path allocates nothing (the steady-state present; asserted by
     /// `steady_state_prepare_is_allocation_free`). On the CHANGED path the CPU
     /// instance build reuses its warm `Vec`s and the glyph cache, so it does not
     /// allocate either once warm at a stable size and glyph set; the GPU upload
     /// (`queue.write_buffer`) is wgpu-managed staging and is not part of that claim.
+    #[allow(clippy::too_many_arguments)] // by-value frame-path args, like the other front-ends
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         atlas: &mut GlyphAtlas,
         snap: &Snapshot,
+        top_inset: f32,
         theme: &Theme,
         size: FrameSize,
     ) -> bool {
@@ -143,6 +152,7 @@ impl GridRenderer {
             snap.version,
             viewport_w,
             viewport_h,
+            top_inset.round() as u32,
             px_key,
             theme_signature(theme),
         );
@@ -186,7 +196,7 @@ impl GridRenderer {
         for cell in &cells {
             let origin = (
                 inset + f32::from(cell.col) * cw,
-                inset + f32::from(cell.row) * ch,
+                top_inset + inset + f32::from(cell.row) * ch,
             );
             crate::cell_render::emit_cell(
                 atlas,
@@ -395,6 +405,7 @@ mod gpu_tests {
             queue,
             atlas,
             snap,
+            0.0,
             &theme(),
             FrameSize {
                 width: w,
@@ -656,13 +667,13 @@ mod gpu_tests {
             scale: SCALE,
         };
         // First prepare builds + caches (allocates).
-        grid.prepare(&device, &queue, &mut atlas, &snap, &theme(), size);
+        grid.prepare(&device, &queue, &mut atlas, &snap, 0.0, &theme(), size);
 
         // An unchanged frame (same version/viewport/theme) must early-out with NO
         // allocation - the steady-state present path (ticket T-1.8 AC1/AC2). This is
         // the renderer-level "skip the rebuild when nothing is dirty".
         let allocs = crate::alloc_probe::count_allocs(|| {
-            let drew = grid.prepare(&device, &queue, &mut atlas, &snap, &theme(), size);
+            let drew = grid.prepare(&device, &queue, &mut atlas, &snap, 0.0, &theme(), size);
             std::hint::black_box(drew);
         });
         assert_eq!(

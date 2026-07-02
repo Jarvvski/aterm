@@ -36,22 +36,22 @@ This document is normative for `aterm-tokens` (the token values) and
 aterm's UI is **radical restraint**: the timeline of command/agent blocks *is*
 the window. Everything that is not content is a hairline, whitespace, or a mode
 accent. This is iA Writer's "omit needless words" applied to a terminal
-(`07-ia-design-language.md` §1). Per ADR-0011 the window does draw its own **44px
-custom title bar** (inside a hidden native titlebar, T-8.1) and an **optional,
-toggleable sessions sidebar** (not shown by default on a single session) - the
-former "no title bar / no sidebar" clause is retired. There is still no toolbar
-and no tab-strip chrome.
+(`07-ia-design-language.md` §1). Per ADR-0011 (as amended 2026-07-02) the window
+draws its own **28px custom title bar** (inside a native transparent-titlebar
+window, T-9.9) and an **optional, toggleable sessions sidebar** (not shown by
+default on a single session) - the former "no title bar / no sidebar" clause is
+retired. There is still no toolbar and no tab-strip chrome.
 
-The title bar (T-9.2) carries, left to right: three decorative traffic-light dots
-in the warm chrome hues (`chrome.close` red / `chrome.minimize` amber /
-`chrome.zoom` green - tokens, not scattered hex), a sidebar-toggle glyph in
-`fg.muted`, and an absolutely-centered active title (`fg.primary`) + `  -  <cwd>`
-(`fg.muted`), over a bottom `hairline` rule. The renderer reserves this 44px band
-so the timeline lays out below it. The mock's rounded corners + soft drop shadow
-are a titlebar-less-window property that cannot be drawn into a native-decorated
-opaque surface, so they land with the borderless packaging (T-8.1); the toggle
-glyph's pointer *click* awaits mouse hit-testing (today the intent is driven by
-`Cmd-B`).
+The title bar (T-9.2, reworked by T-9.9) carries, left to right: the REAL native
+macOS traffic-light buttons (floating in a reserved 71px left inset - aterm draws
+nothing there; the mock's drawn dots are superseded by owner direction,
+2026-07-02), a sidebar-toggle glyph in `fg.muted`, and an absolutely-centered
+active title (`fg.primary`) + `  -  <cwd>` (`fg.muted`), over a bottom `hairline`
+rule. The bar is 28px tall - the native titlebar band height, so the immovable
+native buttons (AppKit centers them at y=14) share the bar's vertical center with
+the glyph and title; this supersedes the mock's 44px, since winit exposes no
+`trafficLightPosition` to move the buttons instead. The renderer reserves this
+band so the timeline lays out below it.
 
 Five rules govern every component:
 
@@ -61,8 +61,9 @@ Five rules govern every component:
    soft shadow, per the mock). Blocks are delimited by `hairline` top/bottom
    rules, not boxes. (Implementation note: the shipped popovers - the T-9.5
    completion finder - render flat on `bg.elev` with a hairline border; the soft
-   drop shadow is deferred with the other window-shadow work in T-8.1, since a
-   shadow needs a transparent surface.)
+   popover drop shadow remains deferred, and would now need its own drawn
+   treatment - the window shadow became native chrome in T-9.9 and the surface is
+   deliberately opaque, so there is no transparent-surface mechanism to ride on.)
 2. **Two mode accents, used scarcely.** Per ADR-0011 the old one-accent rule is
    relaxed to a two-accent **mode** model: shell blue (`accent.primary`) and agent
    purple (`accent.agent`), resolved as "the current mode color" by
@@ -458,15 +459,27 @@ turns into a hand over a clickable target.
 
 ### Window frame (T-9.9)
 
-The window is borderless + transparent (no native macOS titlebar), so aterm's custom
-title bar is the only bar. The mock's rounded `.aw` container is self-drawn: a
-`bg.canvas` fill + 1px `hairline` border with 12px-radius corners, via a rounded-rect
-SDF pipeline that alphas the corners away; the soft drop shadow is the OS window shadow
-hugging that drawn opaque region. The three warm traffic-light dots
-(`chrome.close`/`minimize`/`zoom`) are real controls - click to close / minimize / zoom
-(they brighten on hover), or `Cmd-W`/`Cmd-M` - and stay live even under the risk-gate
-modal. On a GPU with no transparent alpha mode the window falls back to an opaque square
-(no rounding), unchanged from before. Drag-to-move is a title-bar-background press.
+The window is a native `.titled` macOS window with a TRANSPARENT titlebar - the
+standard treatment kitty/Slack/Linear use (alacritty's `decorations = "Transparent"`
+trio: `titlebar_transparent` + `title_hidden` + `fullsize_content_view`). macOS
+paints no titlebar background, no title text, and no separator, so aterm's custom
+bar is the only visible bar - while the rounded corners, the soft drop shadow, and
+the traffic-light buttons are all REAL native chrome, not drawn. Close/minimize/zoom
+are the native buttons by mouse (AppKit hit-tests them before aterm's content view
+sees the event) and `Cmd-W`/`Cmd-M` by keyboard (aterm has no menu bar to supply the
+chords). The wgpu surface is opaque; aterm draws nothing window-frame-shaped.
+Pointer events elsewhere in the titlebar band DO reach aterm (measured on macOS 15),
+so the sidebar glyph stays hover/clickable; nothing drags automatically in this
+style, so drag-to-move is an explicit `drag_window()` on a bar-background press (the
+Zed pattern), and a second band press within the double-click window zooms (standing
+in for the native titlebar double-click action, which the transparent titlebar can't
+fire itself). Because the native buttons are PERMANENT chrome floating over the
+surface, the title-bar band is reserved even in alt-screen: the bar stays drawn, the
+PTY grid is sized from the content below it, and the grid fast-path draws with the
+matching top inset - a full-screen TUI never lays out under the immovable buttons
+(where a stray click would land on the red button and close the app). The
+`chrome.close`/`minimize`/`zoom` tokens remain in `aterm-tokens` as the mock's
+palette record but are no longer drawn.
 
 ### Shell-integration indicator (3-state)
 

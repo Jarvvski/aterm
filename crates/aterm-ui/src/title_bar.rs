@@ -1,27 +1,25 @@
-//! The custom window title bar (ticket T-9.2): the chrome strip every non-alt-screen
-//! screen sits under, drawn to the vision mock (ADR-0011) `<!-- title bar -->` block.
+//! The custom window title bar (ticket T-9.2): the chrome strip every screen sits under
+//! (including alt-screen, T-9.9 - the native buttons floating over it are permanent
+//! chrome), drawn to the vision mock (ADR-0011) `<!-- title bar -->` block.
 //!
 //! It is another front-end over the shared [`GlyphAtlas`] (like the grid, prose, timeline,
-//! and input box): a 44px bar with a bottom `hairline` rule carrying, left to right, three
-//! traffic-light dots in the warm chrome hues, a sidebar-toggle glyph in `fg.muted`, and an
-//! absolutely-centered active title (`fg.primary`) + `  -  <cwd>` (`fg.muted`). The window
-//! keeps a hidden NATIVE titlebar (the titlebar-less packaging is T-8.1); this custom bar
-//! is drawn INSIDE it, and the host reserves the top [`title_bar_px`] so the timeline lays
-//! out below it.
+//! and input box): a bar with a bottom `hairline` rule carrying a sidebar-toggle glyph in
+//! `fg.muted` and an absolutely-centered active title (`fg.primary`) + `  -  <cwd>`
+//! (`fg.muted`). The host reserves the top [`title_bar_px`] so the timeline lays out below
+//! it.
 //!
-//! ## Scope (T-9.2)
-//! - Traffic-light dots are DECORATIVE (real close/minimize/zoom is packaging, T-8.1); they
-//!   render in the chrome color tokens ([`aterm_tokens::SemanticColors::chrome_close`] etc.)
-//!   so no hex is hardcoded here.
-//! - The sidebar-toggle glyph is drawn; the sidebar PANEL + making the glyph actually toggle
-//!   it are EPIC-10. The toggle-sidebar INTENT path lives in `aterm-app` (a keybinding ->
-//!   `Session::toggle_sidebar`); wiring the glyph's pointer CLICK to it needs mouse
-//!   hit-testing (absent today - the app handles only keys + wheel), the same deferral as the
-//!   T-9.4 mode-chip click.
-//! - The mock's rounded corners + soft drop shadow are a titlebar-less-window property
-//!   (T-8.1): they cannot be drawn into a native-decorated opaque surface, so they are
-//!   deferred there. This bar draws the testable in-surface chrome: the dots, the toggle
-//!   glyph, the centered title/cwd, and the bottom hairline.
+//! ## The native transparent titlebar (ticket T-9.9)
+//! The window keeps its NATIVE `.titled` chrome with a TRANSPARENT titlebar (see
+//! [`crate::window`]): macOS paints no titlebar background, but the REAL traffic-light
+//! buttons float over this bar's top-left. So this bar draws NO window controls of its
+//! own - the left [`TRAFFIC_LIGHT_INSET_LOGICAL`] is left empty for the native buttons,
+//! and the bar's height matches the native 28pt titlebar band so the buttons (AppKit
+//! centers them at y=14pt; immovable without private API) share the bar's vertical
+//! center with the toggle glyph + title.
+//!
+//! ## Scope
+//! - The sidebar-toggle glyph is drawn + hover/clickable (T-9.8); the sidebar PANEL it
+//!   will open/close is EPIC-10. The toggle-sidebar INTENT path lives in `aterm-app`.
 //!
 //! ## Damage gating
 //! Like the input box, [`Self::prepare`] keys a full rebuild on a cheap FNV signature over
@@ -36,21 +34,23 @@ use aterm_tokens::{space, type_scale, Rgba, Theme};
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
 use crate::grid_render::FrameSize;
-use crate::hit::{HitRect, HitTarget, WindowControl};
+use crate::hit::{HitRect, HitTarget};
 use crate::prose::ProseShaper;
 use crate::text::{FaceStyle, FontFamily, GlyphKey, GridCell};
 use crate::window::cell_px;
 
-/// The title bar's height in LOGICAL px (the mock's `height:44px`); scaled to physical at
-/// draw. Exposed so the host ([`crate::gpu`]) reserves this top band and lays the timeline
-/// out below it via [`title_bar_px`].
-pub const TITLE_BAR_LOGICAL: f32 = 44.0;
+/// The title bar's height in LOGICAL px; scaled to physical at draw. Matches the native
+/// macOS titlebar band (28pt), where AppKit vertically centers the real traffic-light
+/// buttons (at y=14pt, fixed) - so the bar's own centered content shares their center
+/// (ticket T-9.9). Exposed so the host ([`crate::gpu`]) reserves this top band and lays
+/// the timeline out below it via [`title_bar_px`].
+pub const TITLE_BAR_LOGICAL: f32 = 28.0;
 
-/// The traffic-light dot glyph: `nf-fa-circle` (U+F111) - the same filled-circle PUA icon
-/// the gutter/meta dots use, so its presence is already coverage-tested. Drawn three times
-/// in the chrome hues. (A true 12px circle is a T-8.1 borderless-window nicety; here it is a
-/// grid-cell-sized colored dot, which reads unambiguously as a traffic light.)
-const DOT_GLYPH: char = '\u{f111}';
+/// The left inset in LOGICAL px reserved for the NATIVE traffic-light buttons (ticket
+/// T-9.9): the button cluster ends at x=61pt on macOS 15 (frames at x=7/27/47, 14pt
+/// wide), and ~71pt is the de-facto convention for the first custom control after it
+/// (Zed's `TRAFFIC_LIGHT_PADDING`). The bar draws NOTHING to the left of this.
+pub const TRAFFIC_LIGHT_INSET_LOGICAL: f32 = 71.0;
 
 /// The sidebar-toggle glyph: `nf-fa-columns` (U+F0DB), a two-panel icon that stands in for
 /// the mock's `◧` (U+25E7 SQUARE WITH LEFT HALF BLACK, `.notdef` in the bundled Mono Nerd
@@ -94,19 +94,7 @@ pub struct TitleBarRenderer {
     /// the rebuild path so the host's pointer path can hit-test it even on an idle frame that
     /// early-outs. `None` until the bar has drawn once.
     sidebar_toggle_rect: Option<HitRect>,
-    /// The three traffic-light dots' clickable regions in physical px (ticket T-9.9), indexed
-    /// `[Close, Minimize, Zoom]` ([`TITLE_BAR_CONTROLS`]), cached on the rebuild path. The
-    /// host wires each to the matching winit window control via the hit map.
-    dot_rects: [Option<HitRect>; 3],
 }
-
-/// The window controls behind the three traffic-light dots, in left-to-right draw order
-/// (ticket T-9.9): close, minimize, zoom.
-const TITLE_BAR_CONTROLS: [WindowControl; 3] = [
-    WindowControl::Close,
-    WindowControl::Minimize,
-    WindowControl::Zoom,
-];
 
 impl TitleBarRenderer {
     /// Build the title-bar front-end: its reused instance buffers + the title/cwd shaper.
@@ -125,7 +113,6 @@ impl TitleBarRenderer {
             built: None,
             last_glyph_draw_calls: 0,
             sidebar_toggle_rect: None,
-            dot_rects: [None; 3],
         }
     }
 
@@ -141,19 +128,6 @@ impl TitleBarRenderer {
     #[must_use]
     pub fn sidebar_toggle_rect(&self) -> Option<HitRect> {
         self.sidebar_toggle_rect
-    }
-
-    /// The three traffic-light dots as `(control, rect)` pairs in physical px (ticket T-9.9),
-    /// `[Close, Minimize, Zoom]`; each rect is `None` before the first draw. The host pushes
-    /// them into the frame's [`crate::hit::HitMap`] as [`HitTarget::WindowControl`] so a
-    /// pointer click drives the matching window control.
-    #[must_use]
-    pub fn window_control_rects(&self) -> [(WindowControl, Option<HitRect>); 3] {
-        [
-            (TITLE_BAR_CONTROLS[0], self.dot_rects[0]),
-            (TITLE_BAR_CONTROLS[1], self.dot_rects[1]),
-            (TITLE_BAR_CONTROLS[2], self.dot_rects[2]),
-        ]
     }
 
     /// Build the frame's instances for `view` through the shared `atlas`, reusing the prior
@@ -183,18 +157,10 @@ impl TitleBarRenderer {
         let px_key = px as u32;
 
         // The sidebar-toggle glyph brightens on pointer hover (ticket T-9.8), the mock's
-        // `.navitem:hover { color: var(--ink) }`; a traffic-light dot brightens on hover too
-        // (ticket T-9.9). Both are folded into the signature so a hover change forces exactly
-        // one rebuild.
+        // `.navitem:hover { color: var(--ink) }`. Folded into the signature so a hover
+        // change forces exactly one rebuild.
         let toggle_hovered = hovered == Some(HitTarget::SidebarToggle);
-        let hovered_control = match hovered {
-            Some(HitTarget::WindowControl(c)) => Some(c),
-            _ => None,
-        };
-        let sig = fold_u64(
-            fold_bool(signature(view, width, px_key, theme), toggle_hovered),
-            control_code(hovered_control),
-        );
+        let sig = fold_bool(signature(view, width, px_key, theme), toggle_hovered);
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
         }
@@ -227,44 +193,15 @@ impl TitleBarRenderer {
             color: theme.colors.hairline.to_linear_f32(),
         });
 
-        // A cell row vertically centered in the bar, for the dots + toggle glyph.
+        // A cell row vertically centered in the bar, for the toggle glyph.
         let row_y = ((bar_h - ch) * 0.5).max(0.0);
-        let pad_l = 15.0 * scale; // the mock's 15px left padding
-        let dot_pitch = cw + 6.0 * scale; // dot + a small gap
-
-        // Three traffic-light dots in the chrome hues (token-colored), now real window
-        // controls (ticket T-9.9): each caches a clickable rect and brightens on hover.
         let c = &theme.colors;
-        let hit_pad = 4.0 * scale;
-        for (i, base) in [c.chrome_close, c.chrome_minimize, c.chrome_zoom]
-            .into_iter()
-            .enumerate()
-        {
-            let dot_x = pad_l + i as f32 * dot_pitch;
-            let hovered_here = hovered_control == Some(TITLE_BAR_CONTROLS[i]);
-            let color = if hovered_here { brighten(base) } else { base };
-            let dot = grid_glyph(DOT_GLYPH, color, canvas);
-            emit_cell(
-                atlas,
-                queue,
-                &dot,
-                (dot_x, row_y),
-                &ctx,
-                &mut self.bg_instances,
-                &mut self.glyph_instances,
-            );
-            // Cache the clickable region (the dot cell padded to a comfortable target).
-            self.dot_rects[i] = Some([
-                (dot_x - hit_pad).max(0.0),
-                (row_y - hit_pad).max(0.0),
-                cw + 2.0 * hit_pad,
-                (ch + 2.0 * hit_pad).min(bar_h),
-            ]);
-        }
 
-        // The sidebar-toggle glyph, one cell right of the dots (the mock's ~18px margin-left).
-        // `fg.muted` at rest, brightening to `fg.primary` on pointer hover (ticket T-9.8).
-        let toggle_x = pad_l + 3.0 * dot_pitch + 18.0 * scale;
+        // The sidebar-toggle glyph, just right of the NATIVE traffic-light buttons (ticket
+        // T-9.9): everything left of the inset is left empty for the real buttons floating
+        // over this bar. `fg.muted` at rest, brightening to `fg.primary` on pointer hover
+        // (ticket T-9.8).
+        let toggle_x = TRAFFIC_LIGHT_INSET_LOGICAL * scale;
         let toggle_fg = if toggle_hovered {
             c.fg_primary
         } else {
@@ -411,7 +348,7 @@ impl TitleBarRenderer {
     }
 
     /// Record the title-bar draws into `pass` through the shared `atlas`: the solid layer
-    /// (bottom hairline) first, then the single glyph instanced draw (dots + toggle + text).
+    /// (bottom hairline) first, then the single glyph instanced draw (toggle + text).
     pub fn draw(&mut self, pass: &mut wgpu::RenderPass<'_>, atlas: &GlyphAtlas) {
         if !self.bg_instances.is_empty() {
             atlas.draw_rects(pass, &self.bg_buf, self.bg_instances.len());
@@ -426,7 +363,7 @@ impl TitleBarRenderer {
 }
 
 /// A single Mono cell carrying `ch` in `fg` on the canvas background (so the background
-/// quad is skipped by [`emit_cell`]); used for the dots + toggle glyph.
+/// quad is skipped by [`emit_cell`]); used for the toggle glyph.
 fn grid_glyph(ch: char, fg: Rgba, canvas: Rgba) -> GridCell {
     GridCell {
         col: 0,
@@ -452,36 +389,6 @@ fn fold_bool(base: u64, b: bool) -> u64 {
     (base ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
 }
 
-/// Fold an arbitrary small value into a signature (ticket T-9.9), for the hovered window
-/// control code.
-fn fold_u64(base: u64, v: u64) -> u64 {
-    (base ^ v).wrapping_mul(0x0000_0100_0000_01b3)
-}
-
-/// Encode the hovered window control as a small distinct code (`0` = none) for the damage
-/// signature (ticket T-9.9).
-fn control_code(control: Option<WindowControl>) -> u64 {
-    match control {
-        None => 0,
-        Some(WindowControl::Close) => 1,
-        Some(WindowControl::Minimize) => 2,
-        Some(WindowControl::Zoom) => 3,
-    }
-}
-
-/// Brighten a chrome dot toward white for its pointer-hover state (ticket T-9.9): the mock's
-/// traffic lights light up under the cursor. A 35% pull to white reads clearly in both themes
-/// while keeping the hue.
-fn brighten(c: Rgba) -> Rgba {
-    let f = |x: u8| (f32::from(x) + (255.0 - f32::from(x)) * 0.35).round() as u8;
-    Rgba {
-        r: f(c.r),
-        g: f(c.g),
-        b: f(c.b),
-        a: c.a,
-    }
-}
-
 fn signature(view: &TitleBarView, w: u32, px_key: u32, theme: &Theme) -> u64 {
     fn fold_u64(h: u64, v: u64) -> u64 {
         (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
@@ -503,15 +410,7 @@ fn signature(view: &TitleBarView, w: u32, px_key: u32, theme: &Theme) -> u64 {
     s = fold_u64(s, u64::from(w));
     s = fold_u64(s, u64::from(px_key));
     let c = &theme.colors;
-    for color in [
-        c.bg_canvas,
-        c.fg_primary,
-        c.fg_muted,
-        c.hairline,
-        c.chrome_close,
-        c.chrome_minimize,
-        c.chrome_zoom,
-    ] {
+    for color in [c.bg_canvas, c.fg_primary, c.fg_muted, c.hairline] {
         s = fold_color(s, color);
     }
     s
@@ -534,19 +433,17 @@ mod tests {
 
     #[test]
     fn title_bar_glyphs_exist_in_the_bundled_grid_font() {
-        // The dots + toggle render through the Mono GRID face; a glyph missing from the
+        // The toggle renders through the Mono GRID face; a glyph missing from the
         // bundled Nerd Font would draw `.notdef` (a box) and silently break the chrome -
         // the same regression the gutter/prompt/chip glyph tests guard. A cmap lookup of 0
-        // IS `.notdef`, so both must resolve non-zero. Pure font parse: every platform.
+        // IS `.notdef`, so it must resolve non-zero. Pure font parse: every platform.
         let r = crate::glyph::GlyphRasterizer::new();
-        for glyph in [DOT_GLYPH, SIDEBAR_TOGGLE_GLYPH] {
-            let gid = r.glyph_id(FontFamily::Grid, FaceStyle::Regular, glyph);
-            assert_ne!(
-                gid, 0,
-                "title-bar glyph U+{:04X} is .notdef in the bundled Mono Nerd Font",
-                glyph as u32
-            );
-        }
+        let gid = r.glyph_id(FontFamily::Grid, FaceStyle::Regular, SIDEBAR_TOGGLE_GLYPH);
+        assert_ne!(
+            gid, 0,
+            "title-bar glyph U+{:04X} is .notdef in the bundled Mono Nerd Font",
+            SIDEBAR_TOGGLE_GLYPH as u32
+        );
     }
 
     #[test]
@@ -596,9 +493,9 @@ mod tests {
 
 // The title bar draws to a real GPU through the shared atlas, so it is verified offscreen
 // and read back - macOS-only, skipping when no adapter is present (the same harness as the
-// grid/prose/timeline/input GPU tests). These cover: the title-bar chrome inks (dots +
-// centered title) in both themes, the glyph layer is one draw call, and the damage gate
-// early-outs alloc-free.
+// grid/prose/timeline/input GPU tests). These cover: the title-bar chrome inks (centered
+// title + hairline) in both themes while the native traffic-light inset stays EMPTY, the
+// glyph layer is one draw call, and the damage gate early-outs alloc-free.
 #[cfg(all(test, target_os = "macos"))]
 mod gpu_tests {
     use super::*;
@@ -743,7 +640,7 @@ mod gpu_tests {
     }
 
     #[test]
-    fn title_bar_inks_dots_and_centered_title_in_both_themes() {
+    fn title_bar_inks_centered_title_and_keeps_the_native_button_inset_empty() {
         let Some((device, queue, format)) = device() else {
             eprintln!("no GPU adapter; skipping");
             return;
@@ -762,10 +659,20 @@ mod gpu_tests {
             );
 
             let bar_h = title_bar_px(SCALE) as u32;
-            // A traffic-light dot inks near the left of the bar (the leftmost dot region).
+            // The traffic-light inset draws NOTHING (ticket T-9.9): the REAL native buttons
+            // float there, so any ink under them would clash. Sampled above the hairline.
+            let inset = (TRAFFIC_LIGHT_INSET_LOGICAL * SCALE) as u32;
+            // (Minus a small rounding slack so the toggle glyph's own left edge, pinned AT
+            // the inset, can never trip this.)
             assert!(
-                rb.any_ink(14, 0, 60, bar_h, 30),
-                "{kind:?}: a traffic-light dot inks at the left of the title bar"
+                !rb.any_ink(0, 0, inset.saturating_sub(4), bar_h.saturating_sub(2), 10),
+                "{kind:?}: the native traffic-light inset stays empty (no drawn dots)"
+            );
+            // The sidebar-toggle glyph inks just right of the inset - sampled ABOVE the
+            // hairline (which spans the full width and would satisfy any_ink on its own).
+            assert!(
+                rb.any_ink(inset, 0, inset + 30, bar_h.saturating_sub(2), 25),
+                "{kind:?}: the sidebar-toggle glyph inks right of the native buttons"
             );
             // The centered title inks in the middle of the bar.
             assert!(
@@ -858,7 +765,7 @@ mod gpu_tests {
         assert_eq!(
             tb.last_glyph_draw_calls(),
             1,
-            "the whole title-bar glyph layer (dots + toggle + title + cwd) is ONE draw"
+            "the whole title-bar glyph layer (toggle + title + cwd) is ONE draw"
         );
     }
 

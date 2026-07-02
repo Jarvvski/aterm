@@ -254,8 +254,9 @@ pub struct SemanticColors {
     /// Window traffic-light dot colors (the mock's warm macOS-control hues), left to
     /// right: close (red), minimize (amber), zoom (green). These are CHROME constants -
     /// identical in both themes (they are the standard macOS control colors, not
-    /// palette-derived) - kept as tokens so the title bar (T-9.2) hardcodes no hex.
-    /// Decorative in v1; real close/minimize/zoom wiring is packaging (T-8.1).
+    /// palette-derived). NO LONGER DRAWN: the T-9.9 rework (2026-07-02) replaced the
+    /// drawn dots with the REAL native traffic-light buttons; the tokens remain as the
+    /// mock's palette record (per the ADR-0011 amendment).
     pub chrome_close: Rgba,
     pub chrome_minimize: Rgba,
     pub chrome_zoom: Rgba,
@@ -850,10 +851,10 @@ mod tests {
 
     #[test]
     fn chrome_traffic_dots_are_distinct_and_shared_across_themes() {
-        // T-9.2: the title bar's traffic-light dots resolve through tokens (no scattered
-        // hex in the renderer). They are decorative CHROME - the standard macOS control
-        // colors - so they are IDENTICAL in both themes and the three differ from each
-        // other (a red / amber / green a scanning eye can tell apart).
+        // The mock's traffic-light hues, kept as the palette record (no longer drawn -
+        // the T-9.9 rework uses the REAL native buttons). They are CHROME - the standard
+        // macOS control colors - so they are IDENTICAL in both themes and the three
+        // differ from each other (a red / amber / green a scanning eye can tell apart).
         for theme in [&LIGHT, &DARK] {
             let c = &theme.colors;
             assert_ne!(c.chrome_close, c.chrome_minimize);

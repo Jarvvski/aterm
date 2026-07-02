@@ -1138,9 +1138,6 @@ impl UiCallbacks for Session {
             }
             // The block-meta hover region has no click action yet (hover-reveal only, T-9.8).
             HitTarget::BlockMeta(_) => {}
-            // Window controls (T-9.9) are handled in `aterm-ui` (the winit window / event
-            // loop) and never forwarded here; this arm keeps the match exhaustive.
-            HitTarget::WindowControl(_) => {}
         }
     }
 

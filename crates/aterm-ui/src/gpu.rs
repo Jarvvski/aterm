@@ -85,11 +85,6 @@ pub struct GpuRenderer {
     /// `RequireConfirm` verdict. Self-gated (its own damage signature), so a parked frame
     /// allocates nothing.
     approval: crate::approval_render::ApprovalRenderer,
-    /// The borderless rounded window-frame front-end (ticket T-9.9): the `bg.canvas` fill +
-    /// hairline border drawn FIRST, beneath everything, so the transparent corners round the
-    /// window. Only drawn when `transparent` (a transparent-capable surface was configured);
-    /// otherwise the surface is opaque and the canvas clear stands (square window, no rounding).
-    window_frame: crate::window_frame::WindowFrameRenderer,
     /// Idle gate for the timeline path: the `(snapshot version, scroll, viewport, theme,
     /// alt, hovered-block)` signature last laid out + prepared. When unchanged, the per-frame
     /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
@@ -114,8 +109,8 @@ pub struct GpuRenderer {
     /// Whether the input box drew on the last frame (it is drawn over the bottom zone in
     /// normal mode when the host supplies an `InputModel`).
     drew_input: bool,
-    /// Whether the title bar drew on the last frame (drawn over the top band in normal mode
-    /// when the host supplies title-bar content).
+    /// Whether the title bar drew on the last frame (drawn over the reserved top band
+    /// whenever the host supplies title-bar content - including alt-screen, T-9.9).
     drew_title: bool,
     /// Whether the raw grid drew as the PRIMARY view on the last frame (alt-screen or the
     /// no-engine headless stand-in). Tracked separately from `drew_timeline` so the glyph
@@ -136,12 +131,6 @@ pub struct GpuRenderer {
     /// [`Self::set_hover`] before a redraw and read here to drive each front-end's hover
     /// treatment. `None` when the pointer is over nothing clickable / off-window.
     hovered: Option<HitTarget>,
-    /// Whether the surface was configured with a transparent alpha mode (ticket T-9.9). When
-    /// `true` the frame clears to transparent and the rounded [`Self::window_frame`] paints
-    /// the canvas + rounded corners; when `false` (no transparent alpha mode on this adapter)
-    /// the frame clears to the opaque canvas and no rounding is drawn - a safe degradation
-    /// that matches the pre-T-9.9 square window with zero risk.
-    transparent: bool,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -191,20 +180,13 @@ impl GpuRenderer {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
-        // Prefer a TRANSPARENT-capable composite alpha mode (ticket T-9.9) so the window's
-        // rounded corners can fall away to the desktop + the OS draws its soft shadow around
-        // the drawn opaque region. `PostMultiplied` matches our straight-alpha (ALPHA_BLENDING)
-        // shader output exactly; `PreMultiplied` is a close second (only the ~1px AA edge of
-        // the rounding differs). If the adapter offers neither, fall back to whatever it lists
-        // first (typically `Opaque`) and skip the rounded frame - a square window, no regression.
-        let alpha_mode = [
-            wgpu::CompositeAlphaMode::PostMultiplied,
-            wgpu::CompositeAlphaMode::PreMultiplied,
-        ]
-        .into_iter()
-        .find(|m| caps.alpha_modes.contains(m))
-        .unwrap_or(caps.alpha_modes[0]);
-        let transparent = alpha_mode != wgpu::CompositeAlphaMode::Opaque;
+        // The surface is OPAQUE (ticket T-9.9): the window is a native `.titled` window
+        // with a transparent TITLEBAR, so macOS itself masks the rounded corners and draws
+        // the drop shadow - the content layer needs no alpha.
+        let alpha_mode = [wgpu::CompositeAlphaMode::Opaque]
+            .into_iter()
+            .find(|m| caps.alpha_modes.contains(m))
+            .unwrap_or(caps.alpha_modes[0]);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -226,7 +208,6 @@ impl GpuRenderer {
         let screens = crate::screens::ScreensRenderer::new(&device);
         let completion = crate::completion_render::CompletionRenderer::new(&device);
         let approval = crate::approval_render::ApprovalRenderer::new(&device);
-        let window_frame = crate::window_frame::WindowFrameRenderer::new(&device);
 
         Ok(Self {
             surface,
@@ -241,7 +222,6 @@ impl GpuRenderer {
             screens,
             completion,
             approval,
-            window_frame,
             timeline_sig: None,
             scroll: crate::timeline::ScrollState::default(),
             last_visible_blocks: 0,
@@ -254,7 +234,6 @@ impl GpuRenderer {
             drew_approval: false,
             hit_map: HitMap::new(),
             hovered: None,
-            transparent,
             _window: window,
             scale_factor,
         })
@@ -377,15 +356,10 @@ impl GpuRenderer {
     fn render_inner(&mut self, frame: Frame<'_>) -> Result<(), RenderError> {
         // Tracy frame zone (ticket T-1.8 AC4); zero-cost with no subscriber.
         let _frame_zone = tracing::trace_span!("frame").entered();
-        // On a transparent surface (ticket T-9.9) clear to transparent so the rounded
-        // corners fall to the desktop; the window-frame renderer then paints the `bg.canvas`
-        // fill that every layer composits onto. On an opaque surface (fallback) the canvas
-        // clear stands, exactly as before (square window).
-        let clear = if self.transparent {
-            wgpu::Color::TRANSPARENT
-        } else {
-            linear_to_wgpu(frame.theme.colors.bg_canvas)
-        };
+        // Clear to the theme canvas: the opaque base every layer composits onto. The
+        // window's rounded corners + shadow are the native `.titled` chrome (T-9.9),
+        // not drawn here.
+        let clear = linear_to_wgpu(frame.theme.colors.bg_canvas);
 
         // The pointer's current hover (ticket T-9.8), read once into a local (Copy) so the
         // disjoint front-end borrows in the build block below don't conflict with `self`.
@@ -455,10 +429,14 @@ impl GpuRenderer {
         // too - otherwise the user could approve/reject a command they cannot see. So it is
         // NOT `!alt_screen`-gated like the chrome layers above.
         let draw_approval = frame.approval.is_some();
-        // The custom title bar draws over a reserved TOP band in normal mode (a full-screen
-        // app owns the whole surface in alt-screen, so it is hidden there, like the input
-        // box). It reserves `title_h` off the top so the timeline lays out below it.
-        let draw_title = !alt_screen && frame.title_bar.is_some();
+        // The custom title bar draws over a reserved TOP band whenever the host supplies
+        // it - INCLUDING alt-screen (ticket T-9.9): the native traffic-light buttons are
+        // permanent window chrome floating over the surface's top-left, so the band must
+        // stay reserved (and the bar drawn) even while a full-screen app owns the rest;
+        // otherwise the TUI's top-left cells would sit under the immovable buttons, where
+        // a click aimed at them lands on the red button and closes the app. The host
+        // shrinks the PTY grid by the same band, so the full-screen app loses nothing.
+        let draw_title = frame.title_bar.is_some();
         self.drew_timeline = draw_timeline;
         self.drew_grid = draw_grid;
         self.drew_screens = draw_screens;
@@ -486,9 +464,9 @@ impl GpuRenderer {
             0.0
         };
         // Reserve the top title-bar band (ticket T-9.2) so the timeline lays out BELOW it,
-        // mirroring the bottom input zone. The timeline honors this as a top inset (added to
-        // its own top breathing band); the grid fast-path is only drawn in alt-screen, where
-        // the title bar is hidden, so it never sees this inset.
+        // mirroring the bottom input zone. The timeline honors this as a top inset (added
+        // to its own top breathing band); the grid fast-path (alt-screen) receives it as
+        // `top_inset` so a full-screen app also lays out below the band (ticket T-9.9).
         let title_h = if draw_title {
             crate::title_bar::title_bar_px(self.scale_factor)
         } else {
@@ -514,17 +492,6 @@ impl GpuRenderer {
         // changed (the steady-state present floor, T-1.8).
         {
             let _build = tracing::trace_span!("build").entered();
-            // The rounded window frame (ticket T-9.9) builds first, beneath everything; only
-            // on a transparent surface (else the opaque canvas clear stands). Self-gated.
-            if self.transparent {
-                self.window_frame.prepare(
-                    &self.device,
-                    &self.queue,
-                    &self.atlas,
-                    frame.theme,
-                    size,
-                );
-            }
             if draw_timeline {
                 let blocks = frame.blocks.expect("draw_timeline implies blocks");
                 // Finalize the scroll offset for this frame against the live extents:
@@ -574,6 +541,7 @@ impl GpuRenderer {
                         &self.queue,
                         &mut self.atlas,
                         snap,
+                        title_h,
                         frame.theme,
                         size,
                     );
@@ -700,16 +668,9 @@ impl GpuRenderer {
                     }
                 }
             }
-            // The window controls (T-9.9) stay live EVEN under the modal: close / minimize /
-            // zoom are pure window ops that can't bypass the pending safety decision, and a
-            // window you cannot close while a gate is up would feel stuck.
-            if draw_title {
-                for (ctrl, rect) in self.title.window_control_rects() {
-                    if let Some(rect) = rect {
-                        self.hit_map.push(rect, HitTarget::WindowControl(ctrl));
-                    }
-                }
-            }
+            // The window's close/minimize/zoom need no entries here even under the modal:
+            // they are the REAL native traffic-light buttons (T-9.9), which AppKit
+            // hit-tests before our content view ever sees the event.
         }
 
         // wgpu 29: `get_current_texture` returns a `CurrentSurfaceTexture` enum.
@@ -756,12 +717,6 @@ impl GpuRenderer {
                     multiview_mask: None,
                 });
 
-                // The rounded window frame draws FIRST (ticket T-9.9), beneath every layer:
-                // its `bg.canvas` fill is the base the primary view + chrome composit onto,
-                // and its SDF rounds the corners on the transparent surface.
-                if self.transparent {
-                    self.window_frame.draw(&mut pass, &self.atlas);
-                }
                 // Draw the chosen PRIMARY front-end through the shared atlas. Each draw
                 // no-ops (and zeroes its own glyph-draw-call counter) when it has no
                 // instances, so the counter stays honest across mode switches and blank
@@ -791,7 +746,7 @@ impl GpuRenderer {
                     self.approval.draw(&mut pass, &self.atlas);
                 }
                 // The title bar draws last, over the reserved top band (its bottom hairline
-                // + dots + toggle + centered title sit on top of the cleared canvas).
+                // + toggle glyph + centered title sit on top of the cleared canvas).
                 if draw_title {
                     self.title.draw(&mut pass, &self.atlas);
                 }
