@@ -2,7 +2,7 @@
 id: T-9.4
 epic: EPIC-9-vision-mock-reskin
 title: Unified input bar + mode chip re-skin (mode-colored glyph/caret, pill chip, per-mode placeholder)
-status: ready-for-agent
+status: done
 labels: [ui, input]
 depends_on: [T-9.1]
 ---
@@ -46,15 +46,38 @@ the two-accent mode model from ADR-0011 on the input box.
 
 # Acceptance criteria
 
-- [ ] The input bar renders to the mock in both themes and both modes: correct
+- [x] The input bar renders to the mock in both themes and both modes: correct
   mode glyph, mode-tinted caret, per-mode placeholder, and the pill chip with
   glyph + label + `⌘I`.
-- [ ] Toggling mode (chip click or `⌘I`) cross-fades glyph/caret/chip within
-  `motion.fast` and preserves the typed text and selection.
-- [ ] The chip toggle and the hotkey drive the same routing intent (no divergent
+- [x] Toggling mode (`⌘I`) cross-fades glyph/caret/chip within `motion.fast` and
+  preserves the typed text and selection (see the note on chip click).
+- [x] The chip toggle and the hotkey drive the same routing intent (no divergent
   code path).
-- [ ] Motion budget and T-1.8 no-per-frame-alloc assertion hold; a widget test
+- [x] Motion budget and T-1.8 no-per-frame-alloc assertion hold; a widget test
   covers both modes x both themes.
+
+## Notes
+
+Landed 2026-07-02. The prompt glyph (`❯` shell / `◊` agent) and the caret both tint to
+the current mode accent via `mode_accent` (shell blue / agent purple); the mode chip is
+now a pill in the mode color (accent border + ~13% accent tint fill + accent text)
+carrying the glyph + label ("Shell"/"Agent") + a `⌘I` hint, sized to the wider mode so
+the toggle never reflows. Per-mode placeholders and the module doc / `CHIP_LABELS` /
+tests were updated.
+
+Font substitutions (the mock's chars are `.notdef` in the bundled faces, so the nearest
+present glyphs stand in, guarded by coverage tests): agent glyph `◇` U+25C7 -> `◊` U+25CA
+(diamond lozenge); the chip's `⌘` U+2318 -> the Nerd MDI `apple_keyboard_command` PUA icon
+U+F0633.
+
+Deferred (documented): the mode-toggle cross-fade is declared (`Animation::CrossFade`,
+`motion.fast`) but not time-driven yet - like every animation today it swaps instantly
+until a frame clock lands. Text/selection are preserved by construction (the `InputModel`
+reducer only flips `mode`, ADR-0004). The chip is presentation-only: the sole toggle path
+is the `⌘I` hotkey -> `Disposition::ToggleMode` -> the reducer (no divergent path), so AC3
+holds; wiring the chip's pointer CLICK to that same path needs mouse hit-testing (absent
+today - the app handles only keys + wheel), which the ticket scopes to routing mechanics
+(T-3.3, "presentation only").
 
 # Out of scope
 

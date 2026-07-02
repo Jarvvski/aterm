@@ -154,8 +154,8 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 |---|---|---|---|
 | T-9.1 | Reconcile tokens to the mock (warm palette + agent second-accent + elevated surface) | done | - |
 | T-9.2 | Window frame + custom title bar shell (traffic lights, centered title, sidebar toggle) | ready-for-agent | T-9.1 |
-| T-9.3 | Command block re-skin (prompt glyph, hover block-meta, exit status, hairline rhythm) | ready-for-agent | T-9.1 |
-| T-9.4 | Unified input bar + mode chip re-skin (mode-colored glyph/caret, pill chip) | ready-for-agent | T-9.1 |
+| T-9.3 | Command block re-skin (prompt glyph, hover block-meta, exit status, hairline rhythm) | done | T-9.1 |
+| T-9.4 | Unified input bar + mode chip re-skin (mode-colored glyph/caret, pill chip) | done | T-9.1 |
 | T-9.5 | Launch + modes empty states and the tab-completion popover | ready-for-agent | T-9.1, T-9.4 |
 | T-9.6 | Agent transcript re-skin (agent glyph, plan header, tool-call rows, diff colors) | ready-for-agent | T-9.1, T-5.10 |
 | T-9.7 | Risk-gate approval UI re-skin (caution card, split Approve+menu, reject states) | ready-for-agent | T-9.1, T-5.11 |

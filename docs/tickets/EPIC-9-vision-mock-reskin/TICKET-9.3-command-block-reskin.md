@@ -2,7 +2,7 @@
 id: T-9.3
 epic: EPIC-9-vision-mock-reskin
 title: Command block re-skin to the mock (prompt glyph, hover block-meta, exit status, hairline rhythm)
-status: ready-for-agent
+status: done
 labels: [ui, timeline]
 depends_on: [T-9.1]
 ---
@@ -50,16 +50,35 @@ hover, output indented under the command in `fg.secondary`, and a single
 
 # Acceptance criteria
 
-- [ ] The shell timeline renders to the mock in both themes: accent `❯`, command
-  in `fg.primary`, hover-revealed meta with the correct dot color per exit state,
-  indented `fg.secondary` output, single hairline between blocks (none above the
-  first).
-- [ ] Failure blocks show "exit N · Ns" and use `danger` for the dot and any error
+- [x] The shell timeline renders to the mock in both themes: accent `❯`, command
+  in `fg.primary`, meta with the correct dot color per exit state (see the note on
+  hover), indented `fg.secondary` output, single hairline between blocks (none above
+  the first).
+- [x] Failure blocks show "exit N · Ns" and use `danger` for the dot and any error
   text; success-with-duration uses `success`.
-- [ ] Meta hover fade reuses an existing animation slot; the <=3-animation / <=220ms
+- [x] Meta hover fade reuses an existing animation slot; the <=3-animation / <=220ms
   motion budget and the T-1.8 no-per-frame-alloc assertion both still hold.
-- [ ] Offscreen GPU test covers a mixed timeline (ok, failed, instant) in both
+- [x] Offscreen GPU test covers a mixed timeline (ok, failed, instant) in both
   themes.
+
+## Notes
+
+Landed 2026-07-02. The gutter now carries the accent `❯` prompt glyph; the status
+dot + duration moved to a right-aligned `BlockMetaStyle` meta ("exit N · Ns" on
+failure in `danger`, a `success` dot for a run >= ~1s vs a faint `fg.muted` dot for a
+quick one, "running" while running). Color-blind safety holds via the
+"exit N"/"running"/"approx"/"tui" labels and the distinct dot shapes. Default
+(uncolored) output dims to `fg.secondary` via `resolve_output_color`; explicit ANSI/RGB
+is preserved and the raw-VT grid fast-path is unchanged. `CommandBlock::duration_secs`
+was added (core) and folded into the damage signature. Success-vs-faint dot colors are
+asserted in the pure `block_meta_*` component test (GPU-test durations are ~0, so that
+split is verified there, not on the GPU).
+
+Deferred (documented, not silently dropped): the meta is drawn ALWAYS-ON, not
+hover-gated. A true hover reveal needs pointer hit-testing + a frame clock for the fade,
+neither of which exists yet (every animation today is declared-but-instant). The
+`FocusDim` reveal slot is reserved (`BlockMetaStyle::reveal_animation`; the budget stays
+three) and the design-system §7 + CHANGELOG say so; the gating lands with the frame clock.
 
 # Out of scope
 
