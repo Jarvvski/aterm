@@ -176,6 +176,14 @@ pub trait UiCallbacks {
         None
     }
 
+    /// The custom title-bar content to draw this frame (ticket T-9.2): the active title +
+    /// cwd, or `None` for a host with no chrome (e.g. [`HeadlessCallbacks`]), in which case
+    /// no title bar is drawn. Borrowed (not cloned) so it reads the host's live strings with
+    /// no per-frame allocation, mirroring [`Self::input`]; the renderer only reads it.
+    fn title_bar(&self) -> Option<crate::title_bar::TitleBarView<'_>> {
+        None
+    }
+
     /// A key was pressed; return bytes to forward to the PTY (Shell mode), if any.
     /// `key` carries the named key / logical character / insertion text and the
     /// live modifier state, so the host can route the real `Cmd-/` toggle chord and
@@ -453,6 +461,7 @@ impl<C: UiCallbacks> AtermApp<C> {
                 // `self.renderer` field, so the two coexist (no per-frame alloc).
                 input: self.callbacks.input(),
                 autonomy: self.callbacks.autonomy_mode(),
+                title_bar: self.callbacks.title_bar(),
             };
             if let Err(e) = renderer.render(frame) {
                 log::warn!("frame render error: {e}");

@@ -29,6 +29,10 @@ pub struct Config {
     /// ask-always -> auto-safe -> auto-run-in-session. Default `Cmd-Shift-A`;
     /// rebindable via the `ATERM_AUTONOMY_KEY` env override (e.g. `ctrl+a`).
     pub autonomy_cycle: KeyBinding,
+    /// The sidebar-toggle hotkey (ticket T-9.2): flips the toggle-sidebar intent. Default
+    /// `Cmd-B`; rebindable via the `ATERM_SIDEBAR_KEY` env override. The sidebar panel is
+    /// EPIC-10; today this just flips the intent (a no-op stub the panel will consume).
+    pub toggle_sidebar: KeyBinding,
 }
 
 impl Default for Config {
@@ -41,6 +45,7 @@ impl Default for Config {
             toggle_mode: KeyBinding::default_toggle(),
             default_autonomy: AutonomyMode::AutoSafe, // the locked AUTO-SAFE default
             autonomy_cycle: KeyBinding::default_autonomy_cycle(),
+            toggle_sidebar: KeyBinding::default_sidebar_toggle(),
         }
     }
 }
@@ -93,6 +98,14 @@ impl Config {
                 Some(binding) => cfg.autonomy_cycle = binding,
                 None => log::warn!(
                     "ignoring invalid ATERM_AUTONOMY_KEY={spec:?}; keeping the default (Cmd-Shift-A)"
+                ),
+            }
+        }
+        if let Ok(spec) = std::env::var("ATERM_SIDEBAR_KEY") {
+            match KeyBinding::parse(&spec) {
+                Some(binding) => cfg.toggle_sidebar = binding,
+                None => log::warn!(
+                    "ignoring invalid ATERM_SIDEBAR_KEY={spec:?}; keeping the default (Cmd-B)"
                 ),
             }
         }

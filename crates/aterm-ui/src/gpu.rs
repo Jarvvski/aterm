@@ -61,6 +61,11 @@ pub struct GpuRenderer {
     /// the timeline viewport is shrunk by its [`crate::input_widget::zone_px`] so the two
     /// never overlap.
     input: crate::input_widget::InputWidgetRenderer,
+    /// The custom title-bar front-end (ticket T-9.2): drawn over a reserved TOP band in
+    /// normal (non-alt-screen) mode when the host supplies title-bar content. Self-gated
+    /// (its own damage signature), so it allocates nothing on an idle present; the timeline
+    /// is laid out below it via a top inset of [`crate::title_bar::title_bar_px`].
+    title: crate::title_bar::TitleBarRenderer,
     /// Idle gate for the timeline path: the `(snapshot version, scroll, viewport, theme,
     /// alt)` signature last laid out + prepared. When unchanged, the per-frame
     /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
@@ -83,6 +88,9 @@ pub struct GpuRenderer {
     /// Whether the input box drew on the last frame (it is drawn over the bottom zone in
     /// normal mode when the host supplies an `InputModel`).
     drew_input: bool,
+    /// Whether the title bar drew on the last frame (drawn over the top band in normal mode
+    /// when the host supplies title-bar content).
+    drew_title: bool,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -148,6 +156,7 @@ impl GpuRenderer {
         let grid = GridRenderer::new(&device);
         let timeline = crate::timeline_render::TimelineRenderer::new(&device);
         let input = crate::input_widget::InputWidgetRenderer::new(&device);
+        let title = crate::title_bar::TitleBarRenderer::new(&device);
 
         Ok(Self {
             surface,
@@ -158,11 +167,13 @@ impl GpuRenderer {
             grid,
             timeline,
             input,
+            title,
             timeline_sig: None,
             scroll: crate::timeline::ScrollState::default(),
             last_visible_blocks: 0,
             drew_timeline: false,
             drew_input: false,
+            drew_title: false,
             _window: window,
             scale_factor,
         })
@@ -220,8 +231,9 @@ impl GpuRenderer {
 
     /// Glyph-layer draw calls from the last frame: the PRIMARY front-end's (the timeline
     /// in normal mode, the grid in alt-screen - each exactly 1 when it has text, T-1.6
-    /// AC c) plus the input box's one draw when it is shown (T-3.6). So a normal frame
-    /// with input is 2 (timeline + box); an alt-screen frame is 1 (the grid, no box).
+    /// AC c) plus the input box's one draw when it is shown (T-3.6) plus the title bar's
+    /// one draw when it is shown (T-9.2). So a normal frame with input + chrome is 3
+    /// (timeline + box + title bar); an alt-screen frame is 1 (the grid, no box/chrome).
     /// Exposed for tests / instrumentation.
     #[must_use]
     pub fn last_glyph_draw_calls(&self) -> u32 {
@@ -235,7 +247,12 @@ impl GpuRenderer {
         } else {
             0
         };
-        primary + input
+        let title = if self.drew_title {
+            self.title.last_glyph_draw_calls()
+        } else {
+            0
+        };
+        primary + input + title
     }
 
     /// Render the snapshot grid (and always clear). Split out so `render` reads
@@ -263,8 +280,13 @@ impl GpuRenderer {
         // the live command line - the raw grid (with the shell's own echo) is not drawn in
         // normal mode (T-4.6), so there is no double echo.
         let draw_input = !alt_screen && frame.input.is_some();
+        // The custom title bar draws over a reserved TOP band in normal mode (a full-screen
+        // app owns the whole surface in alt-screen, so it is hidden there, like the input
+        // box). It reserves `title_h` off the top so the timeline lays out below it.
+        let draw_title = !alt_screen && frame.title_bar.is_some();
         self.drew_timeline = draw_timeline;
         self.drew_input = draw_input;
+        self.drew_title = draw_title;
         let size = crate::grid_render::FrameSize {
             width: self.config.width,
             height: self.config.height,
@@ -284,7 +306,16 @@ impl GpuRenderer {
         } else {
             0.0
         };
-        let effective_h = (self.config.height as f32 - input_zone).max(0.0);
+        // Reserve the top title-bar band (ticket T-9.2) so the timeline lays out BELOW it,
+        // mirroring the bottom input zone. The timeline honors this as a top inset (added to
+        // its own top breathing band); the grid fast-path is only drawn in alt-screen, where
+        // the title bar is hidden, so it never sees this inset.
+        let title_h = if draw_title {
+            crate::title_bar::title_bar_px(self.scale_factor)
+        } else {
+            0.0
+        };
+        let effective_h = (self.config.height as f32 - title_h - input_zone).max(0.0);
         // The block timeline reserves top + bottom canvas breathing room (T-4.7,
         // `space::S12` each), so fewer rows fit than the raw surface height. The grid
         // fast-path keeps its own tight inset and does not consume this row budget.
@@ -336,6 +367,7 @@ impl GpuRenderer {
                         &self.queue,
                         &mut self.atlas,
                         &layout,
+                        title_h,
                         frame.theme,
                         size,
                     );
@@ -366,6 +398,18 @@ impl GpuRenderer {
                     &mut self.atlas,
                     frame.input.expect("draw_input implies input"),
                     frame.autonomy,
+                    frame.theme,
+                    size,
+                );
+            }
+
+            // The title bar (self-gated, like the input box).
+            if draw_title {
+                self.title.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.atlas,
+                    &frame.title_bar.expect("draw_title implies title_bar"),
                     frame.theme,
                     size,
                 );
@@ -424,10 +468,15 @@ impl GpuRenderer {
                 } else {
                     self.grid.draw(&mut pass, &self.atlas);
                 }
-                // The input box draws last, over the reserved bottom zone (its hairline +
+                // The input box draws over the reserved bottom zone (its hairline +
                 // text + chip + caret sit on top of the cleared canvas).
                 if draw_input {
                     self.input.draw(&mut pass, &self.atlas);
+                }
+                // The title bar draws last, over the reserved top band (its bottom hairline
+                // + dots + toggle + centered title sit on top of the cleared canvas).
+                if draw_title {
+                    self.title.draw(&mut pass, &self.atlas);
                 }
             }
             self.queue.submit(std::iter::once(encoder.finish()));

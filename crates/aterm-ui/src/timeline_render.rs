@@ -151,12 +151,17 @@ impl TimelineRenderer {
     /// The unchanged path allocates nothing (the steady-state early-out). The CHANGED
     /// path reuses its warm `Vec`s + the glyph cache; `queue.write_buffer` is wgpu
     /// staging, not part of that claim.
+    // Threads device/queue/atlas/layout/inset/theme/size by value to stay allocation-free
+    // on the frame path; bundling them adds a per-frame borrow dance for no clarity gain.
+    // Mirrors the grid/input prepare shape (T-9.2 added the `top_inset`, tipping it to 8).
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         atlas: &mut GlyphAtlas,
         layout: &TimelineLayout,
+        top_inset: f32,
         theme: &Theme,
         size: FrameSize,
     ) -> bool {
@@ -168,7 +173,11 @@ impl TimelineRenderer {
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
 
-        let sig = signature(layout, width, height, px_key, theme);
+        // Fold the top inset (the reserved title-bar band, T-9.2) into the built signature
+        // so a title-bar toggle / DPI change that moves the timeline down forces a rebuild.
+        // `signature()` itself stays inset-agnostic (its sig_tests are unchanged); the fold
+        // is a separate, unit-tested step (`top_inset_is_a_folded_draw_affecting_axis`).
+        let sig = fold_top_inset(signature(layout, width, height, px_key, theme), top_inset);
         if self.built == Some(sig) {
             // Nothing changed: reuse the buffers verbatim (no rebuild, no allocation).
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
@@ -190,11 +199,12 @@ impl TimelineRenderer {
         // lays out below a top breathing band and inside a horizontal gutter on both
         // edges; the inter-block gap (one [`GAP_ROWS`] row of whitespace) is already in
         // the layout coordinate, so here it just renders as an empty band.
-        // Top breathing band. The matching BOTTOM `space::S12` band is NOT a second
-        // offset here - the caller (`gpu::prepare`) already shrank `viewport_rows` by
-        // 2*S12, so the last row's bottom lands one S12 above the surface foot. Both
-        // bands are one constant; edit them together (see gpu.rs viewport_rows).
-        let top_margin = f32::from(space::S12) * scale; // canvas breathing room (top)
+        // Top breathing band, offset below any reserved title-bar band (`top_inset`, T-9.2).
+        // The matching BOTTOM `space::S12` band is NOT a second offset here - the caller
+        // (`gpu::prepare`) already shrank `viewport_rows` by 2*S12 AND subtracted `top_inset`
+        // from the effective height, so the last row's bottom lands one S12 above the surface
+        // foot. Both bands are one constant; edit them together (see gpu.rs viewport_rows).
+        let top_margin = top_inset + f32::from(space::S12) * scale; // title-bar inset + breathing
         let edge = f32::from(space::S8) * scale; // horizontal canvas gutter (both sides)
         let pad = f32::from(space::S4) * scale; // intra-block content padding
         let metrics = atlas.cell_metrics(FontFamily::Grid, px);
@@ -515,6 +525,15 @@ fn grid_glyph(ch: char, fg: aterm_tokens::Rgba, canvas: aterm_tokens::Rgba) -> G
         underline: false,
         wide: false,
     }
+}
+
+/// Fold the reserved top-band inset (ticket T-9.2) into a base signature, so a title-bar
+/// toggle / DPI change that shifts the timeline down forces a rebuild. Kept separate from
+/// [`signature`] (which stays inset-agnostic) and unit-tested directly. `0.0` (the hidden /
+/// alt-screen case) folds nothing; distinct nonzero insets yield distinct results because
+/// `wrapping_mul` by an odd constant is a bijection on `u64`.
+fn fold_top_inset(base: u64, top_inset: f32) -> u64 {
+    base ^ (top_inset.to_bits() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 /// A stable u64 over everything the timeline draw reads: the mode + scroll geometry,
@@ -857,6 +876,27 @@ mod sig_tests {
     }
 
     #[test]
+    fn top_inset_is_a_folded_draw_affecting_axis() {
+        // T-9.2: the reserved title-bar band shifts the timeline down (top_margin += inset)
+        // and is folded into the built signature, so toggling the title bar on/off forces a
+        // rebuild. Exercises the real `fold_top_inset` the prepare gate uses.
+        let blocks = block_with_output(3, Some(0));
+        let l = layout(&blocks, false, Scroll::default(), 20);
+        let base = signature(&l, 800, 600, 13, &dark());
+        // No inset (title bar hidden / alt-screen) folds nothing.
+        assert_eq!(fold_top_inset(base, 0.0), base, "a zero inset is a no-op");
+        // A title-bar inset must invalidate the gate (the timeline moved down), and two
+        // distinct insets (e.g. 1x vs 2x DPI) must differ.
+        let bar = fold_top_inset(base, 44.0);
+        assert_ne!(base, bar, "a nonzero top inset must invalidate the gate");
+        assert_ne!(
+            bar,
+            fold_top_inset(base, 88.0),
+            "distinct insets yield distinct signatures"
+        );
+    }
+
+    #[test]
     fn alt_screen_and_timeline_modes_differ() {
         let blocks = block_with_output(2, Some(0));
         let tl = layout(&blocks, false, Scroll::default(), 20);
@@ -1115,6 +1155,7 @@ mod gpu_tests {
             queue,
             atlas,
             layout,
+            0.0,
             theme,
             FrameSize {
                 width: w,
@@ -1384,11 +1425,11 @@ mod gpu_tests {
             scale: SCALE,
         };
         // First prepare builds + caches (allocates).
-        tl.prepare(&device, &queue, &mut atlas, &l, &theme, size);
+        tl.prepare(&device, &queue, &mut atlas, &l, 0.0, &theme, size);
         // An unchanged layout must early-out with NO allocation (the steady-state
         // present path; the same zero-alloc discipline as the grid).
         let allocs = crate::alloc_probe::count_allocs(|| {
-            let drew = tl.prepare(&device, &queue, &mut atlas, &l, &theme, size);
+            let drew = tl.prepare(&device, &queue, &mut atlas, &l, 0.0, &theme, size);
             std::hint::black_box(drew);
         });
         assert_eq!(
@@ -1415,7 +1456,7 @@ mod gpu_tests {
         let blocks = block_with_output(3, Some(0));
         let alt = layout(&blocks, true, Scroll::default(), 12);
         assert!(
-            !tl.prepare(&device, &queue, &mut atlas, &alt, &theme, size),
+            !tl.prepare(&device, &queue, &mut atlas, &alt, 0.0, &theme, size),
             "alt-screen mode draws no timeline"
         );
         assert_eq!(tl.bg_instances.len(), 0);
@@ -1425,7 +1466,7 @@ mod gpu_tests {
         let empty = aterm_core::BlockList::new();
         let el = layout(&empty, false, Scroll::default(), 12);
         assert!(
-            !tl.prepare(&device, &queue, &mut atlas, &el, &theme, size),
+            !tl.prepare(&device, &queue, &mut atlas, &el, 0.0, &theme, size),
             "an empty timeline draws nothing"
         );
     }

@@ -42,6 +42,17 @@ toggleable sessions sidebar** (not shown by default on a single session) - the
 former "no title bar / no sidebar" clause is retired. There is still no toolbar
 and no tab-strip chrome.
 
+The title bar (T-9.2) carries, left to right: three decorative traffic-light dots
+in the warm chrome hues (`chrome.close` red / `chrome.minimize` amber /
+`chrome.zoom` green - tokens, not scattered hex), a sidebar-toggle glyph in
+`fg.muted`, and an absolutely-centered active title (`fg.primary`) + `  -  <cwd>`
+(`fg.muted`), over a bottom `hairline` rule. The renderer reserves this 44px band
+so the timeline lays out below it. The mock's rounded corners + soft drop shadow
+are a titlebar-less-window property that cannot be drawn into a native-decorated
+opaque surface, so they land with the borderless packaging (T-8.1); the toggle
+glyph's pointer *click* awaits mouse hit-testing (today the intent is driven by
+`Cmd-B`).
+
 Five rules govern every component:
 
 1. **Chrome-less.** Flat rectangles, hairline separators, no drop shadows on the

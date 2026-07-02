@@ -41,6 +41,7 @@ pub mod sprite;
 pub mod text;
 pub mod timeline;
 pub mod timeline_render;
+pub mod title_bar;
 pub mod widgets;
 pub mod window;
 
@@ -78,6 +79,7 @@ pub use timeline::{
     TimelineLayout, TimelineMode, TimelineRow, VisibleBlock,
 };
 pub use timeline_render::TimelineRenderer;
+pub use title_bar::{TitleBarRenderer, TitleBarView, TITLE_BAR_LOGICAL};
 
 // Re-export the winit key types the host app needs for input routing.
 pub use winit::keyboard::NamedKey;

@@ -11,6 +11,15 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ## Unreleased
 
+### Added
+
+- **A custom window title bar (the vision-mock chrome).** The window now draws a 44px title
+  bar with three warm traffic-light dots, a sidebar-toggle glyph, and a centered active title
+  plus the current directory (home shown as `~`), over a hairline rule; the timeline lays out
+  below it. The traffic-light dots are decorative for now and the sidebar panel arrives with
+  multi-session support - `Cmd-B` flips the (stubbed) toggle-sidebar intent today. The mock's
+  rounded corners + drop shadow land with the borderless-window packaging. (Ticket T-9.2.)
+
 ### Changed
 
 - **The command timeline and input box now wear the vision-mock look.** Command blocks lead

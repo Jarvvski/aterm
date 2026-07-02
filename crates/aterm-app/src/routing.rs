@@ -181,6 +181,22 @@ impl KeyBinding {
         }
     }
 
+    /// The default sidebar-toggle chord (ticket T-9.2): `Cmd-B` (the conventional
+    /// "toggle sidebar" shortcut). Distinct from the mode toggle + autonomy cycle so the
+    /// three chords never collide. The sidebar PANEL itself is EPIC-10; this drives the
+    /// toggle-sidebar intent until then (and stands in for the `◧` glyph's click, which
+    /// needs mouse hit-testing the app does not have yet).
+    #[must_use]
+    pub fn default_sidebar_toggle() -> Self {
+        Self {
+            key: BindKey::Char('b'),
+            mods: Mods {
+                cmd: true,
+                ..Mods::default()
+            },
+        }
+    }
+
     /// Whether `key` is exactly this chord: the modifiers match exactly and the base
     /// key matches (a character case-insensitively, a named key exactly).
     #[must_use]
@@ -577,6 +593,33 @@ mod tests {
         // Exact on modifiers: a bare `A` (no Cmd/Shift) never cycles autonomy.
         let bare_a = kp(None, Some('a'), mods(false, false, false, false));
         assert!(!autonomy.matches(&bare_a));
+    }
+
+    #[test]
+    fn sidebar_toggle_chord_is_cmd_b_and_distinct_from_the_other_hotkeys() {
+        // T-9.2: the sidebar-toggle hotkey is `Cmd-B`, its own chord, never colliding with
+        // the `Cmd-/` mode toggle or the `Cmd-Shift-A` autonomy cycle - the three intents
+        // (routing target / safety tier / chrome) must never fire one another.
+        let sidebar = KeyBinding::default_sidebar_toggle();
+        let toggle = KeyBinding::default_toggle();
+        let autonomy = KeyBinding::default_autonomy_cycle();
+
+        let cmd_b = kp(None, Some('b'), mods(true, false, false, false));
+        assert!(sidebar.matches(&cmd_b), "Cmd-B is the sidebar chord");
+        // Case-insensitive on the character.
+        let cmd_upper_b = kp(None, Some('B'), mods(true, false, false, false));
+        assert!(sidebar.matches(&cmd_upper_b));
+
+        // No collision with the other two hotkeys, either direction.
+        assert!(!toggle.matches(&cmd_b));
+        assert!(!autonomy.matches(&cmd_b));
+        let cmd_slash = kp(None, Some('/'), mods(true, false, false, false));
+        let cmd_shift_a = kp(None, Some('a'), mods(true, false, false, true));
+        assert!(!sidebar.matches(&cmd_slash));
+        assert!(!sidebar.matches(&cmd_shift_a));
+        // Exact on modifiers: a bare `b` never toggles the sidebar.
+        let bare_b = kp(None, Some('b'), mods(false, false, false, false));
+        assert!(!sidebar.matches(&bare_b));
     }
 
     #[test]

@@ -251,6 +251,14 @@ pub struct SemanticColors {
     pub caution_weak: Rgba,
     pub danger: Rgba,
     pub info: Rgba,
+    /// Window traffic-light dot colors (the mock's warm macOS-control hues), left to
+    /// right: close (red), minimize (amber), zoom (green). These are CHROME constants -
+    /// identical in both themes (they are the standard macOS control colors, not
+    /// palette-derived) - kept as tokens so the title bar (T-9.2) hardcodes no hex.
+    /// Decorative in v1; real close/minimize/zoom wiring is packaging (T-8.1).
+    pub chrome_close: Rgba,
+    pub chrome_minimize: Rgba,
+    pub chrome_zoom: Rgba,
 }
 
 /// Which input mode an accent resolves for. Mirrors the domain `Mode (Shell |
@@ -450,6 +458,9 @@ pub const LIGHT: Theme = Theme {
         caution_weak: Rgba::hex(0xF4EDDF),        // warn @ 8% over canvas (--warn-bg)
         danger: Rgba::hex(0xBF5A40),              // --err
         info: Rgba::hex(0x2F7DC2),                // = accent_primary
+        chrome_close: Rgba::hex(0xE0655A),        // traffic-light red (chrome, both themes)
+        chrome_minimize: Rgba::hex(0xDFA63F),     // traffic-light amber (chrome, both themes)
+        chrome_zoom: Rgba::hex(0x7CAE5B),         // traffic-light green (chrome, both themes)
     },
     // ANSI re-tuned to the warm family (structure per T-4.2; hues warmed). On light
     // "paper" the base colors carry (index 7/15 are dark foregrounds), and the light
@@ -502,6 +513,9 @@ pub const DARK: Theme = Theme {
         caution_weak: Rgba::hex(0x2C251A),        // warn @ 9% over canvas (--warn-bg)
         danger: Rgba::hex(0xD47257),              // --err
         info: Rgba::hex(0x3D88CC),                // = accent_primary
+        chrome_close: Rgba::hex(0xE0655A),        // traffic-light red (chrome, both themes)
+        chrome_minimize: Rgba::hex(0xDFA63F),     // traffic-light amber (chrome, both themes)
+        chrome_zoom: Rgba::hex(0x7CAE5B),         // traffic-light green (chrome, both themes)
     },
     // ANSI re-tuned to the warm family (structure per T-4.2; hues warmed). On the
     // warm near-black canvas every entry is comfortably legible; brights are the
@@ -832,6 +846,27 @@ mod tests {
             assert_eq!(theme.mode_accent(Mode::Shell), c.accent_primary);
             assert_eq!(theme.mode_accent(Mode::Agent), c.accent_agent);
         }
+    }
+
+    #[test]
+    fn chrome_traffic_dots_are_distinct_and_shared_across_themes() {
+        // T-9.2: the title bar's traffic-light dots resolve through tokens (no scattered
+        // hex in the renderer). They are decorative CHROME - the standard macOS control
+        // colors - so they are IDENTICAL in both themes and the three differ from each
+        // other (a red / amber / green a scanning eye can tell apart).
+        for theme in [&LIGHT, &DARK] {
+            let c = &theme.colors;
+            assert_ne!(c.chrome_close, c.chrome_minimize);
+            assert_ne!(c.chrome_minimize, c.chrome_zoom);
+            assert_ne!(c.chrome_close, c.chrome_zoom);
+        }
+        assert_eq!(LIGHT.colors.chrome_close, DARK.colors.chrome_close);
+        assert_eq!(LIGHT.colors.chrome_minimize, DARK.colors.chrome_minimize);
+        assert_eq!(LIGHT.colors.chrome_zoom, DARK.colors.chrome_zoom);
+        // The mock's exact warm hues.
+        assert_eq!(DARK.colors.chrome_close, Rgba::hex(0xE0655A));
+        assert_eq!(DARK.colors.chrome_minimize, Rgba::hex(0xDFA63F));
+        assert_eq!(DARK.colors.chrome_zoom, Rgba::hex(0x7CAE5B));
     }
 
     #[test]

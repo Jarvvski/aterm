@@ -8,6 +8,7 @@ use aterm_core::{BlockList, InputModel, Integration, Snapshot};
 use aterm_tokens::Theme;
 
 use crate::components::AutonomyMode;
+use crate::title_bar::TitleBarView;
 
 /// Errors a renderer can surface during a frame.
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +56,12 @@ pub struct Frame<'a> {
     /// [`crate::app::UiCallbacks::autonomy_mode`]; `aterm-app` maps its
     /// `aterm_agent::AutonomyMode` onto this UI-local one.
     pub autonomy: Option<AutonomyMode>,
+    /// The custom title-bar content for this frame (ticket T-9.2): the active title + cwd,
+    /// borrowed from the host. `None` for a host with no chrome (e.g. the headless UI), in
+    /// which case no title bar is drawn and the timeline uses the full height. The renderer
+    /// draws it over a reserved top band in normal (non-alt-screen) mode; the host supplies
+    /// it through [`crate::app::UiCallbacks::title_bar`].
+    pub title_bar: Option<TitleBarView<'a>>,
 }
 
 /// The swappable renderer seam.

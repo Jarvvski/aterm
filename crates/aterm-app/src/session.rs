@@ -22,7 +22,7 @@ use aterm_core::{
     keys, BlockList, Engine, IntegrationStatus, PtyDimensions, Snapshot, DEFAULT_SCROLLBACK,
 };
 use aterm_ui::{
-    ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker, UiCallbacks, Window,
+    ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker, TitleBarView, UiCallbacks, Window,
     DEFAULT_DEBOUNCE,
 };
 
@@ -84,6 +84,20 @@ pub struct Session {
     /// suggestions (ticket T-3.7 `HistoryScope`). Default off (per-mode lens); no runtime
     /// toggle yet (a later setting).
     widen_history: bool,
+    /// The sidebar-toggle hotkey (ticket T-9.2), consulted before the routing brain like
+    /// the autonomy-cycle hotkey. Default `Cmd-B`.
+    sidebar_key: KeyBinding,
+    /// The toggle-sidebar INTENT (ticket T-9.2). The sessions sidebar panel is EPIC-10;
+    /// today this bool is the intent the `◧` title-bar glyph / `Cmd-B` flips, which the
+    /// panel will consume. Default `false` (ADR-0011: not shown by default on one session).
+    sidebar_open: bool,
+    /// The active title shown centered in the custom title bar (ticket T-9.2). A
+    /// placeholder ("aterm") until EPIC-10 replaces it with the active session name.
+    title: String,
+    /// The current working directory shown beside the title (home abbreviated to `~`).
+    /// Sourced from the process cwd at spawn; OSC-7-driven live updates are a follow-up
+    /// (EPIC-10 owns the title-bar/session binding).
+    cwd_display: String,
 }
 
 /// Apply a T-3.2 IME event to the input model. Pure (no engine / no window), so the
@@ -108,6 +122,22 @@ fn apply_ime(input: &mut InputModel, event: ImeEvent) {
         ImeEvent::Commit(text) => input.commit_ime(&text),
         ImeEvent::Disabled => input.set_preedit(None),
     }
+}
+
+/// Render a filesystem path for the title bar, abbreviating a `$HOME` prefix to `~` (the
+/// conventional shell display). Falls back to the lossy string form for a non-UTF-8 path.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    let full = path.to_string_lossy();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::Path::new(&home);
+        if let Ok(rest) = path.strip_prefix(home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.to_string_lossy());
+        }
+    }
+    full.into_owned()
 }
 
 /// Map the agent's autonomy tier onto the UI-local indicator enum. The crate boundary
@@ -138,6 +168,9 @@ impl Session {
         // directory; the single Secrets deny-set feeds the gate, the sandbox, and the
         // sanitizer alike (ticket T-5.11; key custody is T-8.3, out of scope).
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Capture the cwd display (home abbreviated to `~`) for the title bar BEFORE `root`
+        // is moved into the agent runtime (which confines the agent's writes to it).
+        let cwd_display = abbreviate_home(&root);
         let agent = AgentRuntime::new(root, Secrets::new()).map_err(aterm_core::PtyError::Io)?;
         Ok(Self {
             engine,
@@ -152,12 +185,29 @@ impl Session {
             overlay: OverlayWorker::new(DEFAULT_DEBOUNCE),
             overlay_gen: 0,
             widen_history: false,
+            sidebar_key: cfg.toggle_sidebar,
+            sidebar_open: false,
+            title: "aterm".to_string(),
+            cwd_display,
         })
     }
 
     /// Number of command blocks segmented so far (used by tests / status line).
     pub fn block_count(&self) -> usize {
         self.engine.block_count()
+    }
+
+    /// Flip the toggle-sidebar INTENT (ticket T-9.2) and return the new state. The
+    /// sessions sidebar panel is EPIC-10; today this is the intent path the `Cmd-B` hotkey
+    /// drives (and that the `◧` title-bar glyph will drive once mouse hit-testing lands).
+    /// EPIC-10 reads `sidebar_open` to show/hide the panel. Each call flips the bool.
+    pub fn toggle_sidebar(&mut self) -> bool {
+        self.sidebar_open = !self.sidebar_open;
+        log::debug!(
+            "sidebar -> {}",
+            if self.sidebar_open { "open" } else { "closed" }
+        );
+        self.sidebar_open
     }
 
     /// Drain the VT engine's window events so its channel does not grow. Most are
@@ -458,6 +508,17 @@ impl UiCallbacks for Session {
         Some(ui_autonomy(self.autonomy.mode()))
     }
 
+    fn title_bar(&self) -> Option<TitleBarView<'_>> {
+        // The custom title bar (ticket T-9.2): the active title + cwd, drawn over the
+        // reserved top band. Borrowed (not cloned) - the renderer only reads it. EPIC-10
+        // replaces `title` with the active session name and makes the `◧` glyph toggle the
+        // sidebar panel this session's `sidebar_open` intent already tracks.
+        Some(TitleBarView {
+            title: &self.title,
+            cwd: &self.cwd_display,
+        })
+    }
+
     fn on_key(&mut self, key: KeyPress<'_>) -> Option<Vec<u8>> {
         // T-3.3 routing brain. The pure `InputModel` reducer (T-3.1) owns the
         // in-progress line; this layer is the caller that decides where a key goes
@@ -475,6 +536,15 @@ impl UiCallbacks for Session {
         if self.autonomy_key.matches(&key) {
             self.autonomy.cycle();
             log::info!("autonomy -> {}", self.autonomy.mode().label());
+            return None;
+        }
+
+        // The sidebar-toggle hotkey (T-9.2) flips the toggle-sidebar intent, also before
+        // the routing brain (it changes chrome, never routing or the line). The sidebar
+        // panel itself is EPIC-10; this drives the same intent the `◧` glyph will once a
+        // pointer path exists. Sends no PTY bytes.
+        if self.sidebar_key.matches(&key) {
+            self.toggle_sidebar();
             return None;
         }
 
@@ -727,6 +797,26 @@ mod tests {
             input.preedit().is_none(),
             "blur/disable drops the composition so it cannot wedge the routing gate"
         );
+    }
+
+    // --- T-9.2 title-bar cwd display -----------------------------------------
+
+    #[test]
+    fn abbreviate_home_replaces_the_home_prefix_with_tilde() {
+        // The title bar shows the cwd with `$HOME` collapsed to `~` (the shell convention).
+        // Reads $HOME (never sets it), so it is race-free across parallel tests.
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = std::path::PathBuf::from(home);
+            assert_eq!(abbreviate_home(&home), "~", "home itself is exactly ~");
+            assert_eq!(
+                abbreviate_home(&home.join("projects").join("aterm")),
+                "~/projects/aterm",
+                "a path under home is ~-abbreviated"
+            );
+        }
+        // A path plainly outside home is shown verbatim (no false abbreviation).
+        let outside = std::path::Path::new("/opt/definitely-not-home");
+        assert_eq!(abbreviate_home(outside), "/opt/definitely-not-home");
     }
 
     // --- T-3.5 overlay-immediacy classification ------------------------------
