@@ -153,7 +153,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 | id | title | status | depends_on |
 |---|---|---|---|
 | T-9.1 | Reconcile tokens to the mock (warm palette + agent second-accent + elevated surface) | done | - |
-| T-9.2 | Window frame + custom title bar shell (traffic lights, centered title, sidebar toggle) | ready-for-agent | T-9.1 |
+| T-9.2 | Window frame + custom title bar shell (traffic lights, centered title, sidebar toggle) | done | T-9.1 |
 | T-9.3 | Command block re-skin (prompt glyph, hover block-meta, exit status, hairline rhythm) | done | T-9.1 |
 | T-9.4 | Unified input bar + mode chip re-skin (mode-colored glyph/caret, pill chip) | done | T-9.1 |
 | T-9.5 | Launch + modes empty states and the tab-completion popover | ready-for-agent | T-9.1, T-9.4 |
