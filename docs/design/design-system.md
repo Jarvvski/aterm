@@ -456,6 +456,18 @@ the SAME intent as the keyboard equivalent (sidebar == `Cmd-B`, chip == `Cmd-/`,
 completion row == `Enter`) - never a second, divergent action route. The pointer
 turns into a hand over a clickable target.
 
+### Window frame (T-9.9)
+
+The window is borderless + transparent (no native macOS titlebar), so aterm's custom
+title bar is the only bar. The mock's rounded `.aw` container is self-drawn: a
+`bg.canvas` fill + 1px `hairline` border with 12px-radius corners, via a rounded-rect
+SDF pipeline that alphas the corners away; the soft drop shadow is the OS window shadow
+hugging that drawn opaque region. The three warm traffic-light dots
+(`chrome.close`/`minimize`/`zoom`) are real controls - click to close / minimize / zoom
+(they brighten on hover), or `Cmd-W`/`Cmd-M` - and stay live even under the risk-gate
+modal. On a GPU with no transparent alpha mode the window falls back to an opaque square
+(no rounding), unchanged from before. Drag-to-move is a title-bar-background press.
+
 ### Shell-integration indicator (3-state)
 
 aterm interprets OSC-133 / OSC-7 marks emitted by the shell-integration shim,

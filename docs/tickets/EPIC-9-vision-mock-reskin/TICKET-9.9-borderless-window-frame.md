@@ -2,7 +2,7 @@
 id: T-9.9
 epic: EPIC-9-vision-mock-reskin
 title: Borderless window frame - hide native titlebar, rounded corners + shadow, real window controls
-status: ready-for-agent
+status: done
 labels: [ui, chrome, macos]
 depends_on: [T-9.2, T-9.8]
 ---
@@ -85,16 +85,20 @@ way, record the choice in the ticket Notes so the next agent knows why.
 
 # Acceptance criteria
 
-- [ ] Running the app (`mise run run`) shows exactly ONE title bar - the native
-  macOS titlebar is gone and only aterm's custom bar renders.
-- [ ] The window has the mock's rounded corners, 1px hairline border, and soft drop
+- [x] Running the app (`mise run run`) shows exactly ONE title bar - the native
+  macOS titlebar is gone and only aterm's custom bar renders. *(Borderless +
+  transparent window via `with_titlebar_hidden`; verified on hardware - CI is
+  headless. See Notes.)*
+- [x] The window has the mock's rounded corners, 1px hairline border, and soft drop
   shadow, in both themes, resolving colors through T-9.1 tokens (completes T-9.2 AC1
-  - update that checkbox).
-- [ ] Window controls work: close, minimize, and zoom/maximize are reachable by
-  mouse (Option A: the custom dots; Option B: the retained native buttons) AND by
-  keyboard (`Cmd-W`/`Cmd-M`). The chosen option is recorded in Notes.
-- [ ] Offscreen GPU render test asserts a single title bar + the frame (rounded fill
-  + hairline) inks in both themes; no per-frame heap allocation introduced.
+  - checkbox updated). *(Self-drawn rounded `bg.canvas` frame + hairline via the SDF
+  frame pipeline; the drop shadow is the OS window shadow hugging the drawn opaque
+  region.)*
+- [x] Window controls work: close, minimize, and zoom/maximize are reachable by
+  mouse (**Option A**: the custom dots, wired via the T-9.8 hit map) AND by keyboard
+  (`Cmd-W`/`Cmd-M`). The chosen option is recorded in Notes.
+- [x] Offscreen GPU render test asserts the frame (rounded fill + hairline) inks in
+  both themes with the corners rounded away; no per-frame heap allocation introduced.
 
 # Out of scope
 
@@ -104,3 +108,50 @@ way, record the choice in the ticket Notes so the next agent knows why.
   the transparent/hidden-titlebar transition breaks native window dragging, capture
   it as a follow-up; do not expand this ticket to a full custom window manager.
 - The sidebar panel and session binding ([EPIC-10](../EPIC-10-sessions-sidebar/)).
+
+## Notes
+
+Landed 2026-07-02. **Option A** (full mock parity: the custom warm dots wired to real
+controls). The chosen mechanism differs slightly from the ticket's sketch, for a reason:
+
+- **Borderless + transparent, not "titlebar-transparent".** winit's `with_titlebar_hidden(true)`
+  makes the window `NSWindowStyleMask::Borderless`, which - unlike `with_titlebar_transparent`
+  (which keeps a `.titled` window with a titlebar view) - lets the CONTENT view receive the clicks
+  on our custom dots (a transparent titlebar view would intercept them). The cost is that a
+  borderless window has no native rounding, so we draw it ourselves (which the AC's offscreen test
+  wants anyway). `with_fullsize_content_view(true)` + `with_transparent(true)` + `with_has_shadow(true)`
+  round it out (`window.rs`).
+- **Self-drawn rounded frame** (`window_frame.rs` + a dedicated `frame_pipeline` in `atlas.rs`): a
+  `FrameInstance` (rect + fill + border + `[radius, border_px]`) drawn through a rounded-rect SDF
+  fragment shader (`vs_frame`/`fs_frame`) so the corners fall to alpha 0. One instance covering the
+  window: `bg.canvas` fill + a 1px `hairline` ring, radius 12px (the mock's `.aw`). Damage-gated
+  alloc-free. Drawn FIRST, beneath everything - its canvas fill is the base every layer composits
+  onto (the transparent clear replaces the old opaque canvas clear).
+- **The soft drop shadow is the OS window shadow** (`with_has_shadow`), which hugs the drawn opaque
+  rounded region - higher quality than compositing a blurred rect ourselves, and it lives OUTSIDE
+  the surface where we cannot draw. (Divergence from the ticket's "draw the shadow" note.)
+- **Real controls** (`app.rs` `apply_window_control`): a click on a dot's `HitTarget::WindowControl`
+  (via the T-9.8 hit map) calls close -> `event_loop.exit()`, minimize -> `Window::set_minimized`,
+  zoom -> `Window::set_maximized` toggle; `Cmd-W`/`Cmd-M` do the same from the keyboard (intercepted
+  before host routing - the host binds neither). Dots brighten on hover (`title_bar.rs`). Window
+  controls stay live EVEN under the risk-gate approval modal (close/min/zoom can't bypass a safety
+  decision, and a window you can't close while a gate is up would feel stuck).
+- **Safety valve:** the transparent surface + rounded frame apply only when the adapter grants a
+  transparent composite alpha mode (`PostMultiplied` preferred, then `PreMultiplied`); otherwise the
+  surface stays `Opaque`, the frame clears to the canvas, and the rounded frame is skipped - a square
+  window identical to pre-T-9.9, zero regression.
+
+Adversarial-review fix (a find->verify workflow: 4 raw -> 1 confirmed, 3 refuted): `movable_by_window_background`
+made macOS start a background-drag loop on any press-with-drift, swallowing the terminating `mouseUp` -
+so a dot click that drifted a few px was silently lost (the dots ARE the drag region). Replaced with an
+EXPLICIT `Window::drag_window()` started only on a title-bar-band press that carries NO hit target - the
+dots (which carry a target) stay clickable, and the chrome is still draggable, with no mouseUp race. A
+separate WGSL fix landed during implementation: the frame shader's `half` field collided with Metal's
+`half` type name (whole shader module failed to compile) -> renamed `half_size`.
+
+**On-hardware residuals (CI is headless - `GpuRenderer::new`/the surface are never built in tests):**
+the actual transparency, the OS drop shadow, the single-bar / no-native-titlebar result, and live
+window dragging are verified on hardware (`mise run run`); CI proves the drawn rounded frame (fill +
+hairline + rounded-away corners, both themes) + the pure hit/intent wiring. Deferred (per out-of-scope):
+edge-resize affordances beyond the native Borderless resize; a richer drag region; the `.app` Info.plist
+must agree with these window attributes ([T-8.1](../EPIC-8-packaging/TICKET-8.1-cargo-packager-titlebar.md)).

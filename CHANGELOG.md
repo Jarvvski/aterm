@@ -13,6 +13,12 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **One title bar, rounded corners, and real window controls.** The doubled title bar is gone:
+  macOS no longer draws its own titlebar above aterm's custom one - the window is borderless and
+  transparent, with the mock's rounded corners, a 1px hairline border, and the soft OS drop shadow.
+  The three warm traffic-light dots are now real controls: click to close, minimize, or zoom (they
+  brighten under the pointer), and `Cmd-W` / `Cmd-M` work from the keyboard. On a GPU that can't
+  give a transparent surface, the window stays square with no other change. (Ticket T-9.9.)
 - **The mouse works now - hover and click affordances.** aterm tracked only keys and the
   scroll wheel; it now has a pointer. Hovering the title-bar sidebar glyph brightens it, the
   mode pill lifts its tint, a completion row tints under the cursor, and a command block reveals

@@ -49,13 +49,13 @@ session (session *data* and the sidebar panel come from EPIC-10).
 
 # Acceptance criteria
 
-- [ ] The window renders rounded with a hairline border + the soft shadow in both
+- [x] The window renders rounded with a hairline border + the soft shadow in both
   themes, resolving all colors through T-9.1 tokens (chrome dot colors via tokens
-  or a documented chrome-constant set, no scattered literals). *(DEFERRED: colors
-  resolve through the new `chrome.*` tokens and the title bar draws its bottom
-  hairline, but the rounded corners + window border frame + drop shadow cannot be
-  drawn into a native-decorated opaque surface - they land with the borderless
-  packaging in T-8.1. Left unchecked so a status scan reads honestly - see Notes.)*
+  or a documented chrome-constant set, no scattered literals). *(COMPLETED by
+  [T-9.9](TICKET-9.9-borderless-window-frame.md): the borderless transparent window +
+  the self-drawn rounded `bg.canvas` frame with the hairline border + the OS drop
+  shadow. Originally deferred here because they cannot be drawn into a native-decorated
+  opaque surface.)*
 - [x] The 44px title bar shows the three traffic-light dots, the `◧` toggle glyph
   (with the hover color change), and a centered title + cwd. *(Dots + toggle glyph
   substitute + centered title/cwd all render; the hover color change needs mouse

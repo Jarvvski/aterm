@@ -73,6 +73,24 @@ pub(crate) struct RectInstance {
     pub color: [f32; 4],
 }
 
+/// A single ROUNDED-rect instance with a border - the borderless window frame (ticket
+/// T-9.9). The dedicated frame pipeline evaluates a rounded-rect SDF in the fragment
+/// shader so the corners fall away to transparent (the mock's rounded window on a
+/// transparent surface) and a `border_px` ring in `border` rings the `fill`. One instance
+/// per frame; physical px + linear RGBA.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct FrameInstance {
+    /// `[x, y, w, h]` in physical px (top-left origin) - the whole window.
+    pub rect: [f32; 4],
+    /// Linear RGBA interior fill (the canvas).
+    pub fill: [f32; 4],
+    /// Linear RGBA border ring (the hairline).
+    pub border: [f32; 4],
+    /// `[corner_radius_px, border_px, 0, 0]` (padded to 16 bytes).
+    pub params: [f32; 4],
+}
+
 /// Viewport uniform: the surface size in physical px (padded to 16 bytes). Shared by
 /// the rect pipeline and the glyph pipeline via the one [`GlyphAtlas`] viewport bind
 /// group.
@@ -165,6 +183,10 @@ pub struct GlyphAtlas {
     /// The shared solid-quad pipeline (group(0) viewport only, alpha-blended). Both the
     /// grid's cell backgrounds and the timeline's flat rectangles draw through it.
     rect_pipeline: wgpu::RenderPipeline,
+    /// The rounded-rect window-frame pipeline (group(0) viewport only, alpha-blended, ticket
+    /// T-9.9). Evaluates a rounded-rect SDF so the corners fall to transparent; draws the one
+    /// [`FrameInstance`] (canvas fill + hairline border ring) beneath everything.
+    frame_pipeline: wgpu::RenderPipeline,
     viewport_buf: wgpu::Buffer,
     viewport_bind: wgpu::BindGroup,
     atlas_bind: wgpu::BindGroup,
@@ -359,6 +381,42 @@ impl GlyphAtlas {
             cache: None,
         });
 
+        // Window-frame pipeline (ticket T-9.9): same group(0)-only layout + alpha blending as
+        // the rect pipeline, but the `vs_frame`/`fs_frame` entry points and the wider
+        // `FrameInstance` vertex layout. One rounded-rect SDF quad drawn beneath everything.
+        let frame_attrs = wgpu::vertex_attr_array![
+            0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4
+        ];
+        let frame_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("aterm-frame-pipeline"),
+            layout: Some(&rect_pl_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_frame"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<FrameInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &frame_attrs,
+                }],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_frame"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             atlas,
             cache: GlyphCache::new(ATLAS_DIM, ATLAS_DIM),
@@ -368,6 +426,7 @@ impl GlyphAtlas {
             atlas_full_logged: false,
             glyph_pipeline,
             rect_pipeline,
+            frame_pipeline,
             viewport_buf,
             viewport_bind,
             atlas_bind,
@@ -518,6 +577,21 @@ impl GlyphAtlas {
         pass.draw(0..6, 0..count as u32);
     }
 
+    /// Record the rounded-rect window-frame draw (ticket T-9.9): the frame pipeline +
+    /// group(0) viewport + the caller's [`FrameInstance`] buffer, then one instanced draw of
+    /// `count` (always 1) rounded quads. The SDF fragment shader alphas out the corners.
+    pub(crate) fn draw_frame(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        buf: &InstanceBuffer,
+        count: usize,
+    ) {
+        pass.set_pipeline(&self.frame_pipeline);
+        pass.set_bind_group(0, &self.viewport_bind, &[]);
+        pass.set_vertex_buffer(0, buf.buf().slice(..));
+        pass.draw(0..6, 0..count as u32);
+    }
+
     /// Record the shared glyph draw into a caller-owned `pass`: set the glyph pipeline,
     /// group(0) viewport, group(1) atlas, and the caller's instance buffer, then issue
     /// EXACTLY ONE instanced draw of `count` quads. The caller (front-end) owns the
@@ -656,6 +730,64 @@ fn vs_glyph(@builtin(vertex_index) vi: u32, inst: GIn) -> GOut {
 fn fs_glyph(in: GOut) -> @location(0) vec4<f32> {
     let a = textureSample(atlas_tex, atlas_samp, in.uv).r;
     return vec4<f32>(in.color.rgb, in.color.a * a);
+}
+
+// --- Rounded window frame (T-9.9) ---
+// One quad covering the window; a rounded-rect SDF alphas out the corners (transparent
+// on the transparent surface) and rings a `border_px` hairline around the `fill`.
+struct FIn {
+    @location(0) rect: vec4<f32>,
+    @location(1) fill: vec4<f32>,
+    @location(2) border: vec4<f32>,
+    @location(3) params: vec4<f32>,
+};
+struct FOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) local: vec2<f32>,     // pixel position relative to the rect's top-left
+    @location(1) half_size: vec2<f32>, // rect half-size (px); NOT `half` - a Metal type name
+    @location(2) fill: vec4<f32>,
+    @location(3) border: vec4<f32>,
+    @location(4) params: vec4<f32>,    // [radius_px, border_px, _, _]
+};
+
+// Signed distance to a rounded rect centered at the origin (negative inside).
+fn sd_round_rect(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - half_size + vec2<f32>(r, r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0, 0.0))) - r;
+}
+
+@vertex
+fn vs_frame(@builtin(vertex_index) vi: u32, inst: FIn) -> FOut {
+    var out: FOut;
+    let c = corner(vi);
+    let p = inst.rect.xy + c * inst.rect.zw;
+    out.pos = to_clip(p);
+    out.local = c * inst.rect.zw;   // 0..w, 0..h across the quad
+    out.half_size = inst.rect.zw * 0.5;
+    out.fill = inst.fill;
+    out.border = inst.border;
+    out.params = inst.params;
+    return out;
+}
+
+@fragment
+fn fs_frame(in: FOut) -> @location(0) vec4<f32> {
+    let radius = in.params.x;
+    let border_px = in.params.y;
+    // Position relative to the rect center.
+    let p = in.local - in.half_size;
+    let d = sd_round_rect(p, in.half_size, radius);
+    // ~1px antialiased edge.
+    let aa = fwidth(d) + 0.0001;
+    // Coverage of being inside the rounded rect (d < 0).
+    let inside = 1.0 - smoothstep(-aa, aa, d);
+    // The fill region is the rounded rect shrunk by the border width.
+    let d_fill = d + border_px;
+    let fill_cov = 1.0 - smoothstep(-aa, aa, d_fill);
+    // Border where inside but not fill; blend fill over border by fill coverage.
+    let rgb = mix(in.border.rgb, in.fill.rgb, fill_cov);
+    let a = mix(in.border.a, in.fill.a, fill_cov) * inside;
+    return vec4<f32>(rgb, a);
 }
 "#;
 

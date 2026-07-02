@@ -36,7 +36,7 @@ use aterm_tokens::{space, type_scale, Rgba, Theme};
 use crate::atlas::{GlyphAtlas, GlyphInstance, InstanceBuffer, RectInstance};
 use crate::cell_render::{emit_cell, CellCtx};
 use crate::grid_render::FrameSize;
-use crate::hit::{HitRect, HitTarget};
+use crate::hit::{HitRect, HitTarget, WindowControl};
 use crate::prose::ProseShaper;
 use crate::text::{FaceStyle, FontFamily, GlyphKey, GridCell};
 use crate::window::cell_px;
@@ -94,7 +94,19 @@ pub struct TitleBarRenderer {
     /// the rebuild path so the host's pointer path can hit-test it even on an idle frame that
     /// early-outs. `None` until the bar has drawn once.
     sidebar_toggle_rect: Option<HitRect>,
+    /// The three traffic-light dots' clickable regions in physical px (ticket T-9.9), indexed
+    /// `[Close, Minimize, Zoom]` ([`TITLE_BAR_CONTROLS`]), cached on the rebuild path. The
+    /// host wires each to the matching winit window control via the hit map.
+    dot_rects: [Option<HitRect>; 3],
 }
+
+/// The window controls behind the three traffic-light dots, in left-to-right draw order
+/// (ticket T-9.9): close, minimize, zoom.
+const TITLE_BAR_CONTROLS: [WindowControl; 3] = [
+    WindowControl::Close,
+    WindowControl::Minimize,
+    WindowControl::Zoom,
+];
 
 impl TitleBarRenderer {
     /// Build the title-bar front-end: its reused instance buffers + the title/cwd shaper.
@@ -113,6 +125,7 @@ impl TitleBarRenderer {
             built: None,
             last_glyph_draw_calls: 0,
             sidebar_toggle_rect: None,
+            dot_rects: [None; 3],
         }
     }
 
@@ -128,6 +141,19 @@ impl TitleBarRenderer {
     #[must_use]
     pub fn sidebar_toggle_rect(&self) -> Option<HitRect> {
         self.sidebar_toggle_rect
+    }
+
+    /// The three traffic-light dots as `(control, rect)` pairs in physical px (ticket T-9.9),
+    /// `[Close, Minimize, Zoom]`; each rect is `None` before the first draw. The host pushes
+    /// them into the frame's [`crate::hit::HitMap`] as [`HitTarget::WindowControl`] so a
+    /// pointer click drives the matching window control.
+    #[must_use]
+    pub fn window_control_rects(&self) -> [(WindowControl, Option<HitRect>); 3] {
+        [
+            (TITLE_BAR_CONTROLS[0], self.dot_rects[0]),
+            (TITLE_BAR_CONTROLS[1], self.dot_rects[1]),
+            (TITLE_BAR_CONTROLS[2], self.dot_rects[2]),
+        ]
     }
 
     /// Build the frame's instances for `view` through the shared `atlas`, reusing the prior
@@ -157,10 +183,18 @@ impl TitleBarRenderer {
         let px_key = px as u32;
 
         // The sidebar-toggle glyph brightens on pointer hover (ticket T-9.8), the mock's
-        // `.navitem:hover { color: var(--ink) }`. Folded into the signature so a hover
-        // change forces exactly one rebuild.
+        // `.navitem:hover { color: var(--ink) }`; a traffic-light dot brightens on hover too
+        // (ticket T-9.9). Both are folded into the signature so a hover change forces exactly
+        // one rebuild.
         let toggle_hovered = hovered == Some(HitTarget::SidebarToggle);
-        let sig = fold_bool(signature(view, width, px_key, theme), toggle_hovered);
+        let hovered_control = match hovered {
+            Some(HitTarget::WindowControl(c)) => Some(c),
+            _ => None,
+        };
+        let sig = fold_u64(
+            fold_bool(signature(view, width, px_key, theme), toggle_hovered),
+            control_code(hovered_control),
+        );
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
         }
@@ -198,22 +232,34 @@ impl TitleBarRenderer {
         let pad_l = 15.0 * scale; // the mock's 15px left padding
         let dot_pitch = cw + 6.0 * scale; // dot + a small gap
 
-        // Three traffic-light dots in the chrome hues (decorative; token-colored).
+        // Three traffic-light dots in the chrome hues (token-colored), now real window
+        // controls (ticket T-9.9): each caches a clickable rect and brightens on hover.
         let c = &theme.colors;
-        for (i, color) in [c.chrome_close, c.chrome_minimize, c.chrome_zoom]
+        let hit_pad = 4.0 * scale;
+        for (i, base) in [c.chrome_close, c.chrome_minimize, c.chrome_zoom]
             .into_iter()
             .enumerate()
         {
+            let dot_x = pad_l + i as f32 * dot_pitch;
+            let hovered_here = hovered_control == Some(TITLE_BAR_CONTROLS[i]);
+            let color = if hovered_here { brighten(base) } else { base };
             let dot = grid_glyph(DOT_GLYPH, color, canvas);
             emit_cell(
                 atlas,
                 queue,
                 &dot,
-                (pad_l + i as f32 * dot_pitch, row_y),
+                (dot_x, row_y),
                 &ctx,
                 &mut self.bg_instances,
                 &mut self.glyph_instances,
             );
+            // Cache the clickable region (the dot cell padded to a comfortable target).
+            self.dot_rects[i] = Some([
+                (dot_x - hit_pad).max(0.0),
+                (row_y - hit_pad).max(0.0),
+                cw + 2.0 * hit_pad,
+                (ch + 2.0 * hit_pad).min(bar_h),
+            ]);
         }
 
         // The sidebar-toggle glyph, one cell right of the dots (the mock's ~18px margin-left).
@@ -404,6 +450,36 @@ fn grid_glyph(ch: char, fg: Rgba, canvas: Rgba) -> GridCell {
 /// unchanged, mirroring the timeline's `fold_top_inset`.
 fn fold_bool(base: u64, b: bool) -> u64 {
     (base ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// Fold an arbitrary small value into a signature (ticket T-9.9), for the hovered window
+/// control code.
+fn fold_u64(base: u64, v: u64) -> u64 {
+    (base ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// Encode the hovered window control as a small distinct code (`0` = none) for the damage
+/// signature (ticket T-9.9).
+fn control_code(control: Option<WindowControl>) -> u64 {
+    match control {
+        None => 0,
+        Some(WindowControl::Close) => 1,
+        Some(WindowControl::Minimize) => 2,
+        Some(WindowControl::Zoom) => 3,
+    }
+}
+
+/// Brighten a chrome dot toward white for its pointer-hover state (ticket T-9.9): the mock's
+/// traffic lights light up under the cursor. A 35% pull to white reads clearly in both themes
+/// while keeping the hue.
+fn brighten(c: Rgba) -> Rgba {
+    let f = |x: u8| (f32::from(x) + (255.0 - f32::from(x)) * 0.35).round() as u8;
+    Rgba {
+        r: f(c.r),
+        g: f(c.g),
+        b: f(c.b),
+        a: c.a,
+    }
 }
 
 fn signature(view: &TitleBarView, w: u32, px_key: u32, theme: &Theme) -> u64 {

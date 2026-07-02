@@ -2,26 +2,51 @@
 //!
 //! Kept separate from [`crate::app`] (the event loop) and [`crate::gpu`] (the
 //! surface) so window construction and the cell-size arithmetic are in one place.
-//! The geometry helpers are pure and unit-tested; the chrome here is intentionally
-//! minimal - borderless / transparent-titlebar styling is ticket T-8.1, this
-//! module just opens a plain titled window for the surface to live in.
+//! The geometry helpers are pure and unit-tested.
+//!
+//! ## Borderless window (ticket T-9.9)
+//! On macOS the window is created BORDERLESS + TRANSPARENT so aterm's custom title bar
+//! (T-9.2) is the ONLY bar - the native titlebar (and its buttons) are gone, and the
+//! surface's transparent corners let the mock's rounded [`crate::window_frame`] + the OS
+//! drop shadow show. `with_titlebar_hidden` drops the native chrome AND lets the content
+//! view receive clicks on the custom traffic-light dots (a titlebar-*transparent* window
+//! would keep a titlebar view that intercepts them); `with_has_shadow` keeps the soft OS
+//! shadow (it hugs the drawn opaque rounded region). The custom window CONTROLS
+//! (close/min/zoom) are wired to the dots in [`crate::app`] via the T-9.8 hit map, and the
+//! window is dragged by a press on the title-bar background (also [`crate::app`], via
+//! `Window::drag_window`). NOTE we deliberately do NOT set `movable_by_window_background`:
+//! on macOS that starts an AppKit background-drag loop on any press-with-drift and swallows
+//! the terminating `mouseUp`, so a dot click that drifts a few px would be lost (the dots
+//! ARE the drag region). Explicit `drag_window` on a no-control press avoids that race and
+//! keeps the dots clickable. Edge-resize stays native (the Borderless mask is resizable).
 
 use winit::dpi::LogicalSize;
 use winit::window::{Window, WindowAttributes};
 
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
+
 /// Default window size in logical points (matches the old inline scaffold value).
 pub const DEFAULT_LOGICAL_SIZE: (f64, f64) = (960.0, 600.0);
 
-/// Build the winit attributes for the main window. Minimal for now (title +
-/// size); the hidden-titlebar / transparent bundle work is T-8.1.
+/// Build the winit attributes for the main window: title + size + (on macOS) the
+/// borderless + transparent chrome (ticket T-9.9). Non-macOS keeps the plain titled
+/// window (v1 is macOS-first); `with_transparent` is a best-effort request there.
 #[must_use]
 pub fn window_attributes(title: &str) -> WindowAttributes {
-    Window::default_attributes()
+    let attrs = Window::default_attributes()
         .with_title(title)
+        .with_transparent(true)
         .with_inner_size(LogicalSize::new(
             DEFAULT_LOGICAL_SIZE.0,
             DEFAULT_LOGICAL_SIZE.1,
-        ))
+        ));
+    #[cfg(target_os = "macos")]
+    let attrs = attrs
+        .with_titlebar_hidden(true)
+        .with_fullsize_content_view(true)
+        .with_has_shadow(true);
+    attrs
 }
 
 /// One grid cell's size in **physical** pixels for the active grid type style.

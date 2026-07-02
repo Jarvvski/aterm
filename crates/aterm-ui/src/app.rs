@@ -563,6 +563,31 @@ impl<C: UiCallbacks> AtermApp<C> {
         }
     }
 
+    /// Apply a borderless-window control (ticket T-9.9) against the winit window / event
+    /// loop: close exits, minimize miniaturizes, zoom toggles maximize. Driven by a click on
+    /// a traffic-light dot (via the T-9.8 hit map) and by the `Cmd-W`/`Cmd-M` chords. Window
+    /// ops live in the UI crate (they need the window + event loop), so - unlike the host
+    /// affordances - they are NOT routed through [`UiCallbacks::on_click`].
+    fn apply_window_control(
+        &self,
+        control: crate::hit::WindowControl,
+        event_loop: &ActiveEventLoop,
+    ) {
+        match control {
+            crate::hit::WindowControl::Close => event_loop.exit(),
+            crate::hit::WindowControl::Minimize => {
+                if let Some(w) = self.window.as_ref() {
+                    w.set_minimized(true);
+                }
+            }
+            crate::hit::WindowControl::Zoom => {
+                if let Some(w) = self.window.as_ref() {
+                    w.set_maximized(!w.is_maximized());
+                }
+            }
+        }
+    }
+
     /// Set the control flow for the next wait based on the scheduler state and the
     /// active clock source. Called from `about_to_wait`; never renders.
     ///
@@ -760,11 +785,35 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     .pointer
                     .and_then(|(x, y)| self.renderer.as_ref().and_then(|r| r.hit_test(x, y)));
                 match state {
-                    ElementState::Pressed => self.press_target = target,
+                    ElementState::Pressed => {
+                        self.press_target = target;
+                        // Drag the window from the title-bar background (ticket T-9.9): a
+                        // press in the top title-bar band that is NOT on a control starts a
+                        // native window drag. This keeps the dots clickable (they carry a hit
+                        // target, so they never trigger the drag) while making the chrome
+                        // draggable - WITHOUT `movable_by_window_background`, which would
+                        // swallow the terminating mouseUp of a drifted dot click. A still
+                        // press (no move) just ends without moving, so it is harmless.
+                        if target.is_none() {
+                            if let (Some(w), Some((_, py))) = (self.window.as_ref(), self.pointer) {
+                                let band = crate::title_bar::title_bar_px(w.scale_factor() as f32);
+                                if py < band {
+                                    let _ = w.drag_window();
+                                }
+                            }
+                        }
+                    }
                     ElementState::Released => {
                         if let (Some(t), Some(pressed)) = (target, self.press_target) {
                             if t == pressed {
-                                self.callbacks.on_click(t);
+                                // Window controls (T-9.9) act on the winit window / event loop
+                                // here; every other target routes to the host intent (T-9.8).
+                                match t {
+                                    crate::hit::HitTarget::WindowControl(ctrl) => {
+                                        self.apply_window_control(ctrl, event_loop)
+                                    }
+                                    other => self.callbacks.on_click(other),
+                                }
                                 // A click is activity: re-arm + repaint so its effect shows.
                                 self.scheduler.note_activity(Instant::now());
                                 if let Some(w) = self.window.as_ref() {
@@ -820,6 +869,19 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     ctrl: self.mods.control_key(),
                     shift: self.mods.shift_key(),
                 };
+                // Borderless window controls by keyboard (ticket T-9.9): the conventional
+                // `Cmd-W` (close) / `Cmd-M` (minimize). Intercepted before the host - they are
+                // window ops, and the host binds neither - so a chord never reaches routing.
+                if mods.cmd && !mods.ctrl && !mods.alt {
+                    if let Some(control) = ch.and_then(|c| match c.to_ascii_lowercase() {
+                        'w' => Some(crate::hit::WindowControl::Close),
+                        'm' => Some(crate::hit::WindowControl::Minimize),
+                        _ => None,
+                    }) {
+                        self.apply_window_control(control, event_loop);
+                        return;
+                    }
+                }
                 if let Some(bytes) = self.callbacks.on_key(KeyPress {
                     named,
                     ch,

@@ -85,6 +85,11 @@ pub struct GpuRenderer {
     /// `RequireConfirm` verdict. Self-gated (its own damage signature), so a parked frame
     /// allocates nothing.
     approval: crate::approval_render::ApprovalRenderer,
+    /// The borderless rounded window-frame front-end (ticket T-9.9): the `bg.canvas` fill +
+    /// hairline border drawn FIRST, beneath everything, so the transparent corners round the
+    /// window. Only drawn when `transparent` (a transparent-capable surface was configured);
+    /// otherwise the surface is opaque and the canvas clear stands (square window, no rounding).
+    window_frame: crate::window_frame::WindowFrameRenderer,
     /// Idle gate for the timeline path: the `(snapshot version, scroll, viewport, theme,
     /// alt, hovered-block)` signature last laid out + prepared. When unchanged, the per-frame
     /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
@@ -131,6 +136,12 @@ pub struct GpuRenderer {
     /// [`Self::set_hover`] before a redraw and read here to drive each front-end's hover
     /// treatment. `None` when the pointer is over nothing clickable / off-window.
     hovered: Option<HitTarget>,
+    /// Whether the surface was configured with a transparent alpha mode (ticket T-9.9). When
+    /// `true` the frame clears to transparent and the rounded [`Self::window_frame`] paints
+    /// the canvas + rounded corners; when `false` (no transparent alpha mode on this adapter)
+    /// the frame clears to the opaque canvas and no rounding is drawn - a safe degradation
+    /// that matches the pre-T-9.9 square window with zero risk.
+    transparent: bool,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -180,13 +191,28 @@ impl GpuRenderer {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
+        // Prefer a TRANSPARENT-capable composite alpha mode (ticket T-9.9) so the window's
+        // rounded corners can fall away to the desktop + the OS draws its soft shadow around
+        // the drawn opaque region. `PostMultiplied` matches our straight-alpha (ALPHA_BLENDING)
+        // shader output exactly; `PreMultiplied` is a close second (only the ~1px AA edge of
+        // the rounding differs). If the adapter offers neither, fall back to whatever it lists
+        // first (typically `Opaque`) and skip the rounded frame - a square window, no regression.
+        let alpha_mode = [
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+        ]
+        .into_iter()
+        .find(|m| caps.alpha_modes.contains(m))
+        .unwrap_or(caps.alpha_modes[0]);
+        let transparent = alpha_mode != wgpu::CompositeAlphaMode::Opaque;
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo, // vsync — the 60fps floor anchor
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -200,6 +226,7 @@ impl GpuRenderer {
         let screens = crate::screens::ScreensRenderer::new(&device);
         let completion = crate::completion_render::CompletionRenderer::new(&device);
         let approval = crate::approval_render::ApprovalRenderer::new(&device);
+        let window_frame = crate::window_frame::WindowFrameRenderer::new(&device);
 
         Ok(Self {
             surface,
@@ -214,6 +241,7 @@ impl GpuRenderer {
             screens,
             completion,
             approval,
+            window_frame,
             timeline_sig: None,
             scroll: crate::timeline::ScrollState::default(),
             last_visible_blocks: 0,
@@ -226,6 +254,7 @@ impl GpuRenderer {
             drew_approval: false,
             hit_map: HitMap::new(),
             hovered: None,
+            transparent,
             _window: window,
             scale_factor,
         })
@@ -348,7 +377,15 @@ impl GpuRenderer {
     fn render_inner(&mut self, frame: Frame<'_>) -> Result<(), RenderError> {
         // Tracy frame zone (ticket T-1.8 AC4); zero-cost with no subscriber.
         let _frame_zone = tracing::trace_span!("frame").entered();
-        let clear = linear_to_wgpu(frame.theme.colors.bg_canvas);
+        // On a transparent surface (ticket T-9.9) clear to transparent so the rounded
+        // corners fall to the desktop; the window-frame renderer then paints the `bg.canvas`
+        // fill that every layer composits onto. On an opaque surface (fallback) the canvas
+        // clear stands, exactly as before (square window).
+        let clear = if self.transparent {
+            wgpu::Color::TRANSPARENT
+        } else {
+            linear_to_wgpu(frame.theme.colors.bg_canvas)
+        };
 
         // The pointer's current hover (ticket T-9.8), read once into a local (Copy) so the
         // disjoint front-end borrows in the build block below don't conflict with `self`.
@@ -477,6 +514,17 @@ impl GpuRenderer {
         // changed (the steady-state present floor, T-1.8).
         {
             let _build = tracing::trace_span!("build").entered();
+            // The rounded window frame (ticket T-9.9) builds first, beneath everything; only
+            // on a transparent surface (else the opaque canvas clear stands). Self-gated.
+            if self.transparent {
+                self.window_frame.prepare(
+                    &self.device,
+                    &self.queue,
+                    &self.atlas,
+                    frame.theme,
+                    size,
+                );
+            }
             if draw_timeline {
                 let blocks = frame.blocks.expect("draw_timeline implies blocks");
                 // Finalize the scroll offset for this frame against the live extents:
@@ -652,6 +700,16 @@ impl GpuRenderer {
                     }
                 }
             }
+            // The window controls (T-9.9) stay live EVEN under the modal: close / minimize /
+            // zoom are pure window ops that can't bypass the pending safety decision, and a
+            // window you cannot close while a gate is up would feel stuck.
+            if draw_title {
+                for (ctrl, rect) in self.title.window_control_rects() {
+                    if let Some(rect) = rect {
+                        self.hit_map.push(rect, HitTarget::WindowControl(ctrl));
+                    }
+                }
+            }
         }
 
         // wgpu 29: `get_current_texture` returns a `CurrentSurfaceTexture` enum.
@@ -698,6 +756,12 @@ impl GpuRenderer {
                     multiview_mask: None,
                 });
 
+                // The rounded window frame draws FIRST (ticket T-9.9), beneath every layer:
+                // its `bg.canvas` fill is the base the primary view + chrome composit onto,
+                // and its SDF rounds the corners on the transparent surface.
+                if self.transparent {
+                    self.window_frame.draw(&mut pass, &self.atlas);
+                }
                 // Draw the chosen PRIMARY front-end through the shared atlas. Each draw
                 // no-ops (and zeroes its own glyph-draw-call counter) when it has no
                 // instances, so the counter stays honest across mode switches and blank
