@@ -4,7 +4,7 @@
 //! drop in without touching the app's frame loop, and keeps the 60fps fast-path
 //! behind a stable surface.
 
-use aterm_core::{BlockList, InputModel, Integration, Snapshot};
+use aterm_core::{BlockList, Completion, InputModel, Integration, Snapshot};
 use aterm_tokens::Theme;
 
 use crate::components::AutonomyMode;
@@ -62,6 +62,16 @@ pub struct Frame<'a> {
     /// draws it over a reserved top band in normal (non-alt-screen) mode; the host supplies
     /// it through [`crate::app::UiCallbacks::title_bar`].
     pub title_bar: Option<TitleBarView<'a>>,
+    /// The tab-completion popover state for this frame (ticket T-9.5), borrowed from the
+    /// host's [`Completion`]. `None` for a host with no completion (e.g. the headless UI);
+    /// when `Some` and open, the renderer draws the fuzzy-finder popover above the input's
+    /// left edge. Supplied through [`crate::app::UiCallbacks::completion`].
+    pub completion: Option<&'a Completion>,
+    /// Whether to draw the `modes` explainer screen this frame (ticket T-9.5), in place of
+    /// the timeline. `false` normally; the host toggles it on demand (a help affordance).
+    /// The `launch` empty state is derived by the renderer from an empty block list, so it
+    /// needs no flag. Supplied through [`crate::app::UiCallbacks::show_help`].
+    pub show_help: bool,
 }
 
 /// The swappable renderer seam.

@@ -197,6 +197,21 @@ impl KeyBinding {
         }
     }
 
+    /// The default help/modes-explainer chord (ticket T-9.5): `Cmd-?` (i.e. `Cmd-Shift-/`;
+    /// `?` is the shifted `/`, so it carries Shift). Distinct from the mode toggle, autonomy
+    /// cycle, and sidebar toggle. Rebindable via the `ATERM_HELP_KEY` env override.
+    #[must_use]
+    pub fn default_help() -> Self {
+        Self {
+            key: BindKey::Char('?'),
+            mods: Mods {
+                cmd: true,
+                shift: true,
+                ..Mods::default()
+            },
+        }
+    }
+
     /// Whether `key` is exactly this chord: the modifiers match exactly and the base
     /// key matches (a character case-insensitively, a named key exactly).
     #[must_use]
@@ -620,6 +635,26 @@ mod tests {
         // Exact on modifiers: a bare `b` never toggles the sidebar.
         let bare_b = kp(None, Some('b'), mods(false, false, false, false));
         assert!(!sidebar.matches(&bare_b));
+    }
+
+    #[test]
+    fn help_chord_is_cmd_question_and_distinct_from_the_other_hotkeys() {
+        // T-9.5: the help/modes-explainer hotkey is `Cmd-?` (Cmd-Shift-/), its own chord,
+        // never colliding with the mode toggle, autonomy cycle, or sidebar toggle.
+        let help = KeyBinding::default_help();
+        let cmd_q = kp(None, Some('?'), mods(true, false, false, true));
+        assert!(help.matches(&cmd_q), "Cmd-? is the help chord");
+        // No collision with the other hotkeys.
+        for other in [
+            KeyBinding::default_toggle(),
+            KeyBinding::default_autonomy_cycle(),
+            KeyBinding::default_sidebar_toggle(),
+        ] {
+            assert!(!other.matches(&cmd_q), "Cmd-? fires only the help chord");
+        }
+        // Exact on modifiers: bare `?` (no Cmd) never toggles help.
+        let bare_q = kp(None, Some('?'), mods(false, false, false, true));
+        assert!(!help.matches(&bare_q));
     }
 
     #[test]

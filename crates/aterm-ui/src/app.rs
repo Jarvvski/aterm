@@ -184,6 +184,19 @@ pub trait UiCallbacks {
         None
     }
 
+    /// The tab-completion popover state to draw this frame (ticket T-9.5), or `None` for a
+    /// host with no completion (e.g. [`HeadlessCallbacks`]). Borrowed (not cloned); the
+    /// renderer only reads it (the open flag / items / active row).
+    fn completion(&self) -> Option<&aterm_core::Completion> {
+        None
+    }
+
+    /// Whether to draw the `modes` explainer this frame in place of the timeline (ticket
+    /// T-9.5). Default `false`; a host toggles it via a help affordance.
+    fn show_help(&self) -> bool {
+        false
+    }
+
     /// A key was pressed; return bytes to forward to the PTY (Shell mode), if any.
     /// `key` carries the named key / logical character / insertion text and the
     /// live modifier state, so the host can route the real `Cmd-/` toggle chord and
@@ -462,6 +475,8 @@ impl<C: UiCallbacks> AtermApp<C> {
                 input: self.callbacks.input(),
                 autonomy: self.callbacks.autonomy_mode(),
                 title_bar: self.callbacks.title_bar(),
+                completion: self.callbacks.completion(),
+                show_help: self.callbacks.show_help(),
             };
             if let Err(e) = renderer.render(frame) {
                 log::warn!("frame render error: {e}");

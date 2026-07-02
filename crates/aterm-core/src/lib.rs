@@ -8,6 +8,7 @@
 //! above (rendering, agent) consumes these types.
 
 pub mod block;
+pub mod completion;
 pub mod engine;
 pub mod highlight;
 pub mod history;
@@ -23,6 +24,9 @@ pub mod terminal;
 pub use block::{
     AgentBadge, AgentBlock, AgentBlockKind, Block, BlockList, BlockSegmenter, CommandBlock,
     HeightIndex, HeuristicSegmenter, OutputSpan, RowSnapshot, COLLAPSED_OUTPUT_ROWS,
+};
+pub use completion::{
+    fuzzy_match, rank, Completion, CompletionItem, FuzzyMatch, DEFAULT_COMPLETION_LIMIT,
 };
 pub use engine::{AgentInjector, Engine, EngineMetrics, ToModel};
 pub use highlight::{ghost_for, highlight_command_line, highlight_for};

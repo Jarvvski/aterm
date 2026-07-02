@@ -33,6 +33,9 @@ pub struct Config {
     /// `Cmd-B`; rebindable via the `ATERM_SIDEBAR_KEY` env override. The sidebar panel is
     /// EPIC-10; today this just flips the intent (a no-op stub the panel will consume).
     pub toggle_sidebar: KeyBinding,
+    /// The help/modes-explainer hotkey (ticket T-9.5): toggles the one-input-two-destinations
+    /// screen. Default `Cmd-?` (Cmd-Shift-/); rebindable via the `ATERM_HELP_KEY` env override.
+    pub toggle_help: KeyBinding,
 }
 
 impl Default for Config {
@@ -46,6 +49,7 @@ impl Default for Config {
             default_autonomy: AutonomyMode::AutoSafe, // the locked AUTO-SAFE default
             autonomy_cycle: KeyBinding::default_autonomy_cycle(),
             toggle_sidebar: KeyBinding::default_sidebar_toggle(),
+            toggle_help: KeyBinding::default_help(),
         }
     }
 }
@@ -106,6 +110,14 @@ impl Config {
                 Some(binding) => cfg.toggle_sidebar = binding,
                 None => log::warn!(
                     "ignoring invalid ATERM_SIDEBAR_KEY={spec:?}; keeping the default (Cmd-B)"
+                ),
+            }
+        }
+        if let Ok(spec) = std::env::var("ATERM_HELP_KEY") {
+            match KeyBinding::parse(&spec) {
+                Some(binding) => cfg.toggle_help = binding,
+                None => log::warn!(
+                    "ignoring invalid ATERM_HELP_KEY={spec:?}; keeping the default (Cmd-?)"
                 ),
             }
         }

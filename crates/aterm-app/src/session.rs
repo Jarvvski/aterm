@@ -26,7 +26,10 @@ use aterm_ui::{
     DEFAULT_DEBOUNCE,
 };
 
-use aterm_core::{HistoryRing, HistoryScope, InputEvent, InputMode, InputModel, Motion, Preedit};
+use aterm_core::{
+    rank, Completion, CompletionItem, HistoryRing, HistoryScope, InputEvent, InputMode, InputModel,
+    Motion, Preedit, DEFAULT_COMPLETION_LIMIT,
+};
 
 use crate::agent_runtime::{AgentRuntime, TurnHandle};
 use crate::config::Config;
@@ -98,6 +101,16 @@ pub struct Session {
     /// Sourced from the process cwd at spawn; OSC-7-driven live updates are a follow-up
     /// (EPIC-10 owns the title-bar/session binding).
     cwd_display: String,
+    /// The tab-completion popover state (ticket T-9.5): open flag, ranked items, active row.
+    /// Tab opens it (fuzzy-ranking the shell history against the current line), up/down
+    /// navigate, Enter/Tab accept (filling the input), Esc closes. Richer candidate sources
+    /// ($PATH, Fig specs) are T-8.5; this seeds from `history`.
+    completion: Completion,
+    /// Whether the `modes` explainer screen is shown (ticket T-9.5), toggled by `help_key`.
+    /// Default off. Read by the renderer via `show_help()`.
+    show_help: bool,
+    /// The help/modes-explainer hotkey (ticket T-9.5). Default `Cmd-?` (Cmd-Shift-/).
+    help_key: KeyBinding,
 }
 
 /// Apply a T-3.2 IME event to the input model. Pure (no engine / no window), so the
@@ -189,6 +202,9 @@ impl Session {
             sidebar_open: false,
             title: "aterm".to_string(),
             cwd_display,
+            completion: Completion::new(),
+            show_help: false,
+            help_key: cfg.toggle_help,
         })
     }
 
@@ -208,6 +224,39 @@ impl Session {
             if self.sidebar_open { "open" } else { "closed" }
         );
         self.sidebar_open
+    }
+
+    /// Rank the shell history against the current input line into completion candidates
+    /// (ticket T-9.5). Newest-first, de-duplicated by text, fuzzy-ranked by
+    /// [`aterm_core::rank`], capped at [`DEFAULT_COMPLETION_LIMIT`]. History is the T-9.5
+    /// seed source; richer sources ($PATH, Fig specs) are T-8.5. Pure `&self`.
+    fn completion_candidates(&self) -> Vec<CompletionItem> {
+        let scope = HistoryScope::for_mode(self.input.mode(), self.widen_history);
+        let query = self.input.text().trim();
+        let mut seen = std::collections::HashSet::new();
+        let cands: Vec<(&str, &str)> = self
+            .history
+            .scoped(scope)
+            .filter(|e| !e.text.trim().is_empty() && seen.insert(e.text.as_str()))
+            .map(|e| (e.text.as_str(), ""))
+            .collect();
+        rank(query, &cands, DEFAULT_COMPLETION_LIMIT)
+    }
+
+    /// Accept the active completion (ticket T-9.5): replace the whole input line with the
+    /// candidate as ONE undo unit (caret left at the end), recompute the overlay, and close
+    /// the popover. A no-op (just closes) when there is no active item.
+    fn accept_completion(&mut self) {
+        if let Some(text) = self.completion.active().map(|it| it.text.clone()) {
+            // Select all, then insert - `Insert` replaces the selection (T-3.1), so the line
+            // becomes exactly the candidate with the caret at its end.
+            self.input
+                .reduce(InputEvent::Move(Motion::BufferStart, false));
+            self.input.reduce(InputEvent::Move(Motion::BufferEnd, true));
+            self.input.reduce(InputEvent::Insert(text));
+            self.request_overlay(true);
+        }
+        self.completion.close();
     }
 
     /// Drain the VT engine's window events so its channel does not grow. Most are
@@ -519,6 +568,18 @@ impl UiCallbacks for Session {
         })
     }
 
+    fn completion(&self) -> Option<&Completion> {
+        // The tab-completion popover state (ticket T-9.5): the renderer reads the open flag,
+        // ranked items, and active row to draw the fuzzy finder above the input.
+        Some(&self.completion)
+    }
+
+    fn show_help(&self) -> bool {
+        // Whether to draw the `modes` explainer in place of the timeline (ticket T-9.5),
+        // toggled by the help hotkey.
+        self.show_help
+    }
+
     fn on_key(&mut self, key: KeyPress<'_>) -> Option<Vec<u8>> {
         // T-3.3 routing brain. The pure `InputModel` reducer (T-3.1) owns the
         // in-progress line; this layer is the caller that decides where a key goes
@@ -548,6 +609,13 @@ impl UiCallbacks for Session {
             return None;
         }
 
+        // The help hotkey (T-9.5) toggles the `modes` explainer screen - chrome, not routing
+        // or the line. Sends no PTY bytes.
+        if self.help_key.matches(&key) {
+            self.show_help = !self.show_help;
+            return None;
+        }
+
         // While the agent is parked on an approval (T-5.11), the keyboard ANSWERS it
         // instead of editing the line: Enter / `y` approve (the gated call runs), `n`
         // deny (it is fed back as an error result and the turn continues), Esc cancels
@@ -570,6 +638,55 @@ impl UiCallbacks for Session {
         }
 
         let ctx = self.routing_context();
+
+        // Tab-completion popover (T-9.5): while COMPOSING (not passthrough / not mid-IME),
+        // Tab opens the fuzzy finder - or accepts the active row when already open - and
+        // up/down/Enter/Esc drive it. Intercepted BEFORE the routing brain so those keys
+        // navigate the popover instead of editing/submitting the line. When closed, the keys
+        // fall through to normal routing (Enter submits, arrows move the caret, Esc
+        // interrupts). Typing while open refreshes the ranking in the `Edit` arm below.
+        let composing = !ctx.preedit_active
+            && !ctx.degraded
+            && !ctx.alt_screen
+            && !ctx.foreground_reading_stdin;
+        if composing {
+            let open = self.completion.is_open();
+            match key.named {
+                Some(NamedKey::Tab) if !key.mods.cmd && !key.mods.ctrl && !key.mods.alt => {
+                    if open {
+                        self.accept_completion();
+                        return None;
+                    }
+                    let items = self.completion_candidates();
+                    if !items.is_empty() {
+                        self.completion.open_with(items);
+                        return None;
+                    }
+                    // Nothing to offer (no history match): do NOT swallow Tab. Fall through
+                    // to normal routing so an integrated Shell still receives `\t` and its own
+                    // completer runs (T-9.5: our finder seeds from history until T-8.5 adds
+                    // $PATH / spec sources; on a fresh session the ring is empty).
+                }
+                Some(NamedKey::ArrowDown) if open => {
+                    self.completion.move_down();
+                    return None;
+                }
+                Some(NamedKey::ArrowUp) if open => {
+                    self.completion.move_up();
+                    return None;
+                }
+                Some(NamedKey::Enter) if open => {
+                    self.accept_completion();
+                    return None;
+                }
+                Some(NamedKey::Escape) if open => {
+                    self.completion.close();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         let bytes = match decide(classify(&key, &self.toggle_key), &ctx) {
             // The IME owns the key while a composition is active (T-3.2): nothing routes
             // or submits. The composition itself is driven by `on_ime` (winit delivers
@@ -584,6 +701,13 @@ impl UiCallbacks for Session {
                 // recompute at once so the toggle re-styles without a debounce lag or a
                 // flicker of the old mode's overlay (ticket T-3.5 AC4).
                 self.request_overlay(true);
+                // The completion history lens is mode-scoped, so a mode flip changes the
+                // candidate set: re-rank an open popover so it never shows stale wrong-scope
+                // candidates (T-9.5; `refresh` closes it if nothing matches the new scope).
+                if self.completion.is_open() {
+                    let items = self.completion_candidates();
+                    self.completion.refresh(items);
+                }
                 None
             }
             // Interrupt the in-flight turn (Esc): cancel it and fail-closed deny any
@@ -663,6 +787,12 @@ impl UiCallbacks for Session {
                 // no benefit. Space/paste/ghost-accept are immediate; typing/delete debounced.
                 if outcome.text_changed {
                     self.request_overlay(edit_is_immediate(key.named, key.text));
+                    // Keep the completion popover in sync as the query changes: re-rank and
+                    // clamp/close (ticket T-9.5). A no-op when the popover is closed.
+                    if self.completion.is_open() {
+                        let items = self.completion_candidates();
+                        self.completion.refresh(items);
+                    }
                 }
                 if ctx.mode == InputMode::Shell {
                     Self::raw_key_bytes(key.named, key.text, outcome.erased)

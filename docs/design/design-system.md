@@ -59,7 +59,10 @@ Five rules govern every component:
    timeline (the exceptions: the agent card's single hairline border, and the
    floating popovers - gate menu, completion menu - which sit on `bg.elev` with a
    soft shadow, per the mock). Blocks are delimited by `hairline` top/bottom
-   rules, not boxes.
+   rules, not boxes. (Implementation note: the shipped popovers - the T-9.5
+   completion finder - render flat on `bg.elev` with a hairline border; the soft
+   drop shadow is deferred with the other window-shadow work in T-8.1, since a
+   shadow needs a transparent surface.)
 2. **Two mode accents, used scarcely.** Per ADR-0011 the old one-accent rule is
    relaxed to a two-accent **mode** model: shell blue (`accent.primary`) and agent
    purple (`accent.agent`), resolved as "the current mode color" by

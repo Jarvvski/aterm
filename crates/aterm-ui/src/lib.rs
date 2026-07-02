@@ -22,6 +22,7 @@ pub mod app;
 // live `GpuRenderer` (T-4.6).
 mod atlas;
 mod cell_render;
+pub mod completion_render;
 pub mod components;
 pub mod constraint;
 pub mod fonts;
@@ -37,6 +38,7 @@ pub mod profiling;
 pub mod prose;
 pub mod recorder;
 pub mod renderer;
+pub mod screens;
 pub mod sprite;
 pub mod text;
 pub mod timeline;
@@ -50,6 +52,7 @@ pub use app::{
     ScrollCommand, UiCallbacks,
 };
 pub use atlas::GlyphAtlas;
+pub use completion_render::CompletionRenderer;
 pub use components::{
     AgentCardStyle, Animation, AutonomyChip, AutonomyMode, ChipStyle, ChipVariant,
     CommandBlockStyle, GutterShape, GutterStyle, MotionSpec, PromptChip, PromptMode, RiskBadge,
@@ -70,6 +73,7 @@ pub use recorder::{
     DEFAULT_TOLERANCE_MS,
 };
 pub use renderer::{Frame, RenderError, Renderer};
+pub use screens::{ScreenKind, ScreensRenderer};
 pub use text::{
     build_grid_cells, classify_run, is_ascii_fast, resolve_color, AtlasRect, FaceStyle, FontFamily,
     GlyphCache, GlyphKey, GridCell, RunLayout, ShelfAllocator,

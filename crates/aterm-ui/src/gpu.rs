@@ -66,6 +66,13 @@ pub struct GpuRenderer {
     /// (its own damage signature), so it allocates nothing on an idle present; the timeline
     /// is laid out below it via a top inset of [`crate::title_bar::title_bar_px`].
     title: crate::title_bar::TitleBarRenderer,
+    /// The informational-screens front-end (ticket T-9.5): the `launch` empty state (drawn
+    /// when the block timeline is empty) and the `modes` explainer (drawn on `show_help`),
+    /// centered in the content band between the title bar and the input box.
+    screens: crate::screens::ScreensRenderer,
+    /// The tab-completion popover front-end (ticket T-9.5): the fuzzy finder drawn above the
+    /// input's left edge when the host's completion state is open.
+    completion: crate::completion_render::CompletionRenderer,
     /// Idle gate for the timeline path: the `(snapshot version, scroll, viewport, theme,
     /// alt)` signature last laid out + prepared. When unchanged, the per-frame
     /// `timeline::layout` (which allocates) + prepare are skipped and the prior timeline
@@ -91,6 +98,14 @@ pub struct GpuRenderer {
     /// Whether the title bar drew on the last frame (drawn over the top band in normal mode
     /// when the host supplies title-bar content).
     drew_title: bool,
+    /// Whether the raw grid drew as the PRIMARY view on the last frame (alt-screen or the
+    /// no-engine headless stand-in). Tracked separately from `drew_timeline` so the glyph
+    /// draw-call counter attributes the primary view correctly across all modes.
+    drew_grid: bool,
+    /// Whether an informational screen (launch / modes) drew on the last frame (T-9.5).
+    drew_screens: bool,
+    /// Whether the completion popover drew on the last frame (T-9.5).
+    drew_completion: bool,
     // Keep the window alive for the static-lifetime surface.
     _window: Arc<Window>,
     scale_factor: f32,
@@ -157,6 +172,8 @@ impl GpuRenderer {
         let timeline = crate::timeline_render::TimelineRenderer::new(&device);
         let input = crate::input_widget::InputWidgetRenderer::new(&device);
         let title = crate::title_bar::TitleBarRenderer::new(&device);
+        let screens = crate::screens::ScreensRenderer::new(&device);
+        let completion = crate::completion_render::CompletionRenderer::new(&device);
 
         Ok(Self {
             surface,
@@ -168,12 +185,17 @@ impl GpuRenderer {
             timeline,
             input,
             title,
+            screens,
+            completion,
             timeline_sig: None,
             scroll: crate::timeline::ScrollState::default(),
             last_visible_blocks: 0,
             drew_timeline: false,
             drew_input: false,
             drew_title: false,
+            drew_grid: false,
+            drew_screens: false,
+            drew_completion: false,
             _window: window,
             scale_factor,
         })
@@ -229,30 +251,35 @@ impl GpuRenderer {
         }
     }
 
-    /// Glyph-layer draw calls from the last frame: the PRIMARY front-end's (the timeline
-    /// in normal mode, the grid in alt-screen - each exactly 1 when it has text, T-1.6
-    /// AC c) plus the input box's one draw when it is shown (T-3.6) plus the title bar's
-    /// one draw when it is shown (T-9.2). So a normal frame with input + chrome is 3
-    /// (timeline + box + title bar); an alt-screen frame is 1 (the grid, no box/chrome).
+    /// Glyph-layer draw calls from the last frame: the sum of each layer that drew, one per
+    /// layer that has text (T-1.6 AC c). The PRIMARY view (timeline in normal mode, grid in
+    /// alt-screen / headless, or an informational screen - launch / modes, T-9.5), plus the
+    /// input box (T-3.6), the completion popover (T-9.5), and the title bar (T-9.2) when each
+    /// is shown. So a normal frame with input + chrome is 3 (timeline + box + title bar), 4
+    /// with the completion popover open; an alt-screen frame is 1 (the grid, no box/chrome).
     /// Exposed for tests / instrumentation.
     #[must_use]
     pub fn last_glyph_draw_calls(&self) -> u32 {
-        let primary = if self.drew_timeline {
-            self.timeline.last_glyph_draw_calls()
-        } else {
-            self.grid.last_glyph_draw_calls()
-        };
-        let input = if self.drew_input {
-            self.input.last_glyph_draw_calls()
-        } else {
-            0
-        };
-        let title = if self.drew_title {
-            self.title.last_glyph_draw_calls()
-        } else {
-            0
-        };
-        primary + input + title
+        let mut n = 0;
+        if self.drew_timeline {
+            n += self.timeline.last_glyph_draw_calls();
+        }
+        if self.drew_grid {
+            n += self.grid.last_glyph_draw_calls();
+        }
+        if self.drew_screens {
+            n += self.screens.last_glyph_draw_calls();
+        }
+        if self.drew_input {
+            n += self.input.last_glyph_draw_calls();
+        }
+        if self.drew_completion {
+            n += self.completion.last_glyph_draw_calls();
+        }
+        if self.drew_title {
+            n += self.title.last_glyph_draw_calls();
+        }
+        n
     }
 
     /// Render the snapshot grid (and always clear). Split out so `render` reads
@@ -274,18 +301,45 @@ impl GpuRenderer {
         // only when a full-screen app owns the screen (alt-screen, ADR-0007) or there is
         // no engine (the headless / no-blocks stand-in).
         let alt_screen = frame.snapshot.is_some_and(|s| s.alt_screen);
-        let draw_timeline = !alt_screen && frame.blocks.is_some();
+        // The `modes` explainer (T-9.5) replaces the timeline on demand; the `launch` empty
+        // state (T-9.5) shows when the block timeline is empty. Both are drawn by the
+        // screens front-end, centered in the content band. Neither shows in alt-screen.
+        let show_modes = !alt_screen && frame.show_help;
+        let blocks_empty = frame.blocks.is_some_and(aterm_core::BlockList::is_empty);
+        let show_launch = !alt_screen && !show_modes && blocks_empty;
+        let draw_screens = show_modes || show_launch;
+        let screen_kind = if show_modes {
+            crate::screens::ScreenKind::Modes
+        } else {
+            crate::screens::ScreenKind::Launch
+        };
+        // The block timeline is the primary view except in alt-screen, when a screen replaces
+        // it (modes), or when there is no engine (headless -> the grid). Under `launch` the
+        // timeline is still "drawn" but is empty, so the screens splash sits over a blank
+        // canvas.
+        let draw_timeline = !alt_screen && !show_modes && frame.blocks.is_some();
+        // The raw grid is the PRIMARY view only in alt-screen (a full-screen app owns the
+        // screen, ADR-0007) or the no-engine headless stand-in - never while a screen shows.
+        let draw_grid = !draw_timeline && !show_modes;
         // The input box draws over the bottom zone in normal mode (a full-screen app owns
         // input in alt-screen, so it is hidden there). It is the single on-screen home of
         // the live command line - the raw grid (with the shell's own echo) is not drawn in
         // normal mode (T-4.6), so there is no double echo.
         let draw_input = !alt_screen && frame.input.is_some();
+        // The completion popover (T-9.5) floats above the input's left edge when open.
+        let draw_completion = !alt_screen
+            && frame
+                .completion
+                .is_some_and(aterm_core::Completion::is_open);
         // The custom title bar draws over a reserved TOP band in normal mode (a full-screen
         // app owns the whole surface in alt-screen, so it is hidden there, like the input
         // box). It reserves `title_h` off the top so the timeline lays out below it.
         let draw_title = !alt_screen && frame.title_bar.is_some();
         self.drew_timeline = draw_timeline;
+        self.drew_grid = draw_grid;
+        self.drew_screens = draw_screens;
         self.drew_input = draw_input;
+        self.drew_completion = draw_completion;
         self.drew_title = draw_title;
         let size = crate::grid_render::FrameSize {
             width: self.config.width,
@@ -373,7 +427,7 @@ impl GpuRenderer {
                     );
                     self.timeline_sig = Some(sig);
                 }
-            } else {
+            } else if draw_grid {
                 // Alt-screen surface or no-engine stand-in: the grid is the view.
                 self.last_visible_blocks = 0;
                 if let Some(snap) = frame.snapshot {
@@ -388,6 +442,35 @@ impl GpuRenderer {
                 }
                 // Force a timeline rebuild the next time we re-enter timeline mode.
                 self.timeline_sig = None;
+            } else {
+                // A screen (the modes explainer) replaces the primary view; neither the
+                // timeline nor the grid draws. Force a timeline rebuild on re-entry.
+                self.last_visible_blocks = 0;
+                self.timeline_sig = None;
+            }
+
+            // The informational screens (T-9.5): launch (empty timeline) or modes (on
+            // demand), centered in the content band between the title bar and the input box.
+            // Self-gated. The "Currently routing to <mode>" line reads the live input mode.
+            if draw_screens {
+                let screen_mode =
+                    frame
+                        .input
+                        .map_or(aterm_tokens::Mode::Shell, |m| match m.mode() {
+                            aterm_core::InputMode::Agent => aterm_tokens::Mode::Agent,
+                            aterm_core::InputMode::Shell => aterm_tokens::Mode::Shell,
+                        });
+                self.screens.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.atlas,
+                    screen_kind,
+                    screen_mode,
+                    title_h,
+                    effective_h,
+                    frame.theme,
+                    size,
+                );
             }
 
             // The input box (self-gated: its own damage signature early-outs alloc-free).
@@ -398,6 +481,22 @@ impl GpuRenderer {
                     &mut self.atlas,
                     frame.input.expect("draw_input implies input"),
                     frame.autonomy,
+                    frame.theme,
+                    size,
+                );
+            }
+
+            // The completion popover (T-9.5): floats above the input's top edge. Self-gated.
+            if draw_completion {
+                let input_zone_top = (self.config.height as f32 - input_zone).max(0.0);
+                self.completion.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.atlas,
+                    frame
+                        .completion
+                        .expect("draw_completion implies completion"),
+                    input_zone_top,
                     frame.theme,
                     size,
                 );
@@ -460,18 +559,28 @@ impl GpuRenderer {
                     multiview_mask: None,
                 });
 
-                // Draw the chosen front-end through the shared atlas. Each draw no-ops
-                // (and zeroes its own glyph-draw-call counter) when it has no instances,
-                // so the counter stays honest across mode switches and blank frames.
+                // Draw the chosen PRIMARY front-end through the shared atlas. Each draw
+                // no-ops (and zeroes its own glyph-draw-call counter) when it has no
+                // instances, so the counter stays honest across mode switches and blank
+                // frames.
                 if draw_timeline {
                     self.timeline.draw(&mut pass, &self.atlas);
-                } else {
+                } else if draw_grid {
                     self.grid.draw(&mut pass, &self.atlas);
+                }
+                // An informational screen (launch over the empty timeline, or modes as the
+                // whole content) draws in the content band.
+                if draw_screens {
+                    self.screens.draw(&mut pass, &self.atlas);
                 }
                 // The input box draws over the reserved bottom zone (its hairline +
                 // text + chip + caret sit on top of the cleared canvas).
                 if draw_input {
                     self.input.draw(&mut pass, &self.atlas);
+                }
+                // The completion popover floats above the input, on top of the content.
+                if draw_completion {
+                    self.completion.draw(&mut pass, &self.atlas);
                 }
                 // The title bar draws last, over the reserved top band (its bottom hairline
                 // + dots + toggle + centered title sit on top of the cleared canvas).

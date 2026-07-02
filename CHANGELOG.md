@@ -13,6 +13,14 @@ the next version (or an `## Unreleased` heading until a version is cut).
 
 ### Added
 
+- **Launch + modes screens and a tab-completion popover (the vision-mock quiet states).** A
+  fresh window now shows a centered "aterm" splash with a tagline instead of a blank timeline.
+  Press `Cmd-?` for a one-input-two-destinations explainer (the shell/agent split). And `Tab`
+  opens a fuzzy-finder popover that hugs the prompt: type to narrow it (matched letters glow in
+  the accent color), `up`/`down` to move, `Enter`/`Tab` to accept (it fills the input), `Esc`
+  to dismiss. Completions are drawn from the commands you've run this session for now; richer
+  sources ($PATH, argument specs, persisted history) come later. `Tab` still reaches the shell's
+  own completer when the finder has nothing to offer. (Ticket T-9.5.)
 - **A custom window title bar (the vision-mock chrome).** The window now draws a 44px title
   bar with three warm traffic-light dots, a sidebar-toggle glyph, and a centered active title
   plus the current directory (home shown as `~`), over a hairline rule; the timeline lays out
