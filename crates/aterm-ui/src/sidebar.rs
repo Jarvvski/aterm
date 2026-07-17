@@ -564,6 +564,7 @@ fn hover_code(hovered: Option<HitTarget>) -> u64 {
         Some(HitTarget::ModeChip) => 5,
         Some(HitTarget::BlockMeta(index)) => 6 + index as u64,
         Some(HitTarget::CompletionRow(index)) => 7 + index as u64,
+        Some(HitTarget::SettingsSegment { .. } | HitTarget::SettingsStepper { .. }) => 0,
     }
 }
 

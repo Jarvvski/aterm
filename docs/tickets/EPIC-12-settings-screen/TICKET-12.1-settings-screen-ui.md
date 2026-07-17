@@ -2,7 +2,7 @@
 id: T-12.1
 epic: EPIC-12-settings-screen
 title: Settings screen UI - typographic preference rows
-status: ready-for-agent
+status: done
 labels: [ui, design, settings]
 depends_on: [T-9.1]
 ---
@@ -18,9 +18,9 @@ only; binding the controls to live config and persisting them is T-12.2.
 # Context
 
 - Visual source of record: [`docs/design/vision-mock/AtermWindow.dc.html`](../../design/vision-mock/AtermWindow.dc.html), the `screen="settings"` state - an uppercase "PREFERENCES" label, then `hairline`-separated rows (Theme, Font size, Default provider, Autonomy), then the footer line "aterm <version> - themes stay calm, config stays typographic".
-- [ADR-0011](../../adr/0011-vision-mock-north-star.md) adopts the vision mock as the UI north star; a rendered settings screen was not previously scoped in any epic (only T-8.3 config load exists, headless).
+- [ADR-0011](../../adr/0011-vision-mock-ui-north-star.md) adopts the vision mock as the UI north star; a rendered settings screen was not previously scoped in any epic (only T-8.3 config load exists, headless).
 - [`07-ia-design-language.md`](../../research/07-ia-design-language.md) - the "config stays calm and typographic" ethos: settings is just more of the same restrained surface, not a distinct chrome-heavy preferences window.
-- Consumes the reconciled tokens/palette from [T-9.1](../EPIC-9-vision-reskin/TICKET-9.1-design-token-reconciliation.md) (warm palette, `hairline`, `fg.*` hierarchy, `accent.primary` for the active segment).
+- Consumes the reconciled tokens/palette from [T-9.1](../EPIC-9-vision-mock-reskin/TICKET-9.1-token-reconciliation.md) (warm palette, `hairline`, `fg.*` hierarchy, `accent.primary` for the active segment).
 
 # Implementation notes
 
@@ -37,12 +37,12 @@ only; binding the controls to live config and persisting them is T-12.2.
 
 # Acceptance criteria
 
-- [ ] The Settings screen renders all four rows + heading + footer to spec in both themes, matching the mock's structure (hairline row rules, left label+description, right control).
-- [ ] The segmented control and the font-size stepper are reusable widgets, token-driven, with no hardcoded hex.
-- [ ] The active segment uses `accent.primary`; inactive segments use the dim/hover `.seg` treatment.
-- [ ] The version footer reflects the `Cargo.toml` version of record automatically (not a literal).
-- [ ] Autonomy defaults to the "Auto-run safe" segment (matches the locked AUTO-SAFE default).
-- [ ] No frame-budget regression (the T-1.8 no-per-frame-allocation assertion holds).
+- [x] The Settings screen renders all four rows + heading + footer to spec in both themes, matching the mock's structure (hairline row rules, left label+description, right control).
+- [x] The segmented control and the font-size stepper are reusable widgets, token-driven, with no hardcoded hex.
+- [x] The active segment uses `accent.primary`; inactive segments use the dim/hover `.seg` treatment.
+- [x] The version footer reflects the `Cargo.toml` version of record automatically (not a literal).
+- [x] Autonomy defaults to the "Auto-run safe" segment (matches the locked AUTO-SAFE default).
+- [x] No frame-budget regression (the T-1.8 no-per-frame-allocation assertion holds).
 
 # Out of scope
 

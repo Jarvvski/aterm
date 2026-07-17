@@ -26,8 +26,8 @@ use aterm_core::{
 };
 use aterm_ui::{
     ApprovalView, EditorView, HitTarget, ImeEvent, KeyPress, NamedKey, OverlayRequest,
-    OverlayWorker, RiskState, SidebarItem, SidebarView, TitleBarView, UiCallbacks, Window,
-    DEFAULT_DEBOUNCE,
+    OverlayWorker, RiskState, SettingsProvider, SettingsView, SidebarItem, SidebarView,
+    TitleBarView, UiCallbacks, Window, DEFAULT_DEBOUNCE,
 };
 
 use aterm_core::{
@@ -55,6 +55,9 @@ pub struct TerminalHost {
     /// Top-level editor state. Its view flag folds the terminal presentation away without
     /// touching the live sessions or their unified-input routing state.
     editor: EditorSession,
+    /// Whether the Preferences surface currently owns the content area. The retained terminal
+    /// and editor state stay untouched underneath it, so Escape restores the previous view.
+    settings_open: bool,
     /// Input-facing state parked by stable session id while another session owns focus.
     /// The active state stays in the existing hot-path fields, so frame rendering and key
     /// routing keep borrowing directly without a map lookup.
@@ -132,6 +135,9 @@ pub struct TerminalHost {
     show_help: bool,
     /// The help/modes-explainer hotkey (ticket T-9.5). Default `Cmd-?` (Cmd-Shift-/).
     help_key: KeyBinding,
+    /// Standard macOS Preferences chord (`Cmd-,`). This is presentation routing only; T-12.2
+    /// owns applying and persisting control changes.
+    settings_key: KeyBinding,
     /// The single [`Secrets`] deny-set (ticket T-5.6), cloned from the same source the
     /// agent runtime is gated + sandboxed with, used ONLY to sanitize the parked-approval
     /// command before it reaches the risk-gate card (ticket T-9.7) - so no raw secret ever
@@ -270,6 +276,7 @@ impl TerminalHost {
         Ok(Self {
             sessions,
             editor: EditorSession::new(),
+            settings_open: false,
             parked_focus: HashMap::new(),
             session_dims: dims,
             sidebar_items,
@@ -309,6 +316,13 @@ impl TerminalHost {
             completion: Completion::new(),
             show_help: false,
             help_key: cfg.toggle_help,
+            settings_key: KeyBinding {
+                key: crate::routing::BindKey::Char(','),
+                mods: aterm_ui::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            },
             secrets,
             pending_card: None,
             gate_menu_open: false,
@@ -1056,7 +1070,7 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn snapshot(&mut self) -> Option<Arc<Snapshot>> {
-        if self.editor.view() == AppView::Editor {
+        if self.settings_open || self.editor.view() == AppView::Editor {
             return None;
         }
         self.drain_terminal_events();
@@ -1068,7 +1082,7 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn blocks(&mut self) -> Option<Arc<BlockList>> {
-        if self.editor.view() == AppView::Editor {
+        if self.settings_open || self.editor.view() == AppView::Editor {
             return None;
         }
         // The live, virtualized timeline's data (ticket T-2.7): the model thread
@@ -1086,7 +1100,7 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn input(&self) -> Option<&InputModel> {
-        if self.editor.view() == AppView::Editor {
+        if self.settings_open || self.editor.view() == AppView::Editor {
             return None;
         }
         // The unified-input box (ticket T-3.6) reads the live buffer this host owns
@@ -1097,7 +1111,7 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn editor(&self) -> Option<EditorView<'_>> {
-        if self.editor.view() != AppView::Editor {
+        if self.settings_open || self.editor.view() != AppView::Editor {
             return None;
         }
         let document = self.editor.document()?;
@@ -1110,6 +1124,14 @@ impl UiCallbacks for TerminalHost {
             document,
             filename,
             mode: self.input.mode(),
+        })
+    }
+
+    fn settings(&self) -> Option<SettingsView> {
+        self.settings_open.then_some(SettingsView {
+            provider: SettingsProvider::Anthropic,
+            autonomy: ui_autonomy(self.default_autonomy),
+            font_size_px: 14,
         })
     }
 
@@ -1194,6 +1216,25 @@ impl UiCallbacks for TerminalHost {
         // editing keys are still mirrored raw to the PTY so the shell's own line
         // editor echoes them - the byte stream stays what the prior scaffold sent.
 
+        // A parked safety decision is modal across every top-level surface. Resolve it before
+        // Preferences or editor routing so `Cmd-,` cannot hide a gate and no shortcut can
+        // bypass the fail-closed decision channel.
+        if self.handle_gate_key(&key) {
+            return None;
+        }
+
+        if self.settings_open {
+            if matches!(key.named, Some(NamedKey::Escape)) {
+                self.settings_open = false;
+            }
+            return None;
+        }
+        if self.settings_key.matches(&key) {
+            self.settings_open = true;
+            self.show_help = false;
+            return None;
+        }
+
         // Editor is a top-level app view, not an InputModel mode. It owns Escape and Cmd-S;
         // every other key stays away from the hidden terminal input until T-11.2 wires the
         // writing surface's shared editing core.
@@ -1268,17 +1309,6 @@ impl UiCallbacks for TerminalHost {
         // or the line. Sends no PTY bytes.
         if self.help_key.matches(&key) {
             self.show_help = !self.show_help;
-            return None;
-        }
-
-        // While the agent is parked on an approval (T-5.11 / T-9.7), the keyboard ANSWERS
-        // the risk-gate card instead of editing the line: `Enter`/`y` approve, `Esc`/`n`
-        // reject, `↓`/`Tab` open the "Always approve" dropdown. Every key is swallowed so a
-        // pending safety decision can never be bypassed by stray input. This IS the
-        // click/Esc seam the fail-closed channel-backed `ConfirmHandler` was built for -
-        // resolved on the winit thread. The card is present iff a turn is parked (kept in
-        // sync by `refresh_pending_card` each tick), so gate on it, not a fresh lock read.
-        if self.handle_gate_key(&key) {
             return None;
         }
 
@@ -1492,6 +1522,8 @@ impl UiCallbacks for TerminalHost {
                     self.accept_completion();
                 }
             }
+            // T-12.1 owns hoverable presentation only. T-12.2 binds these controls to config.
+            HitTarget::SettingsSegment { .. } | HitTarget::SettingsStepper { .. } => {}
             // The block-meta hover region has no click action yet (hover-reveal only, T-9.8).
             HitTarget::BlockMeta(_) => {}
         }
@@ -1603,6 +1635,30 @@ impl UiCallbacks for TerminalHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_comma_opens_preferences_with_safe_defaults_and_escape_restores_terminal() {
+        let Ok(mut host) = TerminalHost::spawn(&Config::default()) else {
+            return;
+        };
+        assert!(host.settings().is_none());
+
+        host.on_key(cmd_char(','));
+
+        let settings = host.settings().expect("Cmd-, opens Preferences");
+        assert_eq!(settings.provider, aterm_ui::SettingsProvider::Anthropic);
+        assert_eq!(settings.autonomy, aterm_ui::AutonomyMode::AutoSafe);
+        assert_eq!(settings.font_size_px, 14);
+        assert!(host.input().is_none(), "Preferences replaces the input bar");
+        assert!(host.blocks().is_none(), "Preferences replaces the timeline");
+
+        host.on_key(named_key(NamedKey::Escape));
+
+        assert!(host.settings().is_none());
+        assert!(host.input().is_some(), "Escape restores the input bar");
+        assert!(host.blocks().is_some(), "Escape restores the timeline");
+    }
 
     fn editor_fixture(label: &str, text: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()

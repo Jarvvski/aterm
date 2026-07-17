@@ -10,6 +10,7 @@ use aterm_tokens::Theme;
 use crate::approval_render::ApprovalView;
 use crate::components::AutonomyMode;
 use crate::editor::EditorView;
+use crate::settings::SettingsView;
 use crate::sidebar::SidebarView;
 use crate::title_bar::TitleBarView;
 
@@ -56,6 +57,10 @@ pub struct Frame<'a> {
     /// timeline, raw grid, informational screens, and unified input while retaining window
     /// chrome. The borrowed view carries no file transport and allocates nothing.
     pub editor: Option<EditorView<'a>>,
+    /// The Preferences surface for this frame. When present it replaces terminal and editor
+    /// content while retaining shared window chrome. The compact value carries only selected
+    /// control state; the settings module owns the rendering implementation.
+    pub settings: Option<SettingsView>,
     /// The autonomy posture to show in the always-visible indicator this frame
     /// (ticket T-5.11), or `None` for a host with no agent (e.g. the headless UI), in
     /// which case no autonomy chip is drawn. `Copy`, so it rides along by value with

@@ -9,6 +9,17 @@ until the owner explicitly approves it - never auto-bump. The version of record 
 `[workspace.package].version` in the root `Cargo.toml`. New entries go on top, under
 the next version (or an `## Unreleased` heading until a version is cut).
 
+## 0.6.0 - 2026-07-17
+
+### Added
+
+- **Preferences now has its calm typographic surface.** Press `Cmd-,` to open four
+  token-driven rows for theme, font size, default provider, and autonomy, with reusable
+  segmented controls and a font-size stepper. `Esc` restores the previous terminal or
+  editor view without disturbing it. The footer follows the package version automatically,
+  and unchanged frames remain allocation-free. Control persistence follows in T-12.2.
+  (Ticket T-12.1.)
+
 ## 0.5.0 - 2026-07-17
 
 ### Added

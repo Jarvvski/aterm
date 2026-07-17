@@ -217,6 +217,13 @@ pub trait UiCallbacks {
         None
     }
 
+    /// The Preferences surface for this frame, or `None` while another top-level view owns
+    /// the content area. The compact value crosses the seam by copy; persistence remains an
+    /// application concern for T-12.2.
+    fn settings(&self) -> Option<crate::settings::SettingsView> {
+        None
+    }
+
     /// The autonomy posture to show in the always-visible indicator this frame
     /// (ticket T-5.11), or `None` for a host with no agent (e.g.
     /// [`HeadlessCallbacks`]), in which case no autonomy chip is drawn. A real session
@@ -565,6 +572,7 @@ impl<C: UiCallbacks> AtermApp<C> {
                 // `self.renderer` field, so the two coexist (no per-frame alloc).
                 input: self.callbacks.input(),
                 editor: self.callbacks.editor(),
+                settings: self.callbacks.settings(),
                 autonomy: self.callbacks.autonomy_mode(),
                 title_bar: self.callbacks.title_bar(),
                 sidebar: self.callbacks.sidebar(),

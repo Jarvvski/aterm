@@ -71,6 +71,9 @@ pub struct GpuRenderer {
     /// The centered file-backed writing surface. It owns retained hard-line layouts and its
     /// own damage gate, so cursor-only changes reuse document shaping and idle frames do no work.
     editor: crate::editor::EditorRenderer,
+    /// The typographic Preferences surface. It owns the four-row layout and reusable controls
+    /// behind one compact view, with its own damage gate for allocation-free idle frames.
+    settings: crate::settings::SettingsRenderer,
     /// The custom title-bar front-end (ticket T-9.2): drawn over a reserved TOP band in
     /// normal (non-alt-screen) mode when the host supplies title-bar content. Self-gated
     /// (its own damage signature), so it allocates nothing on an idle present; the timeline
@@ -117,6 +120,8 @@ pub struct GpuRenderer {
     drew_input: bool,
     /// Whether the editor was the primary content surface on the last frame.
     drew_editor: bool,
+    /// Whether Preferences was the primary content surface on the last frame.
+    drew_settings: bool,
     /// Whether the title bar drew on the last frame (drawn over the reserved top band
     /// whenever the host supplies title-bar content - including alt-screen, T-9.9).
     drew_title: bool,
@@ -215,6 +220,7 @@ impl GpuRenderer {
         let timeline = crate::timeline_render::TimelineRenderer::new(&device);
         let input = crate::input_widget::InputWidgetRenderer::new(&device);
         let editor = crate::editor::EditorRenderer::new(&device);
+        let settings = crate::settings::SettingsRenderer::new(&device);
         let title = crate::title_bar::TitleBarRenderer::new(&device);
         let sidebar = crate::sidebar::SidebarRenderer::new(&device);
         let screens = crate::screens::ScreensRenderer::new(&device);
@@ -231,6 +237,7 @@ impl GpuRenderer {
             timeline,
             input,
             editor,
+            settings,
             title,
             sidebar,
             screens,
@@ -242,6 +249,7 @@ impl GpuRenderer {
             drew_timeline: false,
             drew_input: false,
             drew_editor: false,
+            drew_settings: false,
             drew_title: false,
             drew_sidebar: false,
             drew_grid: false,
@@ -360,6 +368,9 @@ impl GpuRenderer {
         if self.drew_editor {
             n += self.editor.last_glyph_draw_calls();
         }
+        if self.drew_settings {
+            n += self.settings.last_glyph_draw_calls();
+        }
         if self.drew_completion {
             n += self.completion.last_glyph_draw_calls();
         }
@@ -414,14 +425,17 @@ impl GpuRenderer {
         // its live output via the engine's incremental capture). The RAW GRID is drawn
         // only when a full-screen app owns the screen (alt-screen, ADR-0007) or there is
         // no engine (the headless / no-blocks stand-in).
-        let draw_editor = frame.editor.is_some();
-        let alt_screen = !draw_editor && frame.snapshot.is_some_and(|s| s.alt_screen);
+        let draw_settings = frame.settings.is_some();
+        let draw_editor = !draw_settings && frame.editor.is_some();
+        let alt_screen =
+            !draw_settings && !draw_editor && frame.snapshot.is_some_and(|s| s.alt_screen);
         // The `modes` explainer (T-9.5) replaces the timeline on demand; the `launch` empty
         // state (T-9.5) shows when the block timeline is empty. Both are drawn by the
         // screens front-end, centered in the content band. Neither shows in alt-screen.
-        let show_modes = !draw_editor && !alt_screen && frame.show_help;
+        let show_modes = !draw_settings && !draw_editor && !alt_screen && frame.show_help;
         let blocks_empty = frame.blocks.is_some_and(aterm_core::BlockList::is_empty);
-        let show_launch = !draw_editor && !alt_screen && !show_modes && blocks_empty;
+        let show_launch =
+            !draw_settings && !draw_editor && !alt_screen && !show_modes && blocks_empty;
         let draw_screens = show_modes || show_launch;
         let screen_kind = if show_modes {
             crate::screens::ScreenKind::Modes
@@ -432,17 +446,19 @@ impl GpuRenderer {
         // it (modes), or when there is no engine (headless -> the grid). Under `launch` the
         // timeline is still "drawn" but is empty, so the screens splash sits over a blank
         // canvas.
-        let draw_timeline = !draw_editor && !alt_screen && !show_modes && frame.blocks.is_some();
+        let draw_timeline =
+            !draw_settings && !draw_editor && !alt_screen && !show_modes && frame.blocks.is_some();
         // The raw grid is the PRIMARY view only in alt-screen (a full-screen app owns the
         // screen, ADR-0007) or the no-engine headless stand-in - never while a screen shows.
-        let draw_grid = !draw_editor && !draw_timeline && !show_modes;
+        let draw_grid = !draw_settings && !draw_editor && !draw_timeline && !show_modes;
         // The input box draws over the bottom zone in normal mode (a full-screen app owns
         // input in alt-screen, so it is hidden there). It is the single on-screen home of
         // the live command line - the raw grid (with the shell's own echo) is not drawn in
         // normal mode (T-4.6), so there is no double echo.
-        let draw_input = !draw_editor && !alt_screen && frame.input.is_some();
+        let draw_input = !draw_settings && !draw_editor && !alt_screen && frame.input.is_some();
         // The completion popover (T-9.5) floats above the input's left edge when open.
-        let draw_completion = !draw_editor
+        let draw_completion = !draw_settings
+            && !draw_editor
             && !alt_screen
             && frame
                 .completion
@@ -469,6 +485,7 @@ impl GpuRenderer {
         self.drew_screens = draw_screens;
         self.drew_input = draw_input;
         self.drew_editor = draw_editor;
+        self.drew_settings = draw_settings;
         self.drew_completion = draw_completion;
         self.drew_approval = draw_approval;
         self.drew_title = draw_title;
@@ -529,7 +546,20 @@ impl GpuRenderer {
         // changed (the steady-state present floor, T-1.8).
         {
             let _build = tracing::trace_span!("build").entered();
-            if draw_editor {
+            if draw_settings {
+                self.last_visible_blocks = 0;
+                self.settings.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.atlas,
+                    frame.settings.expect("draw_settings implies settings"),
+                    hovered,
+                    title_h,
+                    frame.theme,
+                    size,
+                );
+                self.timeline_sig = None;
+            } else if draw_editor {
                 self.last_visible_blocks = 0;
                 self.editor.prepare(
                     &self.device,
@@ -727,6 +757,11 @@ impl GpuRenderer {
                         self.hit_map.push(rect, HitTarget::CompletionRow(i));
                     }
                 }
+                if draw_settings {
+                    for &(rect, target) in self.settings.hit_regions() {
+                        self.hit_map.push(rect, target);
+                    }
+                }
                 if draw_sidebar {
                     for &(rect, target) in self.sidebar.hit_regions() {
                         self.hit_map.push(rect, target);
@@ -791,7 +826,9 @@ impl GpuRenderer {
                 // no-ops (and zeroes its own glyph-draw-call counter) when it has no
                 // instances, so the counter stays honest across mode switches and blank
                 // frames.
-                if draw_editor {
+                if draw_settings {
+                    self.settings.draw(&mut pass, &self.atlas);
+                } else if draw_editor {
                     self.editor.draw(&mut pass, &self.atlas);
                 } else if draw_timeline {
                     self.timeline.draw(&mut pass, &self.atlas);

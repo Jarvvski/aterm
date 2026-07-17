@@ -57,6 +57,11 @@ pub enum HitTarget {
     /// the pointer twin of moving to that row and pressing `Enter`
     /// ([`crate::completion_render`]).
     CompletionRow(usize),
+    /// A Preferences segmented-control choice, addressed by stable group and option indexes.
+    /// T-12.1 uses it for hover treatment; T-12.2 will bind clicks to live config.
+    SettingsSegment { group: u8, index: u8 },
+    /// A Preferences font-size stepper button. `true` increments, `false` decrements.
+    SettingsStepper { increment: bool },
 }
 
 /// A rect in physical px: `[x, y, w, h]`.

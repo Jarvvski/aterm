@@ -178,5 +178,5 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 ### EPIC-12 - Settings screen
 | id | title | status | depends_on |
 |---|---|---|---|
-| T-12.1 | Settings screen UI - typographic preference rows | ready-for-agent | T-9.1 |
+| T-12.1 | Settings screen UI - typographic preference rows | done | T-9.1 |
 | T-12.2 | Settings persistence + live application | ready-for-agent | T-12.1, T-8.3 |
