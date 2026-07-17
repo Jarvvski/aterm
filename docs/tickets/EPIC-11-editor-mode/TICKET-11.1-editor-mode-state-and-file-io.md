@@ -2,7 +2,7 @@
 id: T-11.1
 epic: EPIC-11-editor-mode
 title: Editor mode state + file open/save + mode transitions
-status: ready-for-agent
+status: done
 labels: [ui, app, editor]
 depends_on: []
 ---
@@ -28,11 +28,11 @@ Add an editor view to aterm: opening a file folds the block timeline away and sh
 
 # Acceptance criteria
 
-- [ ] An `AppView`-level editor state exists that is distinct from `InputModel.mode`; entering/leaving editor does not mutate `InputModel.mode` (unit-tested).
-- [ ] Opening a file populates an editable buffer with `path`, `dirty=false`, and a correct word count; editing sets `dirty=true` and updates the count.
-- [ ] `⌘S` saves to `path` and clears `dirty`; an IO/permission failure is reported, not panicked.
-- [ ] `esc` returns to the shell view with the timeline and input bar restored intact; the pre-editor Shell/Agent routing target is preserved.
-- [ ] Pure document model (buffer/dirty/word-count) is unit-tested in `aterm-core` with no window and no filesystem.
+- [x] An `AppView`-level editor state exists that is distinct from `InputModel.mode`; entering/leaving editor does not mutate `InputModel.mode` (unit-tested).
+- [x] Opening a file populates an editable buffer with `path`, `dirty=false`, and a correct word count; editing sets `dirty=true` and updates the count.
+- [x] `⌘S` saves to `path` and clears `dirty`; an IO/permission failure is reported, not panicked.
+- [x] `esc` returns to the shell view with the timeline and input bar restored intact; the pre-editor Shell/Agent routing target is preserved.
+- [x] Pure document model (buffer/dirty/word-count) is unit-tested in `aterm-core` with no window and no filesystem.
 
 # Out of scope
 
@@ -43,3 +43,12 @@ Add an editor view to aterm: opening a file folds the block timeline away and sh
 # Notes
 
 2026-07-01 (agent): The dirty-on-`esc` default (save / discard / keep-open) and the concrete open-a-file trigger surface are left for the implementing agent to choose a sensible default and record here for owner review; neither is fixed by the mock. Flag here (and set `status: ready-for-human`) if any implementation path would require a third `InputModel` mode, which ADR-0004 / ADR-0011 forbid.
+
+2026-07-17 (agent): The owner approved `aterm <path>` as the explicit open trigger and
+retaining unsaved document contents in memory when `Esc` returns to the terminal. The pure
+`Document` module owns text, path, dirty state, and cached word count behind a small interface;
+the app's `EditorSession` owns filesystem transport and `AppView` transitions without adding a
+hypothetical storage seam. Entering editor makes the existing render callbacks omit the timeline,
+raw grid, and unified input; `Esc` restores those same live sources without changing the
+`InputModel` text or Shell/Agent mode. `Cmd-S` reports write failures and leaves the document
+dirty. `mise run fmt`, `mise run lint`, `mise run build`, and `mise run test` pass.

@@ -15,7 +15,7 @@
 //! agent-injector mailbox.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -36,6 +36,7 @@ use aterm_core::{
 
 use crate::agent_runtime::{AgentRuntime, PendingApproval, TurnHandle};
 use crate::config::Config;
+use crate::editor::{AppView, EditorSession};
 use crate::routing::{classify, decide, keystroke_for, Disposition, KeyBinding, RoutingContext};
 
 /// Application-level host for all terminal sessions, agent state, and UI callbacks.
@@ -50,6 +51,9 @@ pub struct TerminalHost {
     turn: Option<TurnHandle>,
     /// Every live terminal engine, with exactly one active render/input target.
     sessions: SessionList,
+    /// Top-level editor state. Its view flag folds the terminal presentation away without
+    /// touching the live sessions or their unified-input routing state.
+    editor: EditorSession,
     /// Input-facing state parked by stable session id while another session owns focus.
     /// The active state stays in the existing hot-path fields, so frame rendering and key
     /// routing keep borrowing directly without a map lookup.
@@ -264,6 +268,7 @@ impl TerminalHost {
         let agent = AgentRuntime::new(root, secrets.clone()).map_err(aterm_core::PtyError::Io)?;
         Ok(Self {
             sessions,
+            editor: EditorSession::new(),
             parked_focus: HashMap::new(),
             session_dims: dims,
             sidebar_items,
@@ -313,6 +318,17 @@ impl TerminalHost {
     /// Number of command blocks segmented so far (used by tests / status line).
     pub fn block_count(&self) -> usize {
         self.engine().block_count()
+    }
+
+    /// Load `path` through the app's filesystem adapter and enter the editor view.
+    pub fn open_file(&mut self, path: &Path) -> std::io::Result<()> {
+        self.editor.open(path)
+    }
+
+    /// Test setup seam for exercising Cmd-S before T-11.2 wires the writing surface.
+    #[cfg(test)]
+    fn replace_editor_text(&mut self, text: String) -> bool {
+        self.editor.replace_text(text)
     }
 
     /// The active terminal engine. A live app session is constructed with one engine,
@@ -1012,6 +1028,9 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn snapshot(&mut self) -> Option<Arc<Snapshot>> {
+        if self.editor.view() == AppView::Editor {
+            return None;
+        }
         self.drain_terminal_events();
         // The engine's model thread owns the parse loop; here we just hand the
         // renderer the latest published snapshot as a cheap `Arc` clone (a refcount
@@ -1021,6 +1040,9 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn blocks(&mut self) -> Option<Arc<BlockList>> {
+        if self.editor.view() == AppView::Editor {
+            return None;
+        }
         // The live, virtualized timeline's data (ticket T-2.7): the model thread
         // publishes the block list, here handed to the renderer as a cheap `Arc`
         // clone (a refcount bump under a short lock - NO per-frame deep copy), the
@@ -1036,6 +1058,9 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn input(&self) -> Option<&InputModel> {
+        if self.editor.view() == AppView::Editor {
+            return None;
+        }
         // The unified-input box (ticket T-3.6) reads the live buffer this host owns
         // and drives in `on_key` (the reducer mutations + the mode toggle). Borrowed, not
         // cloned - the renderer only reads it; this finally makes the in-progress line
@@ -1123,6 +1148,25 @@ impl UiCallbacks for TerminalHost {
         // INTERACTIVITY: until the T-3.6 widget is the source of truth, Shell-mode
         // editing keys are still mirrored raw to the PTY so the shell's own line
         // editor echoes them - the byte stream stays what the prior scaffold sent.
+
+        // Editor is a top-level app view, not an InputModel mode. It owns Escape and Cmd-S;
+        // every other key stays away from the hidden terminal input until T-11.2 wires the
+        // writing surface's shared editing core.
+        if self.editor.view() == AppView::Editor {
+            if matches!(key.named, Some(NamedKey::Escape)) {
+                self.editor.exit_to_terminal();
+            } else if key.mods.cmd
+                && !key.mods.ctrl
+                && !key.mods.alt
+                && !key.mods.shift
+                && key.ch.is_some_and(|ch| ch.eq_ignore_ascii_case(&'s'))
+            {
+                if let Err(error) = self.editor.save() {
+                    log::error!("failed to save editor document: {error}");
+                }
+            }
+            return None;
+        }
 
         // Session creation is an app intent, checked before the routing brain so the
         // Command chord never reaches prompt editing.
@@ -1395,6 +1439,9 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn on_ime(&mut self, event: ImeEvent) {
+        if self.editor.view() == AppView::Editor {
+            return;
+        }
         // T-3.2 IME feed. Populate/clear the pure `InputModel`'s preedit (a transient
         // overlay that never touches the committed buffer) or commit the final text.
         // `preedit.is_some()` then makes `routing_context` report `preedit_active`, so
@@ -1483,6 +1530,79 @@ impl UiCallbacks for TerminalHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn editor_fixture(label: &str, text: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aterm-session-{label}-{}-{nonce}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, text).expect("write editor fixture");
+        path
+    }
+
+    #[test]
+    fn opening_an_editor_document_suppresses_the_terminal_timeline_and_input() {
+        let Ok(mut host) = TerminalHost::spawn(&Config::default()) else {
+            return;
+        };
+        let path = editor_fixture("open", "one two three");
+
+        host.open_file(&path).expect("open editor document");
+
+        assert!(host.input().is_none(), "editor suppresses the input bar");
+        assert!(host.blocks().is_none(), "editor suppresses the timeline");
+        assert!(host.snapshot().is_none(), "editor suppresses the raw grid");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn escape_restores_terminal_state_without_changing_the_routing_target() {
+        let Ok(mut host) = TerminalHost::spawn(&Config::default()) else {
+            return;
+        };
+        let path = editor_fixture("escape", "editor text");
+        host.on_key(cmd_char('/'));
+        host.on_ime(ImeEvent::Commit("preserved prompt".to_string()));
+        assert_eq!(
+            host.input().expect("terminal input").mode(),
+            InputMode::Agent
+        );
+        host.open_file(&path).expect("open editor document");
+
+        host.on_key(named_key(NamedKey::Escape));
+
+        let input = host.input().expect("input restored after escape");
+        assert_eq!(input.mode(), InputMode::Agent);
+        assert_eq!(input.text(), "preserved prompt");
+        assert!(host.blocks().is_some(), "timeline restored after escape");
+        assert!(
+            host.snapshot().is_some(),
+            "grid source restored after escape"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cmd_s_persists_the_current_editor_buffer() {
+        let Ok(mut host) = TerminalHost::spawn(&Config::default()) else {
+            return;
+        };
+        let path = editor_fixture("cmd-s", "first draft");
+        host.open_file(&path).expect("open editor document");
+        assert!(host.replace_editor_text("saved by command".to_string()));
+
+        host.on_key(cmd_char('s'));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read saved document"),
+            "saved by command"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     // The host-layer IME semantics (ticket T-3.2), tested on a bare `InputModel`
     // through the pure `apply_ime` boundary - no PTY/engine/window needed. The routing

@@ -9,6 +9,7 @@
 
 pub mod block;
 pub mod completion;
+pub mod document;
 pub mod engine;
 pub mod highlight;
 pub mod history;
@@ -29,6 +30,7 @@ pub use block::{
 pub use completion::{
     fuzzy_match, rank, Completion, CompletionItem, FuzzyMatch, DEFAULT_COMPLETION_LIMIT,
 };
+pub use document::Document;
 pub use engine::{AgentInjector, Engine, EngineMetrics, ToModel};
 pub use highlight::{ghost_for, highlight_command_line, highlight_for};
 pub use history::{HistoryEntry, HistoryRing, HistoryScope, Recall, DEFAULT_HISTORY_CAP};

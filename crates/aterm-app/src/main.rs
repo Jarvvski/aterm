@@ -8,12 +8,19 @@
 
 mod agent_runtime;
 mod config;
+mod editor;
 mod mcp;
 mod routing;
 mod session;
 
 use config::Config;
 use session::TerminalHost;
+
+fn first_path_arg(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    args.into_iter().nth(1).map(std::path::PathBuf::from)
+}
 
 fn main() {
     // Logging: `RUST_LOG=info cargo run -p aterm-app`.
@@ -30,7 +37,7 @@ fn main() {
     );
 
     // Spawn the login shell over a PTY. If this fails we still want to know.
-    let host = match TerminalHost::spawn(&cfg) {
+    let mut host = match TerminalHost::spawn(&cfg) {
         Ok(s) => {
             log::info!("login shell PTY spawned ({} blocks)", s.block_count());
             s
@@ -41,6 +48,12 @@ fn main() {
         }
     };
 
+    if let Some(path) = first_path_arg(std::env::args_os()) {
+        if let Err(error) = host.open_file(&path) {
+            log::error!("failed to open editor file {}: {error}", path.display());
+        }
+    }
+
     // Open the window + GPU surface and run the event loop until the window
     // closes. This blocks the main thread (winit requirement).
     let render_config = aterm_ui::RenderConfig {
@@ -49,5 +62,20 @@ fn main() {
     if let Err(e) = aterm_ui::run_with(cfg.theme, host, render_config) {
         log::error!("event loop error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::first_path_arg;
+
+    #[test]
+    fn first_positional_argument_selects_the_startup_editor_file() {
+        let args = [OsString::from("aterm"), OsString::from("notes.md")];
+
+        assert_eq!(first_path_arg(args), Some(PathBuf::from("notes.md")));
     }
 }

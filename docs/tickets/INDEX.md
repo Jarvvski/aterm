@@ -172,7 +172,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 ### EPIC-11 - Editor mode
 | id | title | status | depends_on |
 |---|---|---|---|
-| T-11.1 | Editor mode state + file open/save + mode transitions | ready-for-agent | - |
+| T-11.1 | Editor mode state + file open/save + mode transitions | done | - |
 | T-11.2 | Editor writing-surface widget (centered prose editing) | ready-for-agent | T-11.1, T-9.1 |
 
 ### EPIC-12 - Settings screen

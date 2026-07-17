@@ -9,6 +9,17 @@ until the owner explicitly approves it - never auto-bump. The version of record 
 `[workspace.package].version` in the root `Cargo.toml`. New entries go on top, under
 the next version (or an `## Unreleased` heading until a version is cut).
 
+## 0.4.0 - 2026-07-17
+
+### Added
+
+- **File-backed editor mode now has a complete lifecycle.** Launching `aterm <path>` loads
+  that file into a pure document model with live dirty state and word count while folding
+  the terminal timeline and input away without destroying them. `Cmd-S` saves through the
+  app filesystem adapter, and `Esc` restores the terminal with its draft text and Shell or
+  Agent routing target unchanged. Unsaved editor contents stay in memory on exit; the
+  centered on-screen writing surface follows in T-11.2. (Ticket T-11.1.)
+
 ## 0.3.0 - 2026-07-17
 
 ### Added
