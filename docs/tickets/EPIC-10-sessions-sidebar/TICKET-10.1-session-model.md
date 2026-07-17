@@ -2,7 +2,7 @@
 id: T-10.1
 epic: EPIC-10-sessions-sidebar
 title: Multi-session model - concurrent PTY-backed sessions + SessionList
-status: ready-for-agent
+status: done
 labels: [core, sessions]
 depends_on: []
 ---
@@ -52,14 +52,14 @@ sidebar (T-10.2) presents; it renders nothing itself.
 
 # Acceptance criteria
 
-- [ ] `SessionList` supports create / close / switch with a stable, never-reused id
+- [x] `SessionList` supports create / close / switch with a stable, never-reused id
   and an always-valid active id while >=1 session exists; unit-tested.
-- [ ] Each session owns an independent PTY + `Term` + `BlockList`; a command in a
+- [x] Each session owns an independent PTY + `Term` + `BlockList`; a command in a
   background session advances that session's timeline without being drawn, and
   switching to it shows its accumulated blocks.
-- [ ] Per-session bounded backpressure holds (a flood in a background session
+- [x] Per-session bounded backpressure holds (a flood in a background session
   blocks only that session's reader, not the app); covered by a test.
-- [ ] No crate-boundary violation (ADR-0003); `mise run build && mise run test`
+- [x] No crate-boundary violation (ADR-0003); `mise run build && mise run test`
   pass.
 
 # Out of scope
@@ -67,3 +67,11 @@ sidebar (T-10.2) presents; it renders nothing itself.
 - The sidebar UI, the title-bar binding, and the `◧` toggle - [T-10.2](TICKET-10.2-sessions-sidebar-ui.md).
 - Keybindings (`⌘T`, switch, close) and focus routing - [T-10.3](TICKET-10.3-session-keybindings.md).
 - The window-frame/title-bar chrome shell itself - [T-9.2](../EPIC-9-vision-mock-reskin/TICKET-9.2-window-frame-titlebar.md).
+
+# Notes
+
+2026-07-17 (agent): `SessionList` is the lifecycle seam in `aterm-core`; the app now
+reads and routes through its active session. Each live session owns one PTY reader and
+one model thread, so `N` sessions have `2N` terminal threads plus the single render
+thread and one lifecycle-reaper thread. Creation/keybinding UI remains with
+T-10.2/T-10.3.

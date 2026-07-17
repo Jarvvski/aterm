@@ -1,5 +1,6 @@
 //! The terminal session: the thin "wire" layer between the headless engine and
-//! the UI. It owns the [`aterm_core::Engine`] (the three-thread reader/model
+//! the UI. It owns the [`aterm_core::SessionList`] whose sessions each contain an
+//! [`aterm_core::Engine`] (the three-thread reader/model
 //! pipeline) and the pure [`InputModel`] reducer, and implements
 //! [`aterm_ui::UiCallbacks`] so the UI event loop pulls the latest snapshot each
 //! frame and pushes keystrokes here, which route to the engine in Shell mode.
@@ -20,7 +21,7 @@ use std::time::{Instant, SystemTime};
 use aterm_agent::{AutonomyMode, AutonomyState, Secrets};
 use aterm_core::{
     keys, AgentBlock, AgentBlockKind, BlockList, Engine, IntegrationStatus, PtyDimensions,
-    Snapshot, DEFAULT_SCROLLBACK,
+    SessionList, Snapshot, DEFAULT_SCROLLBACK,
 };
 use aterm_ui::{
     ApprovalView, HitTarget, ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker,
@@ -36,28 +37,18 @@ use crate::agent_runtime::{AgentRuntime, PendingApproval, TurnHandle};
 use crate::config::Config;
 use crate::routing::{classify, decide, keystroke_for, Disposition, KeyBinding, RoutingContext};
 
-/// One terminal session.
-///
-/// **Field order is load-bearing for clean shutdown (ticket T-5.11).** Rust drops
-/// struct fields in declaration order, so `agent` (the tokio runtime) and `turn` are
-/// declared BEFORE `engine`: an in-flight turn's tokio task owns an
-/// [`aterm_core::AgentInjector`] - a clone of the engine's model-mailbox sender - and
-/// while that clone is alive the model thread never sees its mailbox disconnect, so
-/// [`Engine`]'s drop (which joins the model thread) would hang. Dropping the runtime
-/// FIRST cancels that task and releases the injector, so the subsequent `engine` drop
-/// observes the disconnect and joins cleanly (preserving aterm-core's zero-hang
-/// shutdown invariant). Do NOT move `engine` above `agent`/`turn`.
-pub struct Session {
+/// Application-level host for all terminal sessions, agent state, and UI callbacks.
+pub struct TerminalHost {
     /// The off-render-thread agent-turn runtime (ticket T-5.11): owns the tokio
     /// executor plus the workspace root and the single [`Secrets`] source a turn is
-    /// gated and sandboxed against. Declared first so it (and its injector-holding
-    /// tasks) drop BEFORE `engine` - see the struct-level note.
+    /// gated and sandboxed against.
     agent: AgentRuntime,
     /// The in-flight agent turn, if one is running (ticket T-5.11). `Some` while a turn
     /// streams its steps into the timeline; the handle bridges the keyboard to the
     /// loop's approval/cancel seam and tells the router whether Esc should interrupt.
     turn: Option<TurnHandle>,
-    engine: Engine,
+    /// Every live terminal engine, with exactly one active render/input target.
+    sessions: SessionList,
     input: InputModel,
     window: Option<Arc<Window>>,
     /// The configured mode-toggle hotkey (ticket T-3.3), consulted by
@@ -195,7 +186,7 @@ fn ui_autonomy(mode: aterm_agent::AutonomyMode) -> aterm_ui::AutonomyMode {
     }
 }
 
-impl Session {
+impl TerminalHost {
     /// Spawn a login shell over the three-thread engine and build the session with
     /// the configured hotkeys and the baseline autonomy posture. A fresh session
     /// always starts at `cfg.default_autonomy` (the AUTO-SAFE baseline), so a prior
@@ -208,6 +199,8 @@ impl Session {
             pixel_height: 0,
         };
         let engine = Engine::spawn_login_shell(dims, DEFAULT_SCROLLBACK)?;
+        let mut sessions = SessionList::new();
+        sessions.create(engine);
         // The agent works in - and confines its writes to - the current working
         // directory; the single Secrets deny-set feeds the gate, the sandbox, and the
         // sanitizer alike (ticket T-5.11; key custody is T-8.3, out of scope).
@@ -221,7 +214,7 @@ impl Session {
         let secrets = Secrets::new();
         let agent = AgentRuntime::new(root, secrets.clone()).map_err(aterm_core::PtyError::Io)?;
         Ok(Self {
-            engine,
+            sessions,
             input: InputModel::new(),
             window: None,
             toggle_key: cfg.toggle_mode,
@@ -250,7 +243,16 @@ impl Session {
 
     /// Number of command blocks segmented so far (used by tests / status line).
     pub fn block_count(&self) -> usize {
-        self.engine.block_count()
+        self.engine().block_count()
+    }
+
+    /// The active terminal engine. A live app session is constructed with one engine,
+    /// and [`SessionList`] preserves a valid active selection while non-empty.
+    fn engine(&self) -> &Engine {
+        self.sessions
+            .active()
+            .expect("app session always owns an active terminal session")
+            .engine()
     }
 
     /// Flip the toggle-sidebar INTENT (ticket T-9.2) and return the new state. The
@@ -326,7 +328,7 @@ impl Session {
     /// writes them straight back to the PTY on the model thread; ticket T-1.9.)
     fn drain_terminal_events(&mut self) {
         use aterm_core::TerminalEvent;
-        while let Ok(event) = self.engine.terminal_events().try_recv() {
+        while let Ok(event) = self.engine().terminal_events().try_recv() {
             match event {
                 TerminalEvent::Title(title) => log::debug!("title: {title}"),
                 TerminalEvent::Bell => log::debug!("bell"),
@@ -343,16 +345,16 @@ impl Session {
     /// live.
     fn routing_context(&mut self) -> RoutingContext {
         let degraded = matches!(
-            self.engine.integration_status().status,
+            self.engine().integration_status().status,
             IntegrationStatus::None
         );
-        let alt_screen = self.engine.latest_snapshot().alt_screen;
+        let alt_screen = self.engine().latest_snapshot().alt_screen;
         RoutingContext {
             mode: self.input.mode(),
             preedit_active: self.input.preedit().is_some(),
             degraded,
             alt_screen,
-            foreground_reading_stdin: self.engine.foreground_is_foreign(),
+            foreground_reading_stdin: self.engine().foreground_is_foreign(),
             agent_turn_active: self.turn.as_ref().is_some_and(TurnHandle::is_active),
         }
     }
@@ -543,7 +545,7 @@ impl Session {
     ///
     /// [`Approval`]: aterm_core::AgentBlockKind::Approval
     fn inject_approval(&self, text: &str, is_error: bool) {
-        if let Some(injector) = self.engine.agent_injector() {
+        if let Some(injector) = self.engine().agent_injector() {
             injector.push_block(
                 AgentBlock::new(AgentBlockKind::Approval, text.to_string(), Instant::now())
                     .with_error(is_error),
@@ -674,7 +676,7 @@ impl Session {
 }
 
 /// The three ways a parked risk-gate approval resolves (ticket T-9.7), each driving the
-/// existing T-5.11 approval + autonomy path via [`Session::resolve_gate`].
+/// existing T-5.11 approval + autonomy path via [`TerminalHost::resolve_gate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateAction {
     /// Approve this call only; the autonomy posture is unchanged.
@@ -687,7 +689,7 @@ enum GateAction {
 }
 
 /// What a keystroke does to the risk-gate approval card (ticket T-9.7) - the PURE mapping
-/// behind [`Session::handle_gate_key`], so the whole gate keyboard contract is unit-tested
+/// behind [`TerminalHost::handle_gate_key`], so the whole gate keyboard contract is unit-tested
 /// with no PTY / turn / window. `menu_open` selects the two sub-maps: with the split-Approve
 /// dropdown closed the two primary actions + the open affordance apply; with it open the
 /// keys navigate / select / close it.
@@ -753,7 +755,7 @@ fn gate_key_intent(key: &KeyPress<'_>, menu_open: bool) -> GateKeyIntent {
     }
 }
 
-/// The result of applying one editing key ([`Session::apply_edit_key`]).
+/// The result of applying one editing key ([`TerminalHost::apply_edit_key`]).
 #[derive(Debug, Clone, Copy)]
 struct EditOutcome {
     /// A backspace actually removed a character (gates the Shell-echo DEL).
@@ -793,17 +795,11 @@ fn edit_is_immediate(named: Option<NamedKey>, text: Option<&str>) -> bool {
     ) || (named.is_none() && text.is_some_and(|t| t.chars().count() > 1))
 }
 
-impl Drop for Session {
+impl Drop for TerminalHost {
     fn drop(&mut self) {
-        // Tear the agent turn down BEFORE the engine's model thread is joined (ticket
-        // T-5.11). A live turn's tokio task holds an `AgentInjector` - a clone of the
-        // engine's model-mailbox sender - and while it is alive `Engine::drop`'s
-        // `model.join()` would wait forever on a mailbox disconnect that can never
-        // come, hanging the winit thread. Cancel the turn (fail-closed denies any
-        // parked approval and unblocks the loop), then shut the runtime down (bounded),
-        // which drops the task and releases the injector. The subsequent field-drop of
-        // `engine` then observes the disconnect and joins cleanly. (Field order -
-        // `agent`/`turn` before `engine` - is a backstop; this is the explicit teardown.)
+        // Stop the agent turn before terminal teardown so a parked approval fails closed
+        // and no task keeps trying to append to a timeline that is being closed. Engine
+        // shutdown itself is explicit and does not depend on injector clone lifetimes.
         if let Some(turn) = self.turn.take() {
             turn.cancel();
         }
@@ -811,7 +807,7 @@ impl Drop for Session {
     }
 }
 
-impl UiCallbacks for Session {
+impl UiCallbacks for TerminalHost {
     fn on_ready(&mut self, window: Arc<Window>) {
         self.window = Some(window);
     }
@@ -820,7 +816,7 @@ impl UiCallbacks for Session {
         // Cheap: an Arc clone under a short lock, then a field read. The pacing
         // loop calls this every wake to detect new output before deciding whether
         // to pay for the full grid clone in `snapshot`.
-        self.engine.latest_snapshot().version
+        self.engine().latest_snapshot().version
     }
 
     fn snapshot(&mut self) -> Option<Arc<Snapshot>> {
@@ -829,7 +825,7 @@ impl UiCallbacks for Session {
         // renderer the latest published snapshot as a cheap `Arc` clone (a refcount
         // bump under a short lock) - NO per-frame deep copy of the grid. This is
         // the consumer side of the engine's zero-alloc publish (ticket T-1.5 AC5).
-        Some(self.engine.latest_snapshot())
+        Some(self.engine().latest_snapshot())
     }
 
     fn blocks(&mut self) -> Option<Arc<BlockList>> {
@@ -837,18 +833,18 @@ impl UiCallbacks for Session {
         // publishes the block list, here handed to the renderer as a cheap `Arc`
         // clone (a refcount bump under a short lock - NO per-frame deep copy), the
         // consumer side of the model thread's block publish.
-        Some(self.engine.latest_blocks())
+        Some(self.engine().latest_blocks())
     }
 
     fn integration_status(&mut self) -> aterm_core::Integration {
         // The live three-state shell-integration indicator (ticket T-2.6): a cheap
         // atomic load the engine's model thread keeps current. The renderer maps it
         // to a glyph + "why?" tooltip.
-        self.engine.integration_status()
+        self.engine().integration_status()
     }
 
     fn input(&self) -> Option<&InputModel> {
-        // The unified-input box (ticket T-3.6) reads the live buffer this Session owns
+        // The unified-input box (ticket T-3.6) reads the live buffer this host owns
         // and drives in `on_key` (the reducer mutations + the mode toggle). Borrowed, not
         // cloned - the renderer only reads it; this finally makes the in-progress line
         // (and, in Agent mode, the previously feedback-less prompt) visible on screen.
@@ -1054,7 +1050,7 @@ impl UiCallbacks for Session {
                         // when Opt-Enter fired it from Shell mode) so ghost text can suggest
                         // it later (tickets T-3.7 / T-3.5).
                         self.record_history(&line, InputMode::Agent);
-                        if let Some(injector) = self.engine.agent_injector() {
+                        if let Some(injector) = self.engine().agent_injector() {
                             let policy = self.autonomy.policy();
                             log::info!("agent submit ({}): {line}", self.autonomy.mode().label());
                             self.turn = Some(self.agent.start_turn(line, policy, injector));
@@ -1079,7 +1075,7 @@ impl UiCallbacks for Session {
             // (legacy / DECCKM / Kitty) with the T-3.4 encoder, reading the live
             // key-mode flags off the snapshot.
             Disposition::PassthroughToPty => {
-                let snap = self.engine.latest_snapshot();
+                let snap = self.engine().latest_snapshot();
                 let flags = keys::KeyEncodeFlags {
                     app_cursor: snap.app_cursor,
                     disambiguate: snap.disambiguate,
@@ -1117,7 +1113,7 @@ impl UiCallbacks for Session {
 
         // Mirror to the PTY and surface the bytes so a headless host can observe them.
         if let Some(b) = &bytes {
-            self.engine.send_input(b.clone());
+            self.engine().send_input(b.clone());
         }
         bytes
     }
@@ -1194,7 +1190,7 @@ impl UiCallbacks for Session {
         // change, so a steady tick allocates nothing (an `Arc<str>` refcount bump + a
         // compare) and the title bar's own damage signature sees a new string exactly
         // when `cd` lands.
-        let live = self.engine.current_cwd();
+        let live = self.engine().current_cwd();
         if live.is_some() && live != self.cwd_raw {
             if let Some(path) = &live {
                 self.cwd_display = abbreviate_home(std::path::Path::new(path.as_ref()));
@@ -1206,7 +1202,7 @@ impl UiCallbacks for Session {
     fn on_resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) {
         // Pixel dims are advisory (TIOCSWINSZ ws_xpixel/ypixel); clamp rather than
         // silently wrap if a surface somehow exceeds u16.
-        self.engine.resize(
+        self.engine().resize(
             rows,
             cols,
             u16::try_from(width).unwrap_or(u16::MAX),
@@ -1219,7 +1215,7 @@ impl UiCallbacks for Session {
 mod tests {
     use super::*;
 
-    // The Session-layer IME semantics (ticket T-3.2), tested on a bare `InputModel`
+    // The host-layer IME semantics (ticket T-3.2), tested on a bare `InputModel`
     // through the pure `apply_ime` boundary - no PTY/engine/window needed. The routing
     // gate (`preedit_active` -> Enter never submits) is covered in `routing.rs`
     // (`ime_composition_owns_enter_and_never_submits`); the core mutators in `input.rs`.
@@ -1477,7 +1473,7 @@ mod tests {
     // --- T-9.8 pointer click == keyboard intent ------------------------------
     //
     // A completed click drives the SAME intent as its keyboard equivalent. These spawn a
-    // real Session (PTY + agent runtime), so they are macOS-gated like the other PTY tests
+    // real TerminalHost (PTY + agent runtime), so they are macOS-gated like the other PTY tests
     // and skip gracefully if a login shell cannot spawn (a constrained sandbox), never
     // failing spuriously.
 
@@ -1499,7 +1495,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn clicking_the_sidebar_glyph_matches_cmd_b() {
-        let Ok(mut s) = Session::spawn(&Config::default()) else {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
             eprintln!("no login shell; skipping");
             return;
         };
@@ -1515,7 +1511,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn clicking_the_mode_chip_matches_cmd_slash_and_preserves_text() {
-        let Ok(mut s) = Session::spawn(&Config::default()) else {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
             eprintln!("no login shell; skipping");
             return;
         };
@@ -1546,7 +1542,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn clicking_a_completion_row_selects_and_accepts_it() {
-        let Ok(mut s) = Session::spawn(&Config::default()) else {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
             eprintln!("no login shell; skipping");
             return;
         };
@@ -1582,5 +1578,67 @@ mod tests {
             "the clicked row fills the line"
         );
         assert!(!s.completion.is_open(), "accepting closes the popover");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn render_callbacks_follow_the_active_core_session() {
+        let Ok(mut app) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        let original = app
+            .sessions
+            .active()
+            .expect("spawn creates the first session")
+            .id();
+        let second_engine = Engine::spawn_command(
+            "/bin/cat",
+            &[],
+            PtyDimensions {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            DEFAULT_SCROLLBACK,
+        )
+        .expect("second PTY should spawn");
+        let second = app.sessions.create(second_engine);
+        app.engine().send_input(b"second-session-marker\n".to_vec());
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let saw_second = loop {
+            let text: String = app
+                .snapshot()
+                .expect("active snapshot")
+                .cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect();
+            if text.contains("second-session-marker") {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(saw_second, "render callback never exposed the active PTY");
+        assert_eq!(
+            app.sessions.active().map(|session| session.id()),
+            Some(second)
+        );
+        assert!(app.sessions.set_active(original));
+        assert!(
+            !app.snapshot()
+                .expect("original snapshot")
+                .cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("second-session-marker"),
+            "switching changes the render source rather than merging session grids"
+        );
     }
 }

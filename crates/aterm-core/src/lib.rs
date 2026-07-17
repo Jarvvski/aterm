@@ -17,6 +17,7 @@ pub mod integration;
 pub mod keys;
 pub mod osc;
 pub mod pty;
+pub mod session;
 pub mod shell_integration;
 pub mod terminal;
 
@@ -38,6 +39,7 @@ pub use input::{
 pub use integration::{Integration, IntegrationMonitor, IntegrationReason, IntegrationStatus};
 pub use osc::{Mark, OscScanner, PromptKind, ScanResult};
 pub use pty::{Pty, PtyDimensions, PtyError, PtyEvent, Signal};
+pub use session::{Session, SessionId, SessionList};
 pub use shell_integration::{IntegrationDir, ShellKind, ShimNonce};
 pub use terminal::{
     CellColor, CursorPos, Damage, LineDamage, Snapshot, SnapshotCell, Terminal, TerminalEvent,

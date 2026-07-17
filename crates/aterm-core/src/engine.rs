@@ -37,12 +37,12 @@
 //! the timed coalescing tick + zero-allocation buffer reuse are ticket T-1.4
 //! ("output coalescing + grid snapshot publication").
 //!
-//! **Shutdown.** Dropping the [`Engine`] drops the mailbox sender; the model
-//! thread observes the disconnect, breaks its loop, and drops its [`Pty`] - which
-//! kill+reaps the child and closes the master fd, unblocking the reader's blocking
-//! `read()`. [`Engine`]'s `Drop` then joins both threads. The reverse direction
-//! (child exits first) flows the same way: EOF → reader sends `Exited` → model
-//! breaks. Either way no thread is left detached and there is no hang.
+//! **Shutdown.** Dropping the [`Engine`] sends an explicit shutdown message; the
+//! model thread breaks its loop and drops its [`Pty`] - which kill+reaps the child
+//! and closes the master fd, unblocking the reader's blocking `read()`. [`Engine`]'s
+//! `Drop` then joins both threads. Auxiliary sender clones cannot keep it alive.
+//! The reverse direction (child exits first) flows the same way: EOF → reader
+//! sends `Exited` → model breaks. Either way no thread is left detached or hung.
 
 use std::io;
 use std::io::{Read, Write};
@@ -70,7 +70,7 @@ const READ_BUF_BYTES: usize = 65_536;
 /// backpressure: at most `READER_QUEUE_DEPTH * READ_BUF_BYTES` (~1 MiB) bytes can
 /// be in flight before the reader blocks and the kernel PTY buffer takes over.
 /// A starting heuristic; the coalescing tick (T-1.4) may revisit it.
-const READER_QUEUE_DEPTH: usize = 16;
+pub(crate) const READER_QUEUE_DEPTH: usize = 16;
 
 /// Coalescing window (ticket T-1.4). The model parses PTY bytes *continuously*
 /// for correctness but publishes a snapshot at most once per window, so a megabyte
@@ -118,6 +118,9 @@ pub struct EngineMetrics {
 /// when they have a consumer.
 #[derive(Debug)]
 pub enum ToModel {
+    /// Stop the model thread and tear down its PTY. Sent by [`Engine::drop`] so
+    /// auxiliary mailbox sender clones cannot defer shutdown.
+    Shutdown,
     /// The window resized; reflow the grid and the PTY to `rows` x `cols`.
     Resize {
         rows: u16,
@@ -146,14 +149,9 @@ pub enum ToModel {
 /// of the model mailbox sender; a send after the model thread has stopped is a silent
 /// no-op. Obtained via [`Engine::agent_injector`].
 ///
-/// **Shutdown contract (important).** This is a *clone* of the mailbox sender the
-/// [`Engine`] otherwise owns solely, and the model thread's clean-shutdown path relies
-/// on that mailbox disconnecting (all senders dropped) - see this module's docs and
-/// [`Engine`]'s `Drop`. An `AgentInjector` that OUTLIVES its [`Engine`] keeps the
-/// mailbox connected and would make [`Engine`]'s `Drop` (which joins the model thread)
-/// hang. Callers MUST drop every `AgentInjector` - e.g. by tearing down the runtime
-/// that owns the streaming task - BEFORE the `Engine` is dropped. (The app shuts its
-/// agent runtime down ahead of the engine at session teardown for exactly this reason.)
+/// A clone may outlive its [`Engine`]. Sends after engine shutdown are silent no-ops;
+/// an explicit shutdown message, rather than mailbox disconnection, terminates the
+/// model thread.
 #[derive(Clone)]
 pub struct AgentInjector {
     tx: Sender<ToModel>,
@@ -176,7 +174,7 @@ impl AgentInjector {
 /// A running terminal engine: the reader + model threads and the handles the app
 /// uses to drive them. Owned by the main thread. Drop tears it down cleanly.
 pub struct Engine {
-    /// `Option` so `Drop` can drop the sender (signalling shutdown) before join.
+    /// `Option` so `Drop` can take the sender, request shutdown, and then join.
     to_model: Option<Sender<ToModel>>,
     /// The model thread publishes here; consumers read the latest snapshot.
     latest: Arc<Mutex<Arc<Snapshot>>>,
@@ -767,9 +765,11 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // 1. Drop the mailbox sender so the model thread's `select!` sees the
-        //    disconnect and breaks out of its loop.
-        self.to_model.take();
+        // 1. Explicitly stop the model thread. AgentInjector clones may still hold
+        //    mailbox senders, so sender disconnection is not a safe lifecycle signal.
+        if let Some(tx) = self.to_model.take() {
+            let _ = tx.send(ToModel::Shutdown);
+        }
         // 2. Join the model thread. On exit it drops its `Pty`, which kill+reaps
         //    the child and closes the master fd, unblocking the reader's read().
         if let Some(h) = self.model.take() {
@@ -1242,10 +1242,12 @@ impl Model {
         self.blocks_touched = false;
     }
 
-    /// Apply a control message. Returns `true` if it warrants a republish (a
-    /// resize reflows the grid; input does not - its echo returns as PTY output).
-    fn handle_mailbox(&mut self, msg: ToModel) -> bool {
+    /// Apply a control message. Returns `(shutdown, dirtied)`: shutdown is explicit,
+    /// while dirtied means a republish is warranted (a resize reflows the grid;
+    /// input does not - its echo returns as PTY output).
+    fn handle_mailbox(&mut self, msg: ToModel) -> (bool, bool) {
         match msg {
+            ToModel::Shutdown => (true, false),
             ToModel::Resize {
                 rows,
                 cols,
@@ -1264,7 +1266,7 @@ impl Model {
                     pixel_width,
                     pixel_height,
                 });
-                true
+                (false, true)
             }
             ToModel::Input(bytes) => {
                 if let Err(e) = self
@@ -1274,7 +1276,7 @@ impl Model {
                 {
                     log::warn!("pty write failed: {e}");
                 }
-                false
+                (false, false)
             }
             ToModel::PushAgentBlock(block) => {
                 // Append the agent step to the single timeline (ticket T-5.11) and mark
@@ -1282,7 +1284,7 @@ impl Model {
                 // Returns true so the publish window arms even with no PTY output.
                 self.blocks.push_agent(*block);
                 self.blocks_touched = true;
-                true
+                (false, true)
             }
             ToModel::AppendAgentText(delta) => {
                 // Extend the open (last) agent block in place - a point-update, no
@@ -1290,9 +1292,9 @@ impl Model {
                 // agent block was actually found to extend.
                 if self.blocks.append_last_agent_text(&delta) {
                     self.blocks_touched = true;
-                    true
+                    (false, true)
                 } else {
-                    false
+                    (false, false)
                 }
             }
         }
@@ -1300,14 +1302,20 @@ impl Model {
 
     /// Service all *immediately pending* control messages (rare and tiny), so a
     /// byte flood cannot starve resize/input. Returns `(shutdown, dirtied)`:
-    /// `shutdown` when the mailbox disconnected (the [`Engine`] was dropped), and
-    /// `dirtied` when a resize reflowed the grid so the caller should schedule a
-    /// coalesced publish (publication is the loop's job, not done here - T-1.4).
+    /// `shutdown` after an explicit request or mailbox disconnection, and `dirtied`
+    /// when a resize reflowed the grid so the caller should schedule a coalesced
+    /// publish (publication is the loop's job, not done here - T-1.4).
     fn drain_control(&mut self, mailbox: &Receiver<ToModel>) -> (bool, bool) {
         let mut dirtied = false;
         loop {
             match mailbox.try_recv() {
-                Ok(msg) => dirtied |= self.handle_mailbox(msg),
+                Ok(msg) => {
+                    let (shutdown, dirty) = self.handle_mailbox(msg);
+                    dirtied |= dirty;
+                    if shutdown {
+                        return (true, dirtied);
+                    }
+                }
                 Err(TryRecvError::Empty) => return (false, dirtied),
                 Err(TryRecvError::Disconnected) => return (true, dirtied),
             }
@@ -1374,7 +1382,10 @@ fn run_model(mut model: Model, byte_rx: &Receiver<PtyEvent>, mailbox: &Receiver<
         select! {
             recv(mailbox) -> msg => match msg {
                 Ok(m) => {
-                    let mut dirtied = model.handle_mailbox(m);
+                    let (shutdown, mut dirtied) = model.handle_mailbox(m);
+                    if shutdown {
+                        break;
+                    }
                     let (shutdown, more) = model.drain_control(mailbox);
                     dirtied |= more;
                     if shutdown {

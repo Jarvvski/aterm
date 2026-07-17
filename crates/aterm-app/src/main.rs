@@ -2,7 +2,7 @@
 //!
 //! Wires `aterm-core` (PTY/VT/blocks), `aterm-ui` (winit window + wgpu instanced
 //! grid renderer), and `aterm-agent` (input mode + safety spine). `main` loads config,
-//! spawns the login-shell PTY, and runs the UI event loop with a [`Session`] as
+//! spawns the login-shell PTY, and runs the UI event loop with a [`TerminalHost`] as
 //! the callback set so PTY bytes flow to the renderer and keystrokes flow to the
 //! shell.
 
@@ -13,7 +13,7 @@ mod routing;
 mod session;
 
 use config::Config;
-use session::Session;
+use session::TerminalHost;
 
 fn main() {
     // Logging: `RUST_LOG=info cargo run -p aterm-app`.
@@ -30,7 +30,7 @@ fn main() {
     );
 
     // Spawn the login shell over a PTY. If this fails we still want to know.
-    let session = match Session::spawn(&cfg) {
+    let host = match TerminalHost::spawn(&cfg) {
         Ok(s) => {
             log::info!("login shell PTY spawned ({} blocks)", s.block_count());
             s
@@ -46,7 +46,7 @@ fn main() {
     let render_config = aterm_ui::RenderConfig {
         display_link: cfg.display_link,
     };
-    if let Err(e) = aterm_ui::run_with(cfg.theme, session, render_config) {
+    if let Err(e) = aterm_ui::run_with(cfg.theme, host, render_config) {
         log::error!("event loop error: {e}");
         std::process::exit(1);
     }
