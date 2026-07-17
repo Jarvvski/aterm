@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aterm-core",
  "nix",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aterm-agent",
  "aterm-core",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aterm-core",
  "aterm-ui",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "crossbeam-channel",
@@ -250,11 +250,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-tokens"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "aterm-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aterm-core",
  "aterm-tokens",

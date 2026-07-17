@@ -584,6 +584,7 @@ impl InputWidgetRenderer {
             width,
             height,
             scale,
+            content_left,
         } = size;
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
@@ -604,7 +605,8 @@ impl InputWidgetRenderer {
         };
         let sig = (signature(&view, width, height, px_key, theme)
             .wrapping_mul(0x0000_0100_0000_01b3)
-            ^ autonomy_code.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            ^ autonomy_code.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from(content_left.to_bits()).wrapping_mul(0xc2b2_ae3d_27d4_eb4f))
         .wrapping_add(u64::from(chip_hovered).wrapping_mul(0xff51_afd7_ed55_8ccd));
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
@@ -614,7 +616,8 @@ impl InputWidgetRenderer {
         self.glyph_instances.clear();
 
         let (cw, ch) = cell_px(scale);
-        let inset = INSET_LOGICAL * scale;
+        let left_inset = content_left + INSET_LOGICAL * scale;
+        let right_inset = INSET_LOGICAL * scale;
         let canvas = theme.colors.bg_canvas;
         let metrics = atlas.cell_metrics(FontFamily::Grid, px);
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
@@ -637,12 +640,12 @@ impl InputWidgetRenderer {
         let zone_top = (height as f32 - zone_h).max(0.0);
         let hairline_h = (f32::from(space::HAIRLINE_WIDTH) * scale).round().max(1.0);
         let pad = f32::from(space::S4) * scale;
-        let content_w = (width as f32 - 2.0 * inset).max(0.0);
+        let content_w = (width as f32 - left_inset - right_inset).max(0.0);
         let first_row_y = zone_top + hairline_h + pad;
 
         // Top hairline separating the box from the timeline.
         self.bg_instances.push(RectInstance {
-            rect: [inset, zone_top.round(), content_w, hairline_h],
+            rect: [left_inset, zone_top.round(), content_w, hairline_h],
             color: theme.colors.hairline.to_linear_f32(),
         });
 
@@ -654,7 +657,7 @@ impl InputWidgetRenderer {
             atlas,
             queue,
             &prompt,
-            (inset, first_row_y),
+            (left_inset, first_row_y),
             &ctx,
             &mut self.bg_instances,
             &mut self.glyph_instances,
@@ -683,8 +686,8 @@ impl InputWidgetRenderer {
         }
         let slot_w = slot_w + 2.0 * pad_x;
         let chip_h = label_h + 2.0 * pad_y;
-        let chip_right = width as f32 - inset;
-        let chip_x = (chip_right - slot_w).max(inset);
+        let chip_right = width as f32 - right_inset;
+        let chip_x = (chip_right - slot_w).max(left_inset);
         let chip_y = first_row_y + (ch - chip_h) * 0.5;
 
         let chip = PromptChip::resolve(prompt_mode(view.mode), theme);
@@ -793,7 +796,7 @@ impl InputWidgetRenderer {
             let a_slot_w = a_slot_w + 2.0 * pad_x;
             let a_chip_h = a_label_h + 2.0 * pad_y;
             let gap = f32::from(space::S2) * scale;
-            let a_chip_x = (chip_x - gap - a_slot_w).max(inset);
+            let a_chip_x = (chip_x - gap - a_slot_w).max(left_inset);
             let a_chip_y = first_row_y + (ch - a_chip_h) * 0.5;
 
             let ac = AutonomyChip::resolve(mode, theme);
@@ -872,7 +875,7 @@ impl InputWidgetRenderer {
 
         // The editable region: from after the prompt glyph (one blank cell) to clear of
         // the chips. Clip the text to the columns that fit (clip-by-omission; no scissor).
-        let text_x = inset + 2.0 * cw;
+        let text_x = left_inset + 2.0 * cw;
         let text_right = (left_edge - cw).max(text_x);
         let visible_cols = (((text_right - text_x) / cw).floor() as i64).max(1) as u16;
         let laid = layout_cells(&view, theme, visible_cols);
@@ -1624,6 +1627,7 @@ mod gpu_tests {
                 width: w,
                 height: h,
                 scale: SCALE,
+                content_left: 0.0,
             },
         );
         let mut enc =
@@ -1821,6 +1825,39 @@ mod gpu_tests {
     }
 
     #[test]
+    fn input_box_respects_the_sidebar_content_inset() {
+        let Some((device, queue, format)) = device() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut input = InputWidgetRenderer::new(&device);
+        let theme = *Theme::for_kind(ThemeKind::Dark);
+        let model = model("echo", InputMode::Shell);
+        let sidebar_left = 210.0;
+        input.prepare(
+            &device,
+            &queue,
+            &mut atlas,
+            &model,
+            None,
+            None,
+            &theme,
+            FrameSize {
+                width: 640,
+                height: 180,
+                scale: SCALE,
+                content_left: sidebar_left,
+            },
+        );
+        let caret = input.caret_area_px().expect("input has a caret");
+        assert!(
+            caret[0] >= sidebar_left,
+            "the input content starts after the sidebar, got x={} for left={sidebar_left}",
+            caret[0]
+        );
+    }
+
+    #[test]
     fn unchanged_input_skips_rebuild_alloc_free() {
         let Some((device, queue, format)) = device() else {
             return;
@@ -1833,6 +1870,7 @@ mod gpu_tests {
             width: 320,
             height: 160,
             scale: SCALE,
+            content_left: 0.0,
         };
         iw.prepare(&device, &queue, &mut atlas, &m, None, None, &theme, size);
         let allocs = crate::alloc_probe::count_allocs(|| {

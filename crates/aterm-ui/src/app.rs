@@ -74,6 +74,30 @@ fn wheel_delta_rows(delta: MouseScrollDelta) -> i64 {
     }
 }
 
+/// Convert the full surface into the PTY grid owned by the main content area. Native
+/// title-bar chrome removes rows; the optional sessions panel removes columns.
+fn grid_dims_for_chrome(
+    width: u32,
+    height: u32,
+    scale: f32,
+    has_title_bar: bool,
+    has_sidebar: bool,
+) -> (u16, u16) {
+    let title = if has_title_bar {
+        crate::title_bar::title_bar_px(scale)
+    } else {
+        0.0
+    };
+    let sidebar = if has_sidebar {
+        crate::sidebar::SIDEBAR_LOGICAL_WIDTH * scale
+    } else {
+        0.0
+    };
+    let content_width = (width as f32 - sidebar).max(0.0).round() as u32;
+    let content_height = (height as f32 - title).max(0.0).round() as u32;
+    grid_dims(content_width, content_height, scale)
+}
+
 /// Keyboard modifier state at the time of a key press, in a renderer-neutral form
 /// so the host routes on plain bools rather than winit's `ModifiersState`. `cmd`
 /// is the macOS Command key (winit `SUPER`); `alt` is Option/Alt.
@@ -201,6 +225,13 @@ pub trait UiCallbacks {
     /// no title bar is drawn. Borrowed (not cloned) so it reads the host's live strings with
     /// no per-frame allocation, mirroring [`Self::input`]; the renderer only reads it.
     fn title_bar(&self) -> Option<crate::title_bar::TitleBarView<'_>> {
+        None
+    }
+
+    /// The open sessions sidebar for this frame, or `None` while the panel is closed.
+    /// The view borrows a retained projection so the render path never collects or clones
+    /// session rows per frame (ticket T-10.2).
+    fn sidebar(&self) -> Option<crate::sidebar::SidebarView<'_>> {
         None
     }
 
@@ -529,6 +560,7 @@ impl<C: UiCallbacks> AtermApp<C> {
                 input: self.callbacks.input(),
                 autonomy: self.callbacks.autonomy_mode(),
                 title_bar: self.callbacks.title_bar(),
+                sidebar: self.callbacks.sidebar(),
                 completion: self.callbacks.completion(),
                 show_help: self.callbacks.show_help(),
                 approval: self.callbacks.approval(),
@@ -587,6 +619,15 @@ impl<C: UiCallbacks> AtermApp<C> {
                 }
             }
         }
+    }
+
+    /// Recompute the host PTY geometry from the current chrome state. Called for real
+    /// surface resizes and whenever a click/key toggles the sessions panel.
+    fn notify_host_resize(&mut self, width: u32, height: u32, scale: f32) {
+        let has_title_bar = self.callbacks.title_bar().is_some();
+        let has_sidebar = self.callbacks.sidebar().is_some();
+        let (cols, rows) = grid_dims_for_chrome(width, height, scale, has_title_bar, has_sidebar);
+        self.callbacks.on_resize(cols, rows, width, height);
     }
 
     /// Apply a window control against the winit window / event loop: close exits, minimize
@@ -726,21 +767,7 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     .as_ref()
                     .map(|w| w.scale_factor() as f32)
                     .unwrap_or(1.0);
-                // Reserve the title-bar band out of the PTY grid (ticket T-9.9): the band
-                // is permanent chrome (the native buttons + the custom bar, drawn even in
-                // alt-screen), so the shell's rows are computed from the content BELOW it
-                // and a full-screen app never lays out under the immovable buttons. The
-                // grid fast-path draws with the matching top inset. Headless hosts (no
-                // title bar) keep the full surface.
-                let band = if self.callbacks.title_bar().is_some() {
-                    crate::title_bar::title_bar_px(scale)
-                } else {
-                    0.0
-                };
-                let grid_h = ((size.height as f32) - band).max(0.0).round() as u32;
-                let (cols, rows) = grid_dims(size.width, grid_h, scale);
-                self.callbacks
-                    .on_resize(cols, rows, size.width, size.height);
+                self.notify_host_resize(size.width, size.height, scale);
                 // A resize is activity: re-arm and repaint promptly.
                 self.scheduler.note_activity(Instant::now());
                 if let Some(w) = self.window.as_ref() {
@@ -855,7 +882,20 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                                 // Route the click to the host, which maps it onto the matching
                                 // keyboard intent (T-9.8). The native window buttons never get
                                 // here - AppKit handles them before our view sees the event.
+                                let sidebar_before = self.callbacks.sidebar().is_some();
                                 self.callbacks.on_click(t);
+                                let sidebar_changed =
+                                    sidebar_before != self.callbacks.sidebar().is_some();
+                                if sidebar_changed {
+                                    if let Some((width, height, scale)) =
+                                        self.window.as_ref().map(|w| {
+                                            let size = w.inner_size();
+                                            (size.width, size.height, w.scale_factor() as f32)
+                                        })
+                                    {
+                                        self.notify_host_resize(width, height, scale);
+                                    }
+                                }
                                 // A click is activity: re-arm + repaint so its effect shows.
                                 self.scheduler.note_activity(Instant::now());
                                 if let Some(w) = self.window.as_ref() {
@@ -925,6 +965,7 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                         return;
                     }
                 }
+                let sidebar_before = self.callbacks.sidebar().is_some();
                 if let Some(bytes) = self.callbacks.on_key(KeyPress {
                     named,
                     ch,
@@ -934,6 +975,15 @@ impl<C: UiCallbacks> ApplicationHandler for AtermApp<C> {
                     // Forwarding happens inside the callback (it owns the PTY);
                     // the returned bytes let a headless host observe input.
                     let _ = bytes;
+                }
+                let sidebar_changed = sidebar_before != self.callbacks.sidebar().is_some();
+                if sidebar_changed {
+                    if let Some((width, height, scale)) = self.window.as_ref().map(|w| {
+                        let size = w.inner_size();
+                        (size.width, size.height, w.scale_factor() as f32)
+                    }) {
+                        self.notify_host_resize(width, height, scale);
+                    }
                 }
                 // A keystroke is activity: re-arm keep-warm and repaint.
                 self.scheduler.note_activity(Instant::now());
@@ -1142,6 +1192,29 @@ mod tests {
         assert_eq!(
             theme_kind_from_winit(winit::window::Theme::Dark),
             ThemeKind::Dark
+        );
+    }
+
+    #[test]
+    fn sidebar_reduces_terminal_columns_without_changing_rows() {
+        let without_sidebar = grid_dims_for_chrome(960, 600, 1.0, true, false);
+        let with_sidebar = grid_dims_for_chrome(960, 600, 1.0, true, true);
+        assert!(
+            with_sidebar.0 < without_sidebar.0,
+            "the open panel removes its width from the PTY grid"
+        );
+        assert_eq!(
+            with_sidebar.1, without_sidebar.1,
+            "the sidebar changes columns only"
+        );
+        assert_eq!(
+            with_sidebar,
+            grid_dims(
+                (960.0 - crate::sidebar::SIDEBAR_LOGICAL_WIDTH) as u32,
+                (600.0 - crate::title_bar::TITLE_BAR_LOGICAL) as u32,
+                1.0,
+            ),
+            "the geometry subtracts the exact tokenized chrome extents"
         );
     }
 

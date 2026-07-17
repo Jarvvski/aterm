@@ -134,11 +134,15 @@ impl ApprovalRenderer {
             width,
             height,
             scale,
+            content_left,
         } = size;
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
 
-        let sig = signature(view, width, input_zone_top, px_key, theme);
+        let sig = fold_content_left(
+            signature(view, width, input_zone_top, px_key, theme),
+            content_left,
+        );
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
         }
@@ -147,7 +151,8 @@ impl ApprovalRenderer {
         self.glyph_instances.clear();
 
         let (cw, ch) = cell_px(scale);
-        let inset = INSET_LOGICAL * scale;
+        let left_inset = content_left + INSET_LOGICAL * scale;
+        let right_inset = INSET_LOGICAL * scale;
         let canvas = theme.colors.bg_canvas;
         let metrics = atlas.cell_metrics(FontFamily::Grid, px);
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
@@ -175,7 +180,7 @@ impl ApprovalRenderer {
         // so every wrapped/measured section is bounded and NOTHING is ever laid out past the
         // clamped panel - the whole card fits the window. `card_budget` is the narrower
         // interior of the caution box (its own `ipad` each side).
-        let max_w = (width as f32 - 2.0 * inset).max(cw);
+        let max_w = (width as f32 - left_inset - right_inset).max(cw);
         let ipad_cells = (ipad / cw).ceil() as usize;
         let budget_cells = (((max_w - 2.0 * pad) / cw).floor() as usize).max(8);
         let card_budget = budget_cells.saturating_sub(2 * ipad_cells).max(8);
@@ -266,7 +271,7 @@ impl ApprovalRenderer {
         let box_h = 2.0 * pad + command_rows as f32 * ch + gap + card_h + menu_h;
 
         // Anchor: bottom just above the input, grow upward (like the completion popover).
-        let box_left = inset;
+        let box_left = left_inset;
         let gap_above_input = gap + 2.0 * scale;
         let box_bottom = (input_zone_top - gap_above_input).max(box_h);
         let box_top = (box_bottom - box_h).max(0.0);
@@ -732,6 +737,10 @@ fn signature(view: &ApprovalView, w: u32, input_zone_top: f32, px_key: u32, them
     s
 }
 
+fn fold_content_left(base: u64, content_left: f32) -> u64 {
+    (base ^ u64::from(content_left.to_bits()).rotate_left(17)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +971,7 @@ mod gpu_tests {
                 width: w,
                 height: h,
                 scale: SCALE,
+                content_left: 0.0,
             },
         );
         let mut enc =
@@ -1110,6 +1120,7 @@ mod gpu_tests {
             width: 520,
             height: 340,
             scale: SCALE,
+            content_left: 0.0,
         };
         ar.prepare(&device, &queue, &mut atlas, &v, 300.0, &theme, size);
         let allocs = crate::alloc_probe::count_allocs(|| {
@@ -1119,6 +1130,42 @@ mod gpu_tests {
         assert_eq!(
             allocs, 0,
             "an unchanged parked frame's prepare early-out allocates nothing (got {allocs})"
+        );
+    }
+
+    #[test]
+    fn approval_card_respects_the_sidebar_content_inset() {
+        let Some((device, queue, format)) = device() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut approval = ApprovalRenderer::new(&device);
+        let theme = *Theme::for_kind(ThemeKind::Dark);
+        let view = pending(false);
+        let content_left = 210.0;
+        approval.prepare(
+            &device,
+            &queue,
+            &mut atlas,
+            &view,
+            300.0,
+            &theme,
+            FrameSize {
+                width: 720,
+                height: 380,
+                scale: SCALE,
+                content_left,
+            },
+        );
+        let first_rect_x = approval
+            .bg_instances
+            .iter()
+            .map(|rect| rect.rect[0])
+            .reduce(f32::min)
+            .expect("the approval card emitted backgrounds");
+        assert!(
+            first_rect_x >= content_left,
+            "approval geometry begins after the sidebar, got x={first_rect_x} for left={content_left}"
         );
     }
 }

@@ -36,6 +36,14 @@ pub enum HitTarget {
     /// The custom title bar's sidebar-toggle glyph - the pointer twin of `Cmd-B`
     /// ([`crate::title_bar`]).
     SidebarToggle,
+    /// The sessions sidebar's `+` affordance. T-10.3 maps it onto session creation.
+    SidebarAdd,
+    /// A sessions-sidebar row by stable display index. T-10.3 maps the index back onto
+    /// the current ordered `SessionList` and selects it.
+    SidebarSession(usize),
+    /// A hover-revealed close control by stable display index. Inserted after its row so
+    /// it wins the shared hit map's last-in-draw-order overlap rule.
+    SidebarClose(usize),
     /// The unified input box's mode PILL chip - the pointer twin of `Cmd-/`
     /// ([`crate::input_widget`]).
     ModeChip,

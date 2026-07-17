@@ -25,7 +25,7 @@ use aterm_core::{
 };
 use aterm_ui::{
     ApprovalView, HitTarget, ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker,
-    RiskState, TitleBarView, UiCallbacks, Window, DEFAULT_DEBOUNCE,
+    RiskState, SidebarItem, SidebarView, TitleBarView, UiCallbacks, Window, DEFAULT_DEBOUNCE,
 };
 
 use aterm_core::{
@@ -49,6 +49,9 @@ pub struct TerminalHost {
     turn: Option<TurnHandle>,
     /// Every live terminal engine, with exactly one active render/input target.
     sessions: SessionList,
+    /// Retained presentation projection of `sessions`, borrowed by the sidebar frame.
+    /// Lifecycle changes are rare; steady frames read this slice without collecting.
+    sidebar_items: Vec<SidebarItem>,
     input: InputModel,
     window: Option<Arc<Window>>,
     /// The configured mode-toggle hotkey (ticket T-3.3), consulted by
@@ -86,14 +89,15 @@ pub struct TerminalHost {
     /// today this bool is the intent the `◧` title-bar glyph / `Cmd-B` flips, which the
     /// panel will consume. Default `false` (ADR-0011: not shown by default on one session).
     sidebar_open: bool,
-    /// The active title shown centered in the custom title bar (ticket T-9.2). A
-    /// placeholder ("aterm") until EPIC-10 replaces it with the active session name.
-    title: String,
     /// The current working directory shown beside the title (home abbreviated to `~`).
     /// Seeded from the process cwd at spawn, then kept LIVE from the shell's OSC-7 cwd
     /// reports (polled off [`Engine::current_cwd`] each tick), so a `cd` shows in the
     /// title bar at the next prompt.
     cwd_display: String,
+    /// Process-cwd fallback used whenever the newly active session has not emitted OSC-7.
+    cwd_fallback: String,
+    /// Session whose `cwd_raw` / `cwd_display` cache is currently projected.
+    cwd_session: Option<aterm_core::SessionId>,
     /// The last raw cwd taken from [`Engine::current_cwd`], so the per-tick poll only
     /// re-abbreviates (and re-renders the bar via its damage signature) on an actual
     /// change. `None` until the shell's first OSC-7 report. `Arc<str>` end to end, so
@@ -201,6 +205,12 @@ impl TerminalHost {
         let engine = Engine::spawn_login_shell(dims, DEFAULT_SCROLLBACK)?;
         let mut sessions = SessionList::new();
         sessions.create(engine);
+        let sidebar_items = sessions
+            .iter()
+            .map(|session| {
+                SidebarItem::new(session.name(), session.engine().foreground_is_foreign())
+            })
+            .collect();
         // The agent works in - and confines its writes to - the current working
         // directory; the single Secrets deny-set feeds the gate, the sandbox, and the
         // sanitizer alike (ticket T-5.11; key custody is T-8.3, out of scope).
@@ -208,6 +218,8 @@ impl TerminalHost {
         // Capture the cwd display (home abbreviated to `~`) for the title bar BEFORE `root`
         // is moved into the agent runtime (which confines the agent's writes to it).
         let cwd_display = abbreviate_home(&root);
+        let cwd_fallback = cwd_display.clone();
+        let cwd_session = sessions.active().map(aterm_core::Session::id);
         // ONE Secrets deny-set feeds the gate, the sandbox, the sanitizer (in the agent
         // runtime) AND the approval-card projection here - cloned, so both hold the same
         // single source (ticket T-5.6 / T-9.7).
@@ -215,6 +227,7 @@ impl TerminalHost {
         let agent = AgentRuntime::new(root, secrets.clone()).map_err(aterm_core::PtyError::Io)?;
         Ok(Self {
             sessions,
+            sidebar_items,
             input: InputModel::new(),
             window: None,
             toggle_key: cfg.toggle_mode,
@@ -228,8 +241,9 @@ impl TerminalHost {
             widen_history: false,
             sidebar_key: cfg.toggle_sidebar,
             sidebar_open: false,
-            title: "aterm".to_string(),
             cwd_display,
+            cwd_fallback,
+            cwd_session,
             cwd_raw: None,
             completion: Completion::new(),
             show_help: false,
@@ -255,12 +269,39 @@ impl TerminalHost {
             .engine()
     }
 
+    /// Refresh the retained sidebar projection. The common path keeps the same rows and
+    /// mutates only activity booleans, so an open panel can track foreground work without
+    /// collecting or cloning per frame. Session lifecycle/name changes rebuild the small
+    /// vector only when its identity actually changes.
+    fn sync_sidebar_items(&mut self) {
+        let rebuild = self.sidebar_items.len() != self.sessions.iter().len()
+            || self
+                .sidebar_items
+                .iter()
+                .zip(self.sessions.iter())
+                .any(|(item, session)| item.name != session.name());
+        if rebuild {
+            self.sidebar_items.clear();
+            self.sidebar_items
+                .extend(self.sessions.iter().map(|session| {
+                    SidebarItem::new(session.name(), session.engine().foreground_is_foreign())
+                }));
+        } else {
+            for (item, session) in self.sidebar_items.iter_mut().zip(self.sessions.iter()) {
+                item.running = session.engine().foreground_is_foreign();
+            }
+        }
+    }
+
     /// Flip the toggle-sidebar INTENT (ticket T-9.2) and return the new state. The
     /// sessions sidebar panel is EPIC-10; today this is the intent path the `Cmd-B` hotkey
     /// drives (and that the `◧` title-bar glyph will drive once mouse hit-testing lands).
     /// EPIC-10 reads `sidebar_open` to show/hide the panel. Each call flips the bool.
     pub fn toggle_sidebar(&mut self) -> bool {
         self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open {
+            self.sync_sidebar_items();
+        }
         log::debug!(
             "sidebar -> {}",
             if self.sidebar_open { "open" } else { "closed" }
@@ -859,13 +900,26 @@ impl UiCallbacks for TerminalHost {
     }
 
     fn title_bar(&self) -> Option<TitleBarView<'_>> {
-        // The custom title bar (ticket T-9.2): the active title + cwd, drawn over the
-        // reserved top band. Borrowed (not cloned) - the renderer only reads it. EPIC-10
-        // replaces `title` with the active session name and makes the `◧` glyph toggle the
-        // sidebar panel this session's `sidebar_open` intent already tracks.
+        // The custom title bar (ticket T-10.2): active session name + cwd, borrowed from
+        // retained state so a session switch changes the bar without a frame allocation.
         Some(TitleBarView {
-            title: &self.title,
+            title: self.sessions.active()?.name(),
             cwd: &self.cwd_display,
+        })
+    }
+
+    fn sidebar(&self) -> Option<SidebarView<'_>> {
+        if !self.sidebar_open {
+            return None;
+        }
+        let active_id = self.sessions.active()?.id();
+        let active = self
+            .sessions
+            .iter()
+            .position(|session| session.id() == active_id)?;
+        Some(SidebarView {
+            items: &self.sidebar_items,
+            active,
         })
     }
 
@@ -1128,6 +1182,15 @@ impl UiCallbacks for TerminalHost {
             HitTarget::SidebarToggle => {
                 self.toggle_sidebar();
             }
+            // T-10.2 establishes the typed sidebar intents. T-10.3 owns applying them to
+            // `SessionList` together with keybindings and per-session focus state.
+            HitTarget::SidebarAdd => log::debug!("new-session intent"),
+            HitTarget::SidebarSession(index) => {
+                log::debug!("select-session intent: {index}");
+            }
+            HitTarget::SidebarClose(index) => {
+                log::debug!("close-session intent: {index}");
+            }
             // The mode pill == `Cmd-/`.
             HitTarget::ModeChip => {
                 self.toggle_mode();
@@ -1185,11 +1248,24 @@ impl UiCallbacks for TerminalHost {
         // expensive projection runs once on the park transition, then the card is only
         // borrowed each frame (a parked frame allocates nothing).
         self.refresh_pending_card();
+        if self.sidebar_open {
+            self.sync_sidebar_items();
+        }
         // Keep the title-bar cwd live: the shell reports its cwd via OSC-7 at every
         // prompt (the shim), published by the engine. Re-abbreviate only on an actual
         // change, so a steady tick allocates nothing (an `Arc<str>` refcount bump + a
         // compare) and the title bar's own damage signature sees a new string exactly
         // when `cd` lands.
+        let active_id = self
+            .sessions
+            .active()
+            .expect("app session always owns an active terminal session")
+            .id();
+        if self.cwd_session != Some(active_id) {
+            self.cwd_session = Some(active_id);
+            self.cwd_raw = None;
+            self.cwd_display.clone_from(&self.cwd_fallback);
+        }
         let live = self.engine().current_cwd();
         if live.is_some() && live != self.cwd_raw {
             if let Some(path) = &live {
@@ -1500,12 +1576,23 @@ mod tests {
             return;
         };
         assert!(!s.sidebar_open, "sidebar starts closed");
+        assert!(
+            s.sidebar().is_none(),
+            "a closed sidebar exposes no frame view"
+        );
         // The pointer click flips the intent...
         s.on_click(HitTarget::SidebarToggle);
         assert!(s.sidebar_open, "a sidebar-glyph click opens it (== Cmd-B)");
+        let view = s.sidebar().expect("an open sidebar exposes its frame view");
+        assert_eq!(view.items.len(), 1, "spawn projects the live session");
+        assert_eq!(view.active, 0, "the only live session is active");
         // ...and the Cmd-B chord flips it back the same way.
         s.on_key(cmd_char('b'));
         assert!(!s.sidebar_open, "Cmd-B toggles it, identical to the click");
+        assert!(
+            s.sidebar().is_none(),
+            "closing removes the frame view again"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1592,6 +1679,17 @@ mod tests {
             .active()
             .expect("spawn creates the first session")
             .id();
+        let original_name = app
+            .sessions
+            .active()
+            .expect("spawn creates the first session")
+            .name()
+            .to_string();
+        assert_eq!(
+            app.title_bar().expect("title bar").title,
+            original_name,
+            "the title starts with the active session name"
+        );
         let second_engine = Engine::spawn_command(
             "/bin/cat",
             &[],
@@ -1604,7 +1702,29 @@ mod tests {
             DEFAULT_SCROLLBACK,
         )
         .expect("second PTY should spawn");
+        app.cwd_display = "~/from-first-session".to_string();
+        app.cwd_raw = Some(std::sync::Arc::from("/tmp/from-first-session"));
         let second = app.sessions.create(second_engine);
+        app.tick();
+        assert_eq!(
+            app.title_bar().expect("title bar").cwd,
+            abbreviate_home(&std::env::current_dir().expect("process cwd")),
+            "a newly active session without OSC-7 falls back instead of inheriting cwd"
+        );
+        app.toggle_sidebar();
+        let sidebar = app.sidebar().expect("sidebar is open");
+        assert_eq!(
+            sidebar.items.len(),
+            2,
+            "opening projects every live session without a per-frame collect"
+        );
+        assert_eq!(sidebar.active, 1, "the newly created session is active");
+        assert_eq!(sidebar.items[1].name, "terminal");
+        assert_eq!(
+            app.title_bar().expect("title bar").title,
+            "terminal",
+            "creating and activating a session updates the title"
+        );
         app.engine().send_input(b"second-session-marker\n".to_vec());
 
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -1630,6 +1750,11 @@ mod tests {
             Some(second)
         );
         assert!(app.sessions.set_active(original));
+        assert_eq!(
+            app.title_bar().expect("title bar").title,
+            original_name,
+            "switching back updates the title to the selected session"
+        );
         assert!(
             !app.snapshot()
                 .expect("original snapshot")

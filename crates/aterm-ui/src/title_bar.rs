@@ -152,6 +152,7 @@ impl TitleBarRenderer {
             width,
             height: _,
             scale,
+            content_left: _,
         } = size;
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
@@ -584,6 +585,7 @@ mod gpu_tests {
                 width: w,
                 height: h,
                 scale: SCALE,
+                content_left: 0.0,
             },
         );
         let mut enc =
@@ -785,6 +787,7 @@ mod gpu_tests {
             width: 480,
             height: 120,
             scale: SCALE,
+            content_left: 0.0,
         };
         tb.prepare(&device, &queue, &mut atlas, &view, None, &theme, size);
         let allocs = crate::alloc_probe::count_allocs(|| {

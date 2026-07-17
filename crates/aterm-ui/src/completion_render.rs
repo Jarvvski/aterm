@@ -109,6 +109,7 @@ impl CompletionRenderer {
             width,
             height: _,
             scale,
+            content_left,
         } = size;
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
@@ -120,9 +121,12 @@ impl CompletionRenderer {
             Some(HitTarget::CompletionRow(i)) => Some(i),
             _ => None,
         };
-        let sig = fold_hover(
-            signature(completion, width, input_zone_top, px_key, theme),
-            hovered_row,
+        let sig = fold_content_left(
+            fold_hover(
+                signature(completion, width, input_zone_top, px_key, theme),
+                hovered_row,
+            ),
+            content_left,
         );
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
@@ -140,7 +144,7 @@ impl CompletionRenderer {
         }
 
         let (cw, ch) = cell_px(scale);
-        let inset = INSET_LOGICAL * scale;
+        let inset = content_left + INSET_LOGICAL * scale;
         let canvas = theme.colors.bg_canvas;
         let metrics = atlas.cell_metrics(FontFamily::Grid, px);
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
@@ -366,6 +370,10 @@ fn fold_hover(base: u64, hovered_row: Option<usize>) -> u64 {
         Some(i) => (i as u64).wrapping_add(1),
     };
     (base ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+fn fold_content_left(base: u64, content_left: f32) -> u64 {
+    (base ^ u64::from(content_left.to_bits()).rotate_left(17)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 fn signature(
@@ -595,6 +603,7 @@ mod gpu_tests {
                 width: w,
                 height: h,
                 scale: SCALE,
+                content_left: 0.0,
             },
         );
         let mut enc =
@@ -757,6 +766,7 @@ mod gpu_tests {
                 width: 420,
                 height: 260,
                 scale: SCALE,
+                content_left: 0.0,
             },
         );
         assert!(!drew, "a closed completion draws nothing");
@@ -794,6 +804,7 @@ mod gpu_tests {
             width: 420,
             height: 260,
             scale: SCALE,
+            content_left: 0.0,
         };
         cr.prepare(&device, &queue, &mut atlas, &c, None, 220.0, &theme, size);
         let allocs = crate::alloc_probe::count_allocs(|| {
@@ -803,6 +814,42 @@ mod gpu_tests {
         assert_eq!(
             allocs, 0,
             "an unchanged popover frame's prepare early-out allocates nothing (got {allocs})"
+        );
+    }
+
+    #[test]
+    fn completion_popover_respects_the_sidebar_content_inset() {
+        let Some((device, queue, format)) = device() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut completion = CompletionRenderer::new(&device);
+        let theme = *Theme::for_kind(ThemeKind::Dark);
+        let model = cmpl();
+        let content_left = 210.0;
+        completion.prepare(
+            &device,
+            &queue,
+            &mut atlas,
+            &model,
+            None,
+            260.0,
+            &theme,
+            FrameSize {
+                width: 720,
+                height: 320,
+                scale: SCALE,
+                content_left,
+            },
+        );
+        let first_row = completion
+            .row_rects()
+            .first()
+            .expect("the popover publishes row geometry");
+        assert!(
+            first_row[0] >= content_left,
+            "popover geometry begins after the sidebar, got x={} for left={content_left}",
+            first_row[0]
         );
     }
 }

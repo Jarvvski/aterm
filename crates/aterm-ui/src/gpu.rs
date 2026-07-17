@@ -39,7 +39,7 @@ use crate::renderer::{Frame, RenderError, Renderer};
 /// scroll offset, surface width, effective height, theme code, alt placeholder, hovered
 /// block)`. A tuple (not a struct) so equality is derived; aliased to keep the field type
 /// legible.
-type TimelineSig = (u64, u64, u32, u32, u8, bool, Option<usize>);
+type TimelineSig = (u64, u64, u32, u32, u32, u8, bool, Option<usize>);
 
 /// wgpu-backed renderer with the instanced grid fast-path.
 pub struct GpuRenderer {
@@ -73,6 +73,9 @@ pub struct GpuRenderer {
     /// (its own damage signature), so it allocates nothing on an idle present; the timeline
     /// is laid out below it via a top inset of [`crate::title_bar::title_bar_px`].
     title: crate::title_bar::TitleBarRenderer,
+    /// Toggleable sessions-sidebar front-end (ticket T-10.2). Drawn over the left body
+    /// band while every main front-end receives the matching `FrameSize::content_left`.
+    sidebar: crate::sidebar::SidebarRenderer,
     /// The informational-screens front-end (ticket T-9.5): the `launch` empty state (drawn
     /// when the block timeline is empty) and the `modes` explainer (drawn on `show_help`),
     /// centered in the content band between the title bar and the input box.
@@ -112,6 +115,8 @@ pub struct GpuRenderer {
     /// Whether the title bar drew on the last frame (drawn over the reserved top band
     /// whenever the host supplies title-bar content - including alt-screen, T-9.9).
     drew_title: bool,
+    /// Whether the sessions sidebar drew on the last frame.
+    drew_sidebar: bool,
     /// Whether the raw grid drew as the PRIMARY view on the last frame (alt-screen or the
     /// no-engine headless stand-in). Tracked separately from `drew_timeline` so the glyph
     /// draw-call counter attributes the primary view correctly across all modes.
@@ -205,6 +210,7 @@ impl GpuRenderer {
         let timeline = crate::timeline_render::TimelineRenderer::new(&device);
         let input = crate::input_widget::InputWidgetRenderer::new(&device);
         let title = crate::title_bar::TitleBarRenderer::new(&device);
+        let sidebar = crate::sidebar::SidebarRenderer::new(&device);
         let screens = crate::screens::ScreensRenderer::new(&device);
         let completion = crate::completion_render::CompletionRenderer::new(&device);
         let approval = crate::approval_render::ApprovalRenderer::new(&device);
@@ -219,6 +225,7 @@ impl GpuRenderer {
             timeline,
             input,
             title,
+            sidebar,
             screens,
             completion,
             approval,
@@ -228,6 +235,7 @@ impl GpuRenderer {
             drew_timeline: false,
             drew_input: false,
             drew_title: false,
+            drew_sidebar: false,
             drew_grid: false,
             drew_screens: false,
             drew_completion: false,
@@ -348,6 +356,9 @@ impl GpuRenderer {
         if self.drew_title {
             n += self.title.last_glyph_draw_calls();
         }
+        if self.drew_sidebar {
+            n += self.sidebar.last_glyph_draw_calls();
+        }
         n
     }
 
@@ -437,6 +448,7 @@ impl GpuRenderer {
         // a click aimed at them lands on the red button and closes the app. The host
         // shrinks the PTY grid by the same band, so the full-screen app loses nothing.
         let draw_title = frame.title_bar.is_some();
+        let draw_sidebar = frame.sidebar.is_some();
         self.drew_timeline = draw_timeline;
         self.drew_grid = draw_grid;
         self.drew_screens = draw_screens;
@@ -444,10 +456,19 @@ impl GpuRenderer {
         self.drew_completion = draw_completion;
         self.drew_approval = draw_approval;
         self.drew_title = draw_title;
+        self.drew_sidebar = draw_sidebar;
+        let content_left = if draw_sidebar {
+            (crate::sidebar::SIDEBAR_LOGICAL_WIDTH * self.scale_factor)
+                .round()
+                .min(self.config.width as f32)
+        } else {
+            0.0
+        };
         let size = crate::grid_render::FrameSize {
             width: self.config.width,
             height: self.config.height,
             scale: self.scale_factor,
+            content_left,
         };
 
         // Reserve the bottom input zone (ticket T-3.6) so the timeline lays out ABOVE it.
@@ -513,6 +534,7 @@ impl GpuRenderer {
                     frame.snapshot.map_or(0, |s| s.version),
                     scroll.offset_rows,
                     self.config.width,
+                    content_left.to_bits(),
                     effective_h.round() as u32,
                     theme_kind_code(frame.theme),
                     false,
@@ -638,6 +660,21 @@ impl GpuRenderer {
                 );
             }
 
+            // The panel draws over the left body band and publishes its retained hit
+            // geometry. It starts below the title bar internally, so the native chrome
+            // remains full-width and visually continuous.
+            if draw_sidebar {
+                self.sidebar.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.atlas,
+                    &frame.sidebar.expect("draw_sidebar implies sidebar"),
+                    hovered,
+                    frame.theme,
+                    size,
+                );
+            }
+
             // Rebuild the frame's hit map (ticket T-9.8) from each drawn front-end's cached
             // geometry, in DRAW order (bottom to top) so `HitMap::hit`'s last-wins scan
             // returns the topmost target. Reuses the map's capacity (clear + push), so a warm
@@ -660,6 +697,11 @@ impl GpuRenderer {
                 if draw_completion {
                     for (i, &rect) in self.completion.row_rects().iter().enumerate() {
                         self.hit_map.push(rect, HitTarget::CompletionRow(i));
+                    }
+                }
+                if draw_sidebar {
+                    for &(rect, target) in self.sidebar.hit_regions() {
+                        self.hit_map.push(rect, target);
                     }
                 }
                 if draw_title {
@@ -744,6 +786,10 @@ impl GpuRenderer {
                 // above the content (a modal decision, on top like the popover).
                 if draw_approval {
                     self.approval.draw(&mut pass, &self.atlas);
+                }
+                // The sidebar occludes the left body band after all main-content layers.
+                if draw_sidebar {
+                    self.sidebar.draw(&mut pass, &self.atlas);
                 }
                 // The title bar draws last, over the reserved top band (its bottom hairline
                 // + toggle glyph + centered title sit on top of the cleared canvas).

@@ -41,6 +41,7 @@ pub mod prose;
 pub mod recorder;
 pub mod renderer;
 pub mod screens;
+pub mod sidebar;
 pub mod sprite;
 pub mod text;
 pub mod timeline;
@@ -78,6 +79,7 @@ pub use recorder::{
 };
 pub use renderer::{Frame, RenderError, Renderer};
 pub use screens::{ScreenKind, ScreensRenderer};
+pub use sidebar::{SidebarItem, SidebarRenderer, SidebarView, SIDEBAR_LOGICAL_WIDTH};
 pub use text::{
     build_grid_cells, classify_run, is_ascii_fast, resolve_color, AtlasRect, FaceStyle, FontFamily,
     GlyphCache, GlyphKey, GridCell, RunLayout, ShelfAllocator,

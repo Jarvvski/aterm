@@ -115,11 +115,21 @@ impl ScreensRenderer {
             width,
             height: _,
             scale,
+            content_left,
         } = size;
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
 
-        let sig = signature(kind, mode, width, content_top, content_h, px_key, theme);
+        let sig = signature(
+            kind,
+            mode,
+            width,
+            content_left,
+            content_top,
+            content_h,
+            px_key,
+            theme,
+        );
         if self.built == Some(sig) {
             return !self.glyph_instances.is_empty() || !self.bg_instances.is_empty();
         }
@@ -145,9 +155,16 @@ impl ScreensRenderer {
         };
 
         match kind {
-            ScreenKind::Launch => {
-                self.build_launch(queue, atlas, content_top, content_h, width, scale, theme)
-            }
+            ScreenKind::Launch => self.build_launch(
+                queue,
+                atlas,
+                content_top,
+                content_h,
+                width,
+                content_left,
+                scale,
+                theme,
+            ),
             ScreenKind::Modes => self.build_modes(
                 queue,
                 atlas,
@@ -156,6 +173,7 @@ impl ScreensRenderer {
                 content_top,
                 content_h,
                 width,
+                content_left,
                 scale,
                 theme,
             ),
@@ -202,6 +220,7 @@ impl ScreensRenderer {
         content_top: f32,
         content_h: f32,
         width: u32,
+        content_left: f32,
         scale: f32,
         theme: &Theme,
     ) {
@@ -220,7 +239,8 @@ impl ScreensRenderer {
 
         let total_h = title.height + gap + t1.height + t2.height + gap + footer.height;
         let mut y = content_top + ((content_h - total_h) * 0.5).max(0.0);
-        let center_x = |w: f32| (width as f32 - w) * 0.5;
+        let content_width = (width as f32 - content_left).max(0.0);
+        let center_x = |w: f32| content_left + (content_width - w) * 0.5;
 
         self.place(queue, atlas, &title, center_x(title.width), y, c.fg_primary);
         y += title.height + gap;
@@ -243,15 +263,17 @@ impl ScreensRenderer {
         content_top: f32,
         content_h: f32,
         width: u32,
+        content_left: f32,
         scale: f32,
         theme: &Theme,
     ) {
         let c = &theme.colors;
         let cap_px = (type_scale::CAPTION.size_pt * scale).round().max(1.0);
         let body_px = (type_scale::BODY.size_pt * scale).round().max(1.0);
-        let edge = f32::from(aterm_tokens::space::S8) * scale;
+        let margin = f32::from(aterm_tokens::space::S8) * scale;
+        let edge = content_left + margin;
         let gap = 22.0 * scale;
-        let content_w = (width as f32 - 2.0 * edge).max(1.0);
+        let content_w = (width as f32 - content_left - 2.0 * margin).max(1.0);
         let measure = content_w.min(520.0 * scale); // the mock's ~520px paragraph measure
 
         let eyebrow = self.shape(MODES_EYEBROW, FontFamily::Ui, cap_px);
@@ -478,10 +500,12 @@ fn grid_glyph(ch: char, fg: Rgba, canvas: Rgba) -> GridCell {
 /// A stable u64 over everything a screen draws. Allocation-free (folds the fixed strings only
 /// by their identity via the kind + mode; the strings themselves are constants, so folding the
 /// kind/mode/geometry/px/colors is sufficient to catch every draw-affecting change).
+#[allow(clippy::too_many_arguments)]
 fn signature(
     kind: ScreenKind,
     mode: Mode,
     w: u32,
+    content_left: f32,
     content_top: f32,
     content_h: f32,
     px_key: u32,
@@ -498,6 +522,7 @@ fn signature(
     s = fold_u64(s, matches!(kind, ScreenKind::Modes) as u64);
     s = fold_u64(s, matches!(mode, Mode::Agent) as u64);
     s = fold_u64(s, u64::from(w));
+    s = fold_u64(s, u64::from(content_left.to_bits()));
     s = fold_u64(s, content_top.to_bits() as u64);
     s = fold_u64(s, content_h.to_bits() as u64);
     s = fold_u64(s, u64::from(px_key));
@@ -543,6 +568,7 @@ mod tests {
             ScreenKind::Launch,
             Mode::Shell,
             960,
+            0.0,
             44.0,
             500.0,
             13,
@@ -554,6 +580,7 @@ mod tests {
                 ScreenKind::Launch,
                 Mode::Shell,
                 960,
+                0.0,
                 44.0,
                 500.0,
                 13,
@@ -563,7 +590,16 @@ mod tests {
         );
         assert_ne!(
             base,
-            signature(ScreenKind::Modes, Mode::Shell, 960, 44.0, 500.0, 13, &theme),
+            signature(
+                ScreenKind::Modes,
+                Mode::Shell,
+                960,
+                0.0,
+                44.0,
+                500.0,
+                13,
+                &theme,
+            ),
             "kind"
         );
         // The routing mode only affects the modes screen, but folding it always is safe.
@@ -573,6 +609,7 @@ mod tests {
                 ScreenKind::Launch,
                 Mode::Agent,
                 960,
+                0.0,
                 44.0,
                 500.0,
                 13,
@@ -586,6 +623,7 @@ mod tests {
                 ScreenKind::Launch,
                 Mode::Shell,
                 961,
+                0.0,
                 44.0,
                 500.0,
                 13,
@@ -599,6 +637,7 @@ mod tests {
                 ScreenKind::Launch,
                 Mode::Shell,
                 960,
+                0.0,
                 48.0,
                 500.0,
                 13,
@@ -612,6 +651,7 @@ mod tests {
                 ScreenKind::Launch,
                 Mode::Shell,
                 960,
+                0.0,
                 44.0,
                 480.0,
                 13,
@@ -625,6 +665,7 @@ mod tests {
                 ScreenKind::Launch,
                 Mode::Shell,
                 960,
+                0.0,
                 44.0,
                 500.0,
                 26,
@@ -638,6 +679,7 @@ mod tests {
                 ScreenKind::Launch,
                 Mode::Shell,
                 960,
+                0.0,
                 44.0,
                 500.0,
                 13,
@@ -741,6 +783,7 @@ mod gpu_tests {
                 width: w,
                 height: h,
                 scale: SCALE,
+                content_left: 0.0,
             },
         );
         let mut enc =
@@ -877,6 +920,7 @@ mod gpu_tests {
             width: 620,
             height: 460,
             scale: SCALE,
+            content_left: 0.0,
         };
         sc.prepare(
             &device,
@@ -906,6 +950,43 @@ mod gpu_tests {
         assert_eq!(
             allocs, 0,
             "an unchanged screen frame's prepare early-out allocates nothing (got {allocs})"
+        );
+    }
+
+    #[test]
+    fn modes_screen_respects_the_sidebar_content_inset() {
+        let Some((device, queue, format)) = device() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut screens = ScreensRenderer::new(&device);
+        let theme = *Theme::for_kind(ThemeKind::Dark);
+        let content_left = 210.0;
+        screens.prepare(
+            &device,
+            &queue,
+            &mut atlas,
+            ScreenKind::Modes,
+            Mode::Shell,
+            28.0,
+            360.0,
+            &theme,
+            FrameSize {
+                width: 720,
+                height: 420,
+                scale: SCALE,
+                content_left,
+            },
+        );
+        let first_glyph_x = screens
+            .glyph_instances
+            .iter()
+            .map(|glyph| glyph.rect[0])
+            .reduce(f32::min)
+            .expect("the modes screen emitted glyphs");
+        assert!(
+            first_glyph_x >= content_left,
+            "screen geometry begins after the sidebar, got x={first_glyph_x} for left={content_left}"
         );
     }
 }

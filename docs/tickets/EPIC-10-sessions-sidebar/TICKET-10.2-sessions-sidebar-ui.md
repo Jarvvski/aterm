@@ -2,7 +2,7 @@
 id: T-10.2
 epic: EPIC-10-sessions-sidebar
 title: Sessions sidebar + title-bar session binding
-status: ready-for-agent
+status: done
 labels: [ui, sessions, chrome]
 depends_on: [T-10.1, T-9.1, T-9.2]
 ---
@@ -51,17 +51,27 @@ session name + cwd, and make the `◧` glyph actually toggle the panel.
 
 # Acceptance criteria
 
-- [ ] The sidebar renders to the mock in both themes: SESSIONS header + `+`, one
+- [x] The sidebar renders to the mock in both themes: SESSIONS header + `+`, one
   row per live session with the correct running/idle dot color, ellipsized name,
   hover-revealed `✕`, and the active row's tint + 2px inset accent bar.
-- [ ] The `◧` glyph toggles the panel; the title bar shows the active session name
+- [x] The `◧` glyph toggles the panel; the title bar shows the active session name
   + cwd and updates on switch.
-- [ ] Selecting / closing / adding a session drives the T-10.1 `SessionList` via
+- [x] Selecting / closing / adding a session drives the T-10.1 `SessionList` via
   intents (wired fully in T-10.3; the intents exist and are tested here).
-- [ ] Motion budget + T-1.8 no-per-frame-alloc hold; a widget/GPU test covers the
+- [x] Motion budget + T-1.8 no-per-frame-alloc hold; a widget/GPU test covers the
   panel (>=2 sessions, one active, one idle) in both themes.
 
 # Out of scope
 
 - The session engine itself - [T-10.1](TICKET-10.1-session-model.md).
 - Keybinding wiring and focus routing across sessions - [T-10.3](TICKET-10.3-session-keybindings.md).
+
+# Notes
+
+2026-07-17 (agent): The UI owns a retained `SidebarItem` projection and lends it to
+the deep `SidebarRenderer` through `SidebarView`; no `aterm-core` public interface was
+widened. Running means the session's foreground process group is not the shell. The
+sidebar emits index-based add/select/close intents, while T-10.3 remains responsible
+for applying them and focus/keybinding routing. The bundled UI font lacks the literal
+`✕` and `⌘` glyphs, so the renderer uses its supported `×` close mark and the
+Nerd Font Command-key icon from the bundled grid face.

@@ -9,6 +9,7 @@ use aterm_tokens::Theme;
 
 use crate::approval_render::ApprovalView;
 use crate::components::AutonomyMode;
+use crate::sidebar::SidebarView;
 use crate::title_bar::TitleBarView;
 
 /// Errors a renderer can surface during a frame.
@@ -63,6 +64,10 @@ pub struct Frame<'a> {
     /// draws it over a reserved top band in normal (non-alt-screen) mode; the host supplies
     /// it through [`crate::app::UiCallbacks::title_bar`].
     pub title_bar: Option<TitleBarView<'a>>,
+    /// The sessions sidebar for this frame, or `None` while closed. The borrowed rows
+    /// are a retained host projection, so carrying the panel through the renderer seam
+    /// allocates nothing per frame (ticket T-10.2).
+    pub sidebar: Option<SidebarView<'a>>,
     /// The tab-completion popover state for this frame (ticket T-9.5), borrowed from the
     /// host's [`Completion`]. `None` for a host with no completion (e.g. the headless UI);
     /// when `Some` and open, the renderer draws the fuzzy-finder popover above the input's

@@ -206,6 +206,7 @@ impl TimelineRenderer {
             width,
             height,
             scale,
+            content_left,
         } = size;
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
@@ -217,7 +218,10 @@ impl TimelineRenderer {
         // The hovered block (T-9.8) is folded the same way: it toggles that block's meta
         // reveal, so a hover change must force exactly one rebuild.
         let sig = fold_hovered_block(
-            fold_top_inset(signature(layout, width, height, px_key, theme), top_inset),
+            fold_content_left(
+                fold_top_inset(signature(layout, width, height, px_key, theme), top_inset),
+                content_left,
+            ),
             hovered_block,
         );
         if self.built == Some(sig) {
@@ -248,7 +252,8 @@ impl TimelineRenderer {
         // from the effective height, so the last row's bottom lands one S12 above the surface
         // foot. Both bands are one constant; edit them together (see gpu.rs viewport_rows).
         let top_margin = top_inset + f32::from(space::S12) * scale; // title-bar inset + breathing
-        let edge = f32::from(space::S8) * scale; // horizontal canvas gutter (both sides)
+        let margin = f32::from(space::S8) * scale;
+        let edge = content_left + margin; // sidebar edge + horizontal canvas gutter
         let pad = f32::from(space::S4) * scale; // intra-block content padding
         let metrics = atlas.cell_metrics(FontFamily::Grid, px);
         let baseline_off = (ch - metrics.line) * 0.5 + metrics.ascent;
@@ -276,7 +281,7 @@ impl TimelineRenderer {
         // one `space::S4` of intra-block padding so it never sits flush to the rule.
         let gutter_w = f32::from(cmd.gutter_px) * scale; // status-marker band
         let content_x = edge + gutter_w + pad;
-        let inner_w = (width as f32 - 2.0 * edge).max(0.0);
+        let inner_w = (width as f32 - edge - margin).max(0.0);
         let hairline_h = (f32::from(space::HAIRLINE_WIDTH) * scale).round().max(1.0);
         let hairline = cmd.hairline.to_linear_f32();
         // The gutter marker is one Mono cell, centered horizontally in the marker band.
@@ -919,6 +924,17 @@ fn diff_line_color(
 /// `wrapping_mul` by an odd constant is a bijection on `u64`.
 fn fold_top_inset(base: u64, top_inset: f32) -> u64 {
     base ^ (top_inset.to_bits() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+/// Fold the main content's left edge independently from the title-bar top inset. The
+/// distinct salt keeps a 210px sidebar different from a 210px title band.
+fn fold_content_left(base: u64, content_left: f32) -> u64 {
+    if content_left == 0.0 {
+        base
+    } else {
+        (base ^ u64::from(content_left.to_bits()).rotate_left(17))
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
 }
 
 /// Fold the hovered block index into a base signature (ticket T-9.8) so a pointer hover
@@ -1901,6 +1917,7 @@ mod gpu_tests {
                 width: w,
                 height: h,
                 scale: SCALE,
+                content_left: 0.0,
             },
         );
         let mut enc =
@@ -2193,6 +2210,7 @@ mod gpu_tests {
             width: 240,
             height: 200,
             scale: SCALE,
+            content_left: 0.0,
         };
         // First prepare builds + caches (allocates).
         tl.prepare(&device, &queue, &mut atlas, &l, 0.0, None, &theme, size);
@@ -2209,6 +2227,43 @@ mod gpu_tests {
     }
 
     #[test]
+    fn timeline_respects_the_sidebar_content_inset() {
+        let Some((device, queue, format)) = device() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut timeline = TimelineRenderer::new(&device);
+        let theme = *Theme::for_kind(ThemeKind::Dark);
+        let blocks = block_with_output(3, Some(0));
+        let layout = layout(&blocks, false, Scroll::default(), 12);
+        let content_left = 210.0;
+        timeline.prepare(
+            &device,
+            &queue,
+            &mut atlas,
+            &layout,
+            0.0,
+            None,
+            &theme,
+            FrameSize {
+                width: 640,
+                height: 320,
+                scale: SCALE,
+                content_left,
+            },
+        );
+        let (_, rect) = timeline
+            .block_meta_rects()
+            .first()
+            .expect("a command block publishes its hover rect");
+        assert!(
+            rect[0] >= content_left,
+            "timeline geometry begins after the sidebar, got x={} for left={content_left}",
+            rect[0]
+        );
+    }
+
+    #[test]
     fn alt_screen_and_empty_timeline_draw_nothing() {
         let Some((device, queue, format)) = device() else {
             return;
@@ -2220,6 +2275,7 @@ mod gpu_tests {
             width: 240,
             height: 200,
             scale: SCALE,
+            content_left: 0.0,
         };
 
         // Alt-screen: the grid owns the screen, the timeline draws nothing.

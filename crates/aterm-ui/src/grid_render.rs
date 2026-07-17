@@ -53,6 +53,8 @@ pub struct FrameSize {
     pub width: u32,
     pub height: u32,
     pub scale: f32,
+    /// Physical-pixel left edge of the main content area.
+    pub content_left: f32,
 }
 
 /// The instanced grid renderer: the GRID front-end over the shared [`GlyphAtlas`]. It
@@ -75,7 +77,7 @@ pub struct GridRenderer {
     /// Rebuild gate: `(version, vw, vh, px, theme_sig)` currently built, or `None`.
     /// `theme_sig` is a hash over every theme color the build reads (see
     /// [`theme_signature`]), so a theme change always invalidates the build.
-    built: Option<(u64, u32, u32, u32, u32, u64)>,
+    built: Option<(u64, u32, u32, u32, u32, u32, u64)>,
     /// Glyph-layer draw calls issued by the last [`Self::draw`] (the T-1.6 AC c
     /// counter: exactly 1 when the grid has any inked cell, else 0).
     last_glyph_draw_calls: u32,
@@ -145,6 +147,7 @@ impl GridRenderer {
             width: viewport_w,
             height: viewport_h,
             scale,
+            content_left,
         } = size;
         let px = (type_scale::GRID.size_pt * scale).round().max(1.0);
         let px_key = px as u32;
@@ -153,6 +156,7 @@ impl GridRenderer {
             viewport_w,
             viewport_h,
             top_inset.round() as u32,
+            content_left.to_bits(),
             px_key,
             theme_signature(theme),
         );
@@ -167,7 +171,7 @@ impl GridRenderer {
         // braille / Powerline), which fill the cell box rather than a font outline.
         let cw_i = cw.round().max(1.0) as u32;
         let ch_i = ch.round().max(1.0) as u32;
-        let inset = INSET_LOGICAL * scale;
+        let inset = content_left + INSET_LOGICAL * scale;
         let metrics = atlas.cell_metrics(FontFamily::Grid, px);
         // Center the font's line box in the cell box, then baseline = ascent below
         // the box top.
@@ -411,6 +415,7 @@ mod gpu_tests {
                 width: w,
                 height: h,
                 scale: SCALE,
+                content_left: 0.0,
             },
         );
         let mut enc =
@@ -665,6 +670,7 @@ mod gpu_tests {
             width: w,
             height: h,
             scale: SCALE,
+            content_left: 0.0,
         };
         // First prepare builds + caches (allocates).
         grid.prepare(&device, &queue, &mut atlas, &snap, 0.0, &theme(), size);
@@ -679,6 +685,47 @@ mod gpu_tests {
         assert_eq!(
             allocs, 0,
             "an unchanged frame's prepare early-out allocates nothing (got {allocs})"
+        );
+    }
+
+    #[test]
+    fn grid_respects_the_sidebar_content_inset() {
+        let Some((device, queue, format)) = device() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(&device, format);
+        let mut grid = GridRenderer::new(&device);
+        let snap = one_cell(
+            4,
+            'S',
+            CellColor::Rgb(255, 255, 255),
+            CellColor::Rgb(0, 0, 0),
+            false,
+        );
+        let content_left = 210.0;
+        grid.prepare(
+            &device,
+            &queue,
+            &mut atlas,
+            &snap,
+            0.0,
+            &theme(),
+            FrameSize {
+                width: 640,
+                height: 200,
+                scale: SCALE,
+                content_left,
+            },
+        );
+        let first_glyph_x = grid
+            .glyph_instances
+            .iter()
+            .map(|glyph| glyph.rect[0])
+            .reduce(f32::min)
+            .expect("the grid emitted a glyph");
+        assert!(
+            first_glyph_x >= content_left,
+            "grid geometry begins after the sidebar, got x={first_glyph_x} for left={content_left}"
         );
     }
 

@@ -9,10 +9,16 @@ until the owner explicitly approves it - never auto-bump. The version of record 
 `[workspace.package].version` in the root `Cargo.toml`. New entries go on top, under
 the next version (or an `## Unreleased` heading until a version is cut).
 
-## Unreleased
+## 0.2.0 - 2026-07-17
 
 ### Added
 
+- **The sessions sidebar is live.** `Cmd-B` or the title-bar toggle opens a 210px panel
+  listing every terminal session, with running/idle status, active-session highlighting,
+  ellipsized names, hover close controls, and add/select/close intents ready for the
+  keybinding follow-up. Opening it reflows the terminal into the remaining width without
+  per-frame allocation. The title bar now follows the active session's name and working
+  directory instead of displaying a placeholder. (Ticket T-10.2.)
 - **The title bar's directory is live.** The path beside the title now tracks the shell's
   actual working directory (reported via OSC-7 at every prompt by the shell integration),
   so a `cd` shows up in the title bar at the next prompt - previously it was frozen at
