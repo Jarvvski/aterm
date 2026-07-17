@@ -2,7 +2,7 @@
 id: T-10.3
 epic: EPIC-10-sessions-sidebar
 title: Session keybindings + switching/focus routing
-status: ready-for-agent
+status: done
 labels: [app, sessions, input]
 depends_on: [T-10.1, T-10.2]
 ---
@@ -46,13 +46,13 @@ user is looking at. Closing the active session selects a sensible neighbor.
 
 # Acceptance criteria
 
-- [ ] `⌘T` creates and activates a new session; row-click switches; `✕`/close
+- [x] `⌘T` creates and activates a new session; row-click switches; `✕`/close
   keybinding closes; all drive the T-10.1 `SessionList`.
-- [ ] Keystrokes and submitted lines always reach the active session; after a
+- [x] Keystrokes and submitted lines always reach the active session; after a
   switch, input/history/completion state reflects the newly active session.
-- [ ] Closing the active session selects a valid neighbor and never leaves an
+- [x] Closing the active session selects a valid neighbor and never leaves an
   invalid active id; closing the last session lands on the documented default.
-- [ ] Session bindings do not collide with existing keymaps (`⌘I`, `⌘L`, routing);
+- [x] Session bindings do not collide with existing keymaps (`⌘I`, `⌘L`, routing);
   covered by tests. `mise run build && mise run test` pass.
 
 # Out of scope
@@ -60,3 +60,22 @@ user is looking at. Closing the active session selects a sensible neighbor.
 - The session engine ([T-10.1](TICKET-10.1-session-model.md)) and the sidebar/
   title-bar rendering ([T-10.2](TICKET-10.2-sessions-sidebar-ui.md)).
 - The mode toggle (`⌘I`, T-3.3) and theme toggle (`⌘L`) themselves.
+
+# Notes
+
+2026-07-17 (agent): The existing `UiCallbacks` and `SessionList` interfaces remain
+unchanged. `TerminalHost` parks one private `SessionFocusState` per inactive stable id,
+keeping draft text/selection/mode, history, completion, and the session-scoped autonomy
+posture together while the active state stays on the allocation-free render/key path.
+`Cmd-T` and the sidebar `+` create and activate a session; row clicks switch; the row close
+control and `Cmd-Shift-W` close. `Cmd-W` remains the T-9.9 native window-close chord. Closing
+the last session creates its replacement before retiring it, so the host never exposes an
+invalid active id. Tests include two real `/bin/cat` PTYs proving keystrokes reach only the
+active session. Exercising close under a saturated background PTY also exposed a T-10.1
+teardown deadlock: the model stopped draining before the flooded process group exited, so
+the reaper could wait forever. Engine teardown now kills the PTY session group before model
+shutdown, with the existing flood test extended to require bounded reaping.
+
+2026-07-17 (agent): `mise run fmt`, `mise run lint`, `mise run build`, and
+`mise run test` pass. The bounded flooded-session teardown also passed 10 consecutive
+focused repetitions before the full workspace run.

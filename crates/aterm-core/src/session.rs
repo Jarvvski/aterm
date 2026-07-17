@@ -382,6 +382,18 @@ mod tests {
             "a saturated background reader must not delay another session"
         );
         assert_eq!(responsive_session.id(), responsive);
+
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(sessions);
+            closed_tx
+                .send(())
+                .expect("teardown observer remains available");
+        });
+        assert!(
+            closed_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a flooded background session must tear down without hanging the reaper"
+        );
     }
 
     #[test]

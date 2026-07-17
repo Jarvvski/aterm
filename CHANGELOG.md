@@ -9,6 +9,18 @@ until the owner explicitly approves it - never auto-bump. The version of record 
 `[workspace.package].version` in the root `Cargo.toml`. New entries go on top, under
 the next version (or an `## Unreleased` heading until a version is cut).
 
+## 0.3.0 - 2026-07-17
+
+### Added
+
+- **Sessions now behave independently end to end.** `Cmd-T` or the sidebar `+` opens and
+  activates a new PTY-backed session; clicking a row switches to it; the row close control
+  or `Cmd-Shift-W` closes it and selects the previous neighbor. `Cmd-W` remains the native
+  window-close shortcut. Draft text, selection, mode, history, completion state, and autonomy
+  follow their owning session, and closing the last session opens a fresh launch session
+  instead of leaving an invalid empty host. Closing a flooded background session also reaps
+  its whole PTY process group without wedging later session cleanup. (Ticket T-10.3.)
+
 ## 0.2.0 - 2026-07-17
 
 ### Added

@@ -167,7 +167,7 @@ The ordering front-loads the two existential risks (the perf floor and the engin
 |---|---|---|---|
 | T-10.1 | Multi-session model - concurrent PTY-backed sessions + SessionList | done | - |
 | T-10.2 | Sessions sidebar + title-bar session binding | done | T-10.1, T-9.1, T-9.2 |
-| T-10.3 | Session keybindings + switching/focus routing | ready-for-agent | T-10.1, T-10.2 |
+| T-10.3 | Session keybindings + switching/focus routing | done | T-10.1, T-10.2 |
 
 ### EPIC-11 - Editor mode
 | id | title | status | depends_on |

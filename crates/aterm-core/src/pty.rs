@@ -9,9 +9,9 @@
 //!
 //! Drop order matters: spawning drops the slave half immediately so that when the
 //! child exits, a read on the master returns EOF (no lingering slave fd keeps the
-//! pty open). Dropping the [`Pty`] best-effort kills and reaps the child (so it is
-//! leak-free by construction - no orphaned shell, no zombie), then drops the
-//! master, which closes the last slave reference and unblocks any reader.
+//! pty open). Dropping the [`Pty`] best-effort kills the child's process group and
+//! reaps the child (so it is leak-free by construction - no orphaned pipeline, no
+//! zombie), then drops the master, which unblocks any reader.
 
 use std::io::{Read, Write};
 
@@ -308,14 +308,37 @@ pub(crate) fn signal_foreground(
         .map_err(|e| PtyError::Signal(format!("killpg({}): {e}", pgid.as_raw())))
 }
 
+/// Force-kill a PTY session process group during teardown.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pgid: i32) -> Result<(), PtyError> {
+    if pgid <= 1 {
+        return Err(PtyError::Signal(format!(
+            "refusing to kill non-session pgid {pgid}"
+        )));
+    }
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .map_err(|error| PtyError::Signal(format!("killpg({pgid}): {error}")))
+}
+
 impl Drop for Pty {
-    /// Best-effort terminate-and-reap so the facade leaks nothing: a spawned shell
-    /// is a session leader (`setsid` + `TIOCSCTTY`), so it does NOT die when this
-    /// process exits, and `std::process::Child` (portable-pty's Unix child) does
-    /// not reap on drop. We `kill` (no-op/`Err` if already gone, ignored) then
-    /// `wait` to reap the zombie. Graceful pgroup signalling is ticket T-1.9; this
-    /// is the safety floor. `wait` returns promptly because the child is dead.
+    /// Best-effort terminate-and-reap so the facade leaks nothing. A spawned shell
+    /// is a session leader (`setsid` + `TIOCSCTTY`), so its pid is also the process
+    /// group id. Kill that whole group first: killing only the shell can leave a
+    /// flooded pipeline child holding the PTY slave open while shutdown waits forever.
+    /// The child-level kill remains as a portable fallback, then `wait` reaps it.
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self
+            .child
+            .process_id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pgid| *pgid > 1)
+        {
+            let _ = kill_process_group(pgid);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

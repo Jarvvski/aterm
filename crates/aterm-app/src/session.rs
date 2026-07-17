@@ -14,6 +14,7 @@
 //! T-5.11) - off the render thread, streaming its steps back through the engine's
 //! agent-injector mailbox.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -21,7 +22,7 @@ use std::time::{Instant, SystemTime};
 use aterm_agent::{AutonomyMode, AutonomyState, Secrets};
 use aterm_core::{
     keys, AgentBlock, AgentBlockKind, BlockList, Engine, IntegrationStatus, PtyDimensions,
-    SessionList, Snapshot, DEFAULT_SCROLLBACK,
+    SessionId, SessionList, Snapshot, DEFAULT_SCROLLBACK,
 };
 use aterm_ui::{
     ApprovalView, HitTarget, ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker,
@@ -49,6 +50,12 @@ pub struct TerminalHost {
     turn: Option<TurnHandle>,
     /// Every live terminal engine, with exactly one active render/input target.
     sessions: SessionList,
+    /// Input-facing state parked by stable session id while another session owns focus.
+    /// The active state stays in the existing hot-path fields, so frame rendering and key
+    /// routing keep borrowing directly without a map lookup.
+    parked_focus: HashMap<SessionId, SessionFocusState>,
+    /// Latest PTY dimensions, reused when a session is created after a resize.
+    session_dims: PtyDimensions,
     /// Retained presentation projection of `sessions`, borrowed by the sidebar frame.
     /// Lifecycle changes are rare; steady frames read this slice without collecting.
     sidebar_items: Vec<SidebarItem>,
@@ -64,11 +71,13 @@ pub struct TerminalHost {
     /// into a new session (AC5); the cycle hotkey mutates it (AC4), the always-visible
     /// indicator reads it, and its `policy()` gates each live turn (ticket T-5.11).
     autonomy: AutonomyState,
-    /// The shared input-history ring (ticket T-3.7): every submitted line is pushed here
-    /// (tagged with the mode it was submitted in), and the T-3.5 ghost-text worker draws
-    /// its fish-style suggestions from it. `Arc` so a snapshot is a cheap refcount bump
-    /// into each overlay request; `Arc::make_mut` copies-on-write only when the worker is
-    /// mid-read. In-memory only (persistence is T-8.3), so it starts empty each session.
+    /// Configured autonomy baseline used by every freshly created session.
+    default_autonomy: AutonomyMode,
+    /// The active session's input-history ring (ticket T-3.7): every submitted line is
+    /// pushed here (tagged with the mode it was submitted in), and the T-3.5 ghost-text
+    /// worker draws its fish-style suggestions from it. `Arc` makes an overlay snapshot a
+    /// cheap refcount bump; `Arc::make_mut` copies only while the worker reads an older
+    /// snapshot. Inactive sessions park their own ring in [`SessionFocusState`].
     history: Arc<HistoryRing>,
     /// The async, debounced highlight + ghost-text worker (ticket T-3.5). Runs off the
     /// render thread; the input line's overlay is recomputed here after each edit and the
@@ -85,6 +94,11 @@ pub struct TerminalHost {
     /// The sidebar-toggle hotkey (ticket T-9.2), consulted before the routing brain like
     /// the autonomy-cycle hotkey. Default `Cmd-B`.
     sidebar_key: KeyBinding,
+    /// New-session keybinding (ticket T-10.3). Default `Cmd-T`.
+    new_session_key: KeyBinding,
+    /// Close-session keybinding (ticket T-10.3). Default `Cmd-Shift-W`; `Cmd-W`
+    /// remains the locked native window-close chord from T-9.9.
+    close_session_key: KeyBinding,
     /// The toggle-sidebar INTENT (ticket T-9.2). The sessions sidebar panel is EPIC-10;
     /// today this bool is the intent the `◧` title-bar glyph / `Cmd-B` flips, which the
     /// panel will consume. Default `false` (ADR-0011: not shown by default on one session).
@@ -138,6 +152,29 @@ pub struct TerminalHost {
 /// The dropdown row count in the approval card's split-Approve menu (ticket T-9.7):
 /// "Approve once" (0) and "Always approve" (1).
 const GATE_MENU_LEN: usize = 2;
+
+/// State that follows a terminal session when focus moves between sessions.
+///
+/// Kept private to the host implementation: callers and tests continue through the
+/// existing [`UiCallbacks`] seam, while the session-switch implementation gets one value
+/// to park and restore atomically.
+struct SessionFocusState {
+    input: InputModel,
+    history: Arc<HistoryRing>,
+    completion: Completion,
+    autonomy: AutonomyState,
+}
+
+impl SessionFocusState {
+    fn fresh(default_autonomy: AutonomyMode) -> Self {
+        Self {
+            input: InputModel::new(),
+            history: Arc::new(HistoryRing::new()),
+            completion: Completion::new(),
+            autonomy: AutonomyState::new(default_autonomy),
+        }
+    }
+}
 
 /// Apply a T-3.2 IME event to the input model. Pure (no engine / no window), so the
 /// composition semantics are unit-testable without spawning a session:
@@ -227,12 +264,15 @@ impl TerminalHost {
         let agent = AgentRuntime::new(root, secrets.clone()).map_err(aterm_core::PtyError::Io)?;
         Ok(Self {
             sessions,
+            parked_focus: HashMap::new(),
+            session_dims: dims,
             sidebar_items,
             input: InputModel::new(),
             window: None,
             toggle_key: cfg.toggle_mode,
             autonomy_key: cfg.autonomy_cycle,
             autonomy: AutonomyState::new(cfg.default_autonomy),
+            default_autonomy: cfg.default_autonomy,
             agent,
             turn: None,
             history: Arc::new(HistoryRing::new()),
@@ -240,6 +280,21 @@ impl TerminalHost {
             overlay_gen: 0,
             widen_history: false,
             sidebar_key: cfg.toggle_sidebar,
+            new_session_key: KeyBinding {
+                key: crate::routing::BindKey::Char('t'),
+                mods: aterm_ui::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            },
+            close_session_key: KeyBinding {
+                key: crate::routing::BindKey::Char('w'),
+                mods: aterm_ui::Mods {
+                    cmd: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            },
             sidebar_open: false,
             cwd_display,
             cwd_fallback,
@@ -291,6 +346,102 @@ impl TerminalHost {
                 item.running = session.engine().foreground_is_foreign();
             }
         }
+    }
+
+    /// Replace the active focus state and return the previous state for parking.
+    fn replace_focus(&mut self, next: SessionFocusState) -> SessionFocusState {
+        SessionFocusState {
+            input: std::mem::replace(&mut self.input, next.input),
+            history: std::mem::replace(&mut self.history, next.history),
+            completion: std::mem::replace(&mut self.completion, next.completion),
+            autonomy: std::mem::replace(&mut self.autonomy, next.autonomy),
+        }
+    }
+
+    /// Spawn and focus a fresh terminal session while parking the current focus state.
+    fn create_session(&mut self) -> Result<SessionId, aterm_core::PtyError> {
+        let engine = Engine::spawn_login_shell(self.session_dims, DEFAULT_SCROLLBACK)?;
+        let previous = self
+            .sessions
+            .active()
+            .expect("app session always owns an active terminal session")
+            .id();
+        let id = self.sessions.create(engine);
+        let previous_focus = self.replace_focus(SessionFocusState::fresh(self.default_autonomy));
+        self.parked_focus.insert(previous, previous_focus);
+        self.sync_sidebar_items();
+        self.request_overlay(true);
+        Ok(id)
+    }
+
+    /// Focus a live session and restore its parked input, history, completion, and autonomy.
+    fn set_active_session(&mut self, id: SessionId) -> bool {
+        let current = self
+            .sessions
+            .active()
+            .expect("app session always owns an active terminal session")
+            .id();
+        if current == id {
+            return true;
+        }
+        let Some(next_focus) = self.parked_focus.remove(&id) else {
+            return false;
+        };
+        if !self.sessions.set_active(id) {
+            self.parked_focus.insert(id, next_focus);
+            return false;
+        }
+        let previous_focus = self.replace_focus(next_focus);
+        self.parked_focus.insert(current, previous_focus);
+        self.request_overlay(true);
+        true
+    }
+
+    /// Close a live session and restore the focus state selected by [`SessionList`].
+    fn close_session(&mut self, id: SessionId) -> bool {
+        if self.sessions.iter().len() == 1 {
+            let active = self
+                .sessions
+                .active()
+                .expect("a one-session list has an active session")
+                .id();
+            if active != id {
+                return false;
+            }
+            if let Err(error) = self.create_session() {
+                log::error!("failed to replace the last terminal session: {error}");
+                return false;
+            }
+            let closed = self.sessions.close(id);
+            self.parked_focus.remove(&id);
+            self.sync_sidebar_items();
+            return closed;
+        }
+        let active = self
+            .sessions
+            .active()
+            .expect("a non-empty session list has an active session")
+            .id();
+        if !self.sessions.close(id) {
+            return false;
+        }
+        if id == active {
+            let next = self
+                .sessions
+                .active()
+                .expect("closing among multiple sessions preserves an active session")
+                .id();
+            let next_focus = self
+                .parked_focus
+                .remove(&next)
+                .expect("every inactive session has parked focus state");
+            let _closed_focus = self.replace_focus(next_focus);
+            self.request_overlay(true);
+        } else {
+            self.parked_focus.remove(&id);
+        }
+        self.sync_sidebar_items();
+        true
     }
 
     /// Flip the toggle-sidebar INTENT (ticket T-9.2) and return the new state. The
@@ -973,6 +1124,24 @@ impl UiCallbacks for TerminalHost {
         // editing keys are still mirrored raw to the PTY so the shell's own line
         // editor echoes them - the byte stream stays what the prior scaffold sent.
 
+        // Session creation is an app intent, checked before the routing brain so the
+        // Command chord never reaches prompt editing.
+        if self.new_session_key.matches(&key) {
+            if let Err(error) = self.create_session() {
+                log::error!("failed to create terminal session: {error}");
+            }
+            return None;
+        }
+        if self.close_session_key.matches(&key) {
+            let active = self
+                .sessions
+                .active()
+                .expect("app session always owns an active terminal session")
+                .id();
+            self.close_session(active);
+            return None;
+        }
+
         // The autonomy-cycle hotkey (T-5.11) is a SESSION-posture flip, checked before
         // the routing brain - parallel to how the mode toggle flips routing only. It
         // steps the safety tier (taking effect on the next gate decision, AC4) and
@@ -1007,6 +1176,14 @@ impl UiCallbacks for TerminalHost {
         // resolved on the winit thread. The card is present iff a turn is parked (kept in
         // sync by `refresh_pending_card` each tick), so gate on it, not a fresh lock read.
         if self.handle_gate_key(&key) {
+            return None;
+        }
+
+        // Command is an application-level modifier on macOS. Known app chords have
+        // returned above; the configurable mode toggle is the one Command chord routed
+        // through `classify` below. Consume every other Command press so winit's text
+        // payload cannot fall through to ordinary prompt editing.
+        if key.mods.cmd && !self.toggle_key.matches(&key) {
             return None;
         }
 
@@ -1184,12 +1361,22 @@ impl UiCallbacks for TerminalHost {
             }
             // T-10.2 establishes the typed sidebar intents. T-10.3 owns applying them to
             // `SessionList` together with keybindings and per-session focus state.
-            HitTarget::SidebarAdd => log::debug!("new-session intent"),
+            HitTarget::SidebarAdd => {
+                if let Err(error) = self.create_session() {
+                    log::error!("failed to create terminal session: {error}");
+                }
+            }
             HitTarget::SidebarSession(index) => {
-                log::debug!("select-session intent: {index}");
+                let id = self.sessions.iter().nth(index).map(aterm_core::Session::id);
+                if let Some(id) = id {
+                    self.set_active_session(id);
+                }
             }
             HitTarget::SidebarClose(index) => {
-                log::debug!("close-session intent: {index}");
+                let id = self.sessions.iter().nth(index).map(aterm_core::Session::id);
+                if let Some(id) = id {
+                    self.close_session(id);
+                }
             }
             // The mode pill == `Cmd-/`.
             HitTarget::ModeChip => {
@@ -1278,11 +1465,17 @@ impl UiCallbacks for TerminalHost {
     fn on_resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) {
         // Pixel dims are advisory (TIOCSWINSZ ws_xpixel/ypixel); clamp rather than
         // silently wrap if a surface somehow exceeds u16.
-        self.engine().resize(
+        self.session_dims = PtyDimensions {
             rows,
             cols,
-            u16::try_from(width).unwrap_or(u16::MAX),
-            u16::try_from(height).unwrap_or(u16::MAX),
+            pixel_width: u16::try_from(width).unwrap_or(u16::MAX),
+            pixel_height: u16::try_from(height).unwrap_or(u16::MAX),
+        };
+        self.engine().resize(
+            self.session_dims.rows,
+            self.session_dims.cols,
+            self.session_dims.pixel_width,
+            self.session_dims.pixel_height,
         );
     }
 }
@@ -1569,6 +1762,20 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn cmd_shift_char(ch: char) -> KeyPress<'static> {
+        KeyPress {
+            named: None,
+            ch: Some(ch),
+            text: None,
+            mods: aterm_ui::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn clicking_the_sidebar_glyph_matches_cmd_b() {
         let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
@@ -1593,6 +1800,386 @@ mod tests {
             s.sidebar().is_none(),
             "closing removes the frame view again"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unhandled_cmd_chord_never_edits_the_unified_input() {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        let cmd_x = KeyPress {
+            named: None,
+            ch: Some('x'),
+            text: Some("x"),
+            mods: aterm_ui::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        };
+
+        s.on_key(cmd_x);
+
+        assert_eq!(
+            s.input.text(),
+            "",
+            "Cmd-X must not insert its character when no command handles it"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_t_creates_an_active_session_without_losing_the_previous_draft() {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        s.on_ime(ImeEvent::Commit("first draft".to_string()));
+
+        s.on_key(cmd_char('t'));
+        s.on_click(HitTarget::SidebarToggle);
+
+        let sidebar = s
+            .sidebar()
+            .expect("Cmd-T creates a sidebar-visible session");
+        assert_eq!(sidebar.items.len(), 2, "Cmd-T creates one new session");
+        assert_eq!(sidebar.active, 1, "the new session becomes active");
+        assert_eq!(
+            s.input().expect("active input").text(),
+            "",
+            "a new session starts with an empty draft"
+        );
+
+        s.on_click(HitTarget::SidebarSession(0));
+
+        assert_eq!(
+            s.sidebar().expect("sidebar remains open").active,
+            0,
+            "clicking the first row restores the first session"
+        );
+        assert_eq!(
+            s.input().expect("restored input").text(),
+            "first draft",
+            "switching back restores the per-session draft"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clicking_sidebar_add_creates_and_activates_a_fresh_session() {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        let first = s.sessions.active().expect("first session").id();
+        s.on_ime(ImeEvent::Commit("park me".to_string()));
+
+        s.on_click(HitTarget::SidebarAdd);
+        s.on_click(HitTarget::SidebarToggle);
+
+        let sidebar = s.sidebar().expect("sidebar is open");
+        assert_eq!(
+            sidebar.items.len(),
+            2,
+            "the add affordance creates a session"
+        );
+        assert_eq!(sidebar.active, 1, "the added session becomes active");
+        assert_ne!(
+            s.sessions.active().expect("added session").id(),
+            first,
+            "the added session has a fresh stable id"
+        );
+        assert_eq!(s.input().expect("added session input").text(), "");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn switching_sessions_restores_that_sessions_history_and_completion() {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        s.record_history("cargo test", InputMode::Shell);
+        s.on_ime(ImeEvent::Commit("car".to_string()));
+        let first_items = s.completion_candidates();
+        assert_eq!(
+            first_items.len(),
+            1,
+            "first session has one matching command"
+        );
+        s.completion.open_with(first_items);
+
+        s.on_key(cmd_char('t'));
+
+        assert!(
+            !s.completion().expect("active completion state").is_open(),
+            "a new session does not inherit the previous popover"
+        );
+        assert!(
+            s.completion_candidates().is_empty(),
+            "a new session starts with independent history"
+        );
+        s.record_history("new session only", InputMode::Shell);
+
+        s.on_click(HitTarget::SidebarSession(0));
+
+        assert_eq!(
+            s.input().expect("restored input").text(),
+            "car",
+            "the first session draft returns"
+        );
+        assert!(
+            s.completion().expect("restored completion state").is_open(),
+            "the first session popover returns"
+        );
+        let restored = s.completion_candidates();
+        assert_eq!(restored.len(), 1, "only the first session history matches");
+        assert_eq!(restored[0].text, "cargo test");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_autonomy_resets_on_create_and_restores_on_switch() {
+        let config = Config::default();
+        let Ok(mut s) = TerminalHost::spawn(&config) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        s.autonomy.set_mode(AutonomyMode::AutoRunInSession);
+        assert_eq!(
+            s.autonomy_mode(),
+            Some(aterm_ui::AutonomyMode::AutoRunInSession)
+        );
+
+        s.on_key(cmd_char('t'));
+
+        assert_eq!(
+            s.autonomy_mode(),
+            Some(ui_autonomy(config.default_autonomy)),
+            "a new session starts at the configured autonomy baseline"
+        );
+
+        s.on_click(HitTarget::SidebarSession(0));
+
+        assert_eq!(
+            s.autonomy_mode(),
+            Some(aterm_ui::AutonomyMode::AutoRunInSession),
+            "switching back restores the first session posture"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closing_the_active_session_selects_its_previous_neighbor() {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        let first = s.sessions.active().expect("first session").id();
+        s.on_key(cmd_char('t'));
+        let second = s.sessions.active().expect("second session").id();
+        s.on_key(cmd_char('t'));
+        let third = s.sessions.active().expect("third session").id();
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+
+        s.on_click(HitTarget::SidebarClose(2));
+
+        assert_eq!(s.sessions.iter().len(), 2, "the clicked session closes");
+        assert_eq!(
+            s.sessions.active().map(aterm_core::Session::id),
+            Some(second),
+            "closing the active tail selects its previous neighbor"
+        );
+
+        s.on_key(cmd_shift_char('w'));
+
+        assert_eq!(s.sessions.iter().len(), 1, "Cmd-Shift-W closes a session");
+        assert_eq!(
+            s.sessions.active().map(aterm_core::Session::id),
+            Some(first),
+            "the keyboard close follows the same neighbor rule"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closing_the_last_session_replaces_it_with_a_fresh_launch_session() {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        let closed = s.sessions.active().expect("initial session").id();
+        s.on_ime(ImeEvent::Commit("discard with closed session".to_string()));
+
+        s.on_key(cmd_shift_char('w'));
+
+        assert_eq!(
+            s.sessions.iter().len(),
+            1,
+            "the host always keeps one session"
+        );
+        let replacement = s.sessions.active().expect("replacement session").id();
+        assert_ne!(replacement, closed, "the closed session id is never reused");
+        assert_eq!(
+            s.input().expect("replacement input").text(),
+            "",
+            "the replacement opens in the launch state with a fresh draft"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closing_an_inactive_row_keeps_the_active_focus_unchanged() {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        s.on_key(cmd_char('t'));
+        let active = s.sessions.active().expect("new session").id();
+        s.on_ime(ImeEvent::Commit("active draft".to_string()));
+
+        s.on_click(HitTarget::SidebarClose(0));
+
+        assert_eq!(s.sessions.iter().len(), 1, "the inactive row closes");
+        assert_eq!(
+            s.sessions.active().map(aterm_core::Session::id),
+            Some(active),
+            "closing a background session does not move focus"
+        );
+        assert_eq!(
+            s.input().expect("active input").text(),
+            "active draft",
+            "the active session state is untouched"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_bindings_do_not_collide_with_window_mode_or_sidebar_chords() {
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        let initial = s.sessions.active().expect("initial session").id();
+        let initial_mode = s.input().expect("active input").mode();
+
+        s.on_key(cmd_char('w'));
+        assert_eq!(
+            s.sessions.active().map(aterm_core::Session::id),
+            Some(initial),
+            "Cmd-W remains reserved for the window"
+        );
+
+        s.on_key(cmd_char('/'));
+        assert_ne!(
+            s.input().expect("active input").mode(),
+            initial_mode,
+            "Cmd-/ still toggles the routing mode"
+        );
+        assert_eq!(s.sessions.iter().len(), 1);
+
+        s.on_key(cmd_char('b'));
+        assert!(s.sidebar().is_some(), "Cmd-B still toggles the sidebar");
+        assert_eq!(s.sessions.iter().len(), 1);
+
+        s.on_key(cmd_shift_char('w'));
+        assert_ne!(
+            s.sessions.active().expect("replacement session").id(),
+            initial,
+            "only Cmd-Shift-W closes the session"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keystrokes_reach_only_the_active_sessions_pty() {
+        fn cat_engine() -> Engine {
+            Engine::spawn_command(
+                "/bin/cat",
+                &[],
+                PtyDimensions {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                DEFAULT_SCROLLBACK,
+            )
+            .expect("test PTY should spawn")
+        }
+
+        fn send_line(host: &mut TerminalHost, line: &str) {
+            for ch in line.chars() {
+                let mut encoded = [0_u8; 4];
+                let text = ch.encode_utf8(&mut encoded);
+                host.on_key(KeyPress {
+                    named: None,
+                    ch: Some(ch),
+                    text: Some(text),
+                    mods: Default::default(),
+                });
+            }
+            host.on_key(named_key(NamedKey::Enter));
+        }
+
+        fn snapshot_text(host: &mut TerminalHost) -> String {
+            host.snapshot()
+                .expect("active snapshot")
+                .cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect()
+        }
+
+        fn wait_for_text(host: &mut TerminalHost, expected: &str) {
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if snapshot_text(host).contains(expected) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("active session never displayed {expected:?}");
+        }
+
+        let Ok(mut s) = TerminalHost::spawn(&Config::default()) else {
+            eprintln!("no login shell; skipping");
+            return;
+        };
+        let mut sessions = SessionList::new();
+        let first = sessions.create(cat_engine());
+        let second = sessions.create(cat_engine());
+        s.sessions = sessions;
+        s.parked_focus.clear();
+        s.parked_focus
+            .insert(first, SessionFocusState::fresh(s.default_autonomy));
+        s.sync_sidebar_items();
+
+        send_line(&mut s, "second-route");
+        wait_for_text(&mut s, "second-route");
+
+        s.on_click(HitTarget::SidebarSession(0));
+        assert_eq!(
+            s.sessions.active().map(aterm_core::Session::id),
+            Some(first)
+        );
+        assert!(
+            !snapshot_text(&mut s).contains("second-route"),
+            "switching reveals the first session's independent grid"
+        );
+        send_line(&mut s, "first-route");
+        wait_for_text(&mut s, "first-route");
+
+        s.on_click(HitTarget::SidebarSession(1));
+        assert_eq!(
+            s.sessions.active().map(aterm_core::Session::id),
+            Some(second)
+        );
+        let second_text = snapshot_text(&mut s);
+        assert!(second_text.contains("second-route"));
+        assert!(!second_text.contains("first-route"));
     }
 
     #[cfg(target_os = "macos")]

@@ -765,17 +765,24 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // 1. Explicitly stop the model thread. AgentInjector clones may still hold
+        // 1. Stop the whole PTY session group while the reader/model pipeline is still
+        //    live. A flooded descendant can otherwise keep the slave open after the
+        //    model stops draining, wedging `Pty::drop` in child reaping.
+        #[cfg(unix)]
+        if let Some(pgid) = self.shell_pgid {
+            let _ = crate::pty::kill_process_group(pgid);
+        }
+        // 2. Explicitly stop the model thread. AgentInjector clones may still hold
         //    mailbox senders, so sender disconnection is not a safe lifecycle signal.
         if let Some(tx) = self.to_model.take() {
             let _ = tx.send(ToModel::Shutdown);
         }
-        // 2. Join the model thread. On exit it drops its `Pty`, which kill+reaps
+        // 3. Join the model thread. On exit it drops its `Pty`, which kill+reaps
         //    the child and closes the master fd, unblocking the reader's read().
         if let Some(h) = self.model.take() {
             let _ = h.join();
         }
-        // 3. Join the now-unblocked reader thread.
+        // 4. Join the now-unblocked reader thread.
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
