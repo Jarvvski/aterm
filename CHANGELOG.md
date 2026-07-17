@@ -9,6 +9,16 @@ until the owner explicitly approves it - never auto-bump. The version of record 
 `[workspace.package].version` in the root `Cargo.toml`. New entries go on top, under
 the next version (or an `## Unreleased` heading until a version is cut).
 
+## 0.5.0 - 2026-07-17
+
+### Added
+
+- **Editor mode now has its calm writing surface.** Opening a file renders a centered
+  620px prose column with a quiet filename, dirty-state, word-count header, a mode-colored
+  caret, selection, multiline editing, undo/redo, and native IME preedit. The document and
+  unified input now share one editing implementation, while retained per-line layouts avoid
+  full-document reshaping and unchanged frames allocate nothing. (Ticket T-11.2.)
+
 ## 0.4.0 - 2026-07-17
 
 ### Added

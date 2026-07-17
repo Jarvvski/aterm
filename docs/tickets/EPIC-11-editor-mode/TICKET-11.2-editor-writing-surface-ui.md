@@ -2,7 +2,7 @@
 id: T-11.2
 epic: EPIC-11-editor-mode
 title: Editor writing-surface widget (centered prose editing)
-status: ready-for-agent
+status: done
 labels: [ui, editor, design]
 depends_on: [T-11.1, T-9.1]
 ---
@@ -27,14 +27,23 @@ Draw the editor view from the vision mock: a calm, centered writing surface (max
 
 # Acceptance criteria
 
-- [ ] The editor view renders a centered (~620px max) writing surface with the header row to spec in both themes; no hardcoded colors (all via T-9.1 tokens).
-- [ ] The caret tints to the active mode accent (shell vs agent), per ADR-0011.
-- [ ] Typing, cursor movement, selection, and IME preedit work in the surface via the shared editing core (not a duplicate implementation); a test/reference documents the reuse.
-- [ ] The header shows the filename, dirty/"edited" state, and live word count from the T-11.1 model.
-- [ ] No frame-budget regression: the T-1.8 no-per-frame-allocation assertion holds while editing (no per-keystroke full reshape).
+- [x] The editor view renders a centered (~620px max) writing surface with the header row to spec in both themes; no hardcoded colors (all via T-9.1 tokens).
+- [x] The caret tints to the active mode accent (shell vs agent), per ADR-0011.
+- [x] Typing, cursor movement, selection, and IME preedit work in the surface via the shared editing core (not a duplicate implementation); a test/reference documents the reuse.
+- [x] The header shows the filename, dirty/"edited" state, and live word count from the T-11.1 model.
+- [x] No frame-budget regression: the T-1.8 no-per-frame-allocation assertion holds while editing (no per-keystroke full reshape).
 
 # Out of scope
 
 - File open/save, dirty tracking, word-count computation, and the enter/exit transitions (T-11.1).
 - Syntax highlighting, markdown preview/rendering, LSP, multi-buffer tabs.
 - Sessions (EPIC-10), settings (EPIC-12), and the shared frame/token work (EPIC-9).
+
+# Notes
+
+2026-07-17 (agent): Extracted the inert text, selection, movement, undo, and IME behavior
+behind one crate-private `EditBuffer` implementation, driven through the public `EditEvent`
+interface by both `InputModel` and `Document`. The app now carries one borrowed `EditorView`
+through the existing renderer seam. The retained editor renderer reuses unchanged hard-line
+layouts, reports its caret rectangle to the native IME path, and has an allocation-free idle
+prepare test. `mise run fmt`, `mise run lint`, `mise run build`, and `mise run test` pass.

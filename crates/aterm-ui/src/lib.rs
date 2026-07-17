@@ -26,6 +26,7 @@ mod cell_render;
 pub mod completion_render;
 pub mod components;
 pub mod constraint;
+pub mod editor;
 pub mod fonts;
 pub mod glyph;
 pub mod gpu;
@@ -63,6 +64,7 @@ pub use components::{
     RiskState,
 };
 pub use constraint::{Align, Constraint, Placed, Sizing};
+pub use editor::EditorView;
 pub use glyph::{CellMetrics, GlyphRasterizer, RasterGlyph};
 pub use gpu::GpuRenderer;
 pub use grid_render::{FrameSize, GridRenderer};

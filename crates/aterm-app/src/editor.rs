@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use aterm_core::Document;
+use aterm_core::{Document, EditEvent};
 
 /// Which top-level surface currently owns the content area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -30,9 +30,14 @@ impl EditorSession {
         self.view
     }
 
-    #[cfg(test)]
     pub(crate) fn document(&self) -> Option<&Document> {
         self.document.as_ref()
+    }
+
+    pub(crate) fn reduce(&mut self, event: EditEvent) -> bool {
+        self.document
+            .as_mut()
+            .is_some_and(|document| document.reduce(event))
     }
 
     pub(crate) fn open(&mut self, path: &Path) -> io::Result<()> {

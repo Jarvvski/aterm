@@ -25,13 +25,14 @@ use aterm_core::{
     SessionId, SessionList, Snapshot, DEFAULT_SCROLLBACK,
 };
 use aterm_ui::{
-    ApprovalView, HitTarget, ImeEvent, KeyPress, NamedKey, OverlayRequest, OverlayWorker,
-    RiskState, SidebarItem, SidebarView, TitleBarView, UiCallbacks, Window, DEFAULT_DEBOUNCE,
+    ApprovalView, EditorView, HitTarget, ImeEvent, KeyPress, NamedKey, OverlayRequest,
+    OverlayWorker, RiskState, SidebarItem, SidebarView, TitleBarView, UiCallbacks, Window,
+    DEFAULT_DEBOUNCE,
 };
 
 use aterm_core::{
-    rank, Completion, CompletionItem, HistoryRing, HistoryScope, InputEvent, InputMode, InputModel,
-    Motion, Preedit, DEFAULT_COMPLETION_LIMIT,
+    rank, Completion, CompletionItem, EditEvent, HistoryRing, HistoryScope, InputEvent, InputMode,
+    InputModel, Motion, Preedit, DEFAULT_COMPLETION_LIMIT,
 };
 
 use crate::agent_runtime::{AgentRuntime, PendingApproval, TurnHandle};
@@ -1003,6 +1004,33 @@ fn edit_is_immediate(named: Option<NamedKey>, text: Option<&str>) -> bool {
     ) || (named.is_none() && text.is_some_and(|t| t.chars().count() > 1))
 }
 
+/// Map a writing-surface key onto the shared inert editing interface. Enter is deliberately
+/// an insertion here, while the terminal routing brain continues to own submission.
+fn editor_edit_event(key: &KeyPress<'_>) -> Option<EditEvent> {
+    let extend = key.mods.shift;
+    let motion = match key.named {
+        Some(NamedKey::ArrowLeft) => Some(Motion::Left),
+        Some(NamedKey::ArrowRight) => Some(Motion::Right),
+        Some(NamedKey::ArrowUp) => Some(Motion::Up),
+        Some(NamedKey::ArrowDown) => Some(Motion::Down),
+        Some(NamedKey::Home) => Some(Motion::Home),
+        Some(NamedKey::End) => Some(Motion::End),
+        _ => None,
+    };
+    if let Some(motion) = motion {
+        return Some(EditEvent::Move(motion, extend));
+    }
+    match key.named {
+        Some(NamedKey::Enter) => Some(EditEvent::Insert("\n".to_string())),
+        Some(NamedKey::Backspace) => Some(EditEvent::Backspace),
+        Some(NamedKey::Delete) => Some(EditEvent::Delete),
+        _ => key
+            .text
+            .filter(|text| !text.is_empty())
+            .map(|text| EditEvent::Insert(text.to_string())),
+    }
+}
+
 impl Drop for TerminalHost {
     fn drop(&mut self) {
         // Stop the agent turn before terminal teardown so a parked approval fails closed
@@ -1066,6 +1094,23 @@ impl UiCallbacks for TerminalHost {
         // cloned - the renderer only reads it; this finally makes the in-progress line
         // (and, in Agent mode, the previously feedback-less prompt) visible on screen.
         Some(&self.input)
+    }
+
+    fn editor(&self) -> Option<EditorView<'_>> {
+        if self.editor.view() != AppView::Editor {
+            return None;
+        }
+        let document = self.editor.document()?;
+        let filename = document
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("Untitled");
+        Some(EditorView {
+            document,
+            filename,
+            mode: self.input.mode(),
+        })
     }
 
     fn autonomy_mode(&self) -> Option<aterm_ui::AutonomyMode> {
@@ -1163,6 +1208,20 @@ impl UiCallbacks for TerminalHost {
             {
                 if let Err(error) = self.editor.save() {
                     log::error!("failed to save editor document: {error}");
+                }
+            } else if key.mods.cmd
+                && !key.mods.ctrl
+                && !key.mods.alt
+                && key.ch.is_some_and(|ch| ch.eq_ignore_ascii_case(&'z'))
+            {
+                self.editor.reduce(if key.mods.shift {
+                    EditEvent::Redo
+                } else {
+                    EditEvent::Undo
+                });
+            } else if !key.mods.cmd && !key.mods.ctrl && !key.mods.alt {
+                if let Some(event) = editor_edit_event(&key) {
+                    self.editor.reduce(event);
                 }
             }
             return None;
@@ -1440,6 +1499,20 @@ impl UiCallbacks for TerminalHost {
 
     fn on_ime(&mut self, event: ImeEvent) {
         if self.editor.view() == AppView::Editor {
+            let edit = match event {
+                ImeEvent::Enabled => None,
+                ImeEvent::Preedit { text, .. } if text.is_empty() => {
+                    Some(EditEvent::SetPreedit(None))
+                }
+                ImeEvent::Preedit { text, cursor } => {
+                    Some(EditEvent::SetPreedit(Some(Preedit { text, cursor })))
+                }
+                ImeEvent::Commit(text) => Some(EditEvent::CommitIme(text)),
+                ImeEvent::Disabled => Some(EditEvent::SetPreedit(None)),
+            };
+            if let Some(edit) = edit {
+                self.editor.reduce(edit);
+            }
             return;
         }
         // T-3.2 IME feed. Populate/clear the pure `InputModel`'s preedit (a transient
@@ -1550,12 +1623,100 @@ mod tests {
             return;
         };
         let path = editor_fixture("open", "one two three");
+        host.input.reduce(InputEvent::ToggleMode);
 
         host.open_file(&path).expect("open editor document");
 
+        let editor = host.editor().expect("editor view");
+        assert_eq!(editor.filename, path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(editor.document.text(), "one two three");
+        assert_eq!(editor.mode, InputMode::Agent);
         assert!(host.input().is_none(), "editor suppresses the input bar");
         assert!(host.blocks().is_none(), "editor suppresses the timeline");
         assert!(host.snapshot().is_none(), "editor suppresses the raw grid");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_typing_and_enter_edit_the_document_instead_of_routing_to_the_terminal() {
+        let Ok(mut host) = TerminalHost::spawn(&Config::default()) else {
+            return;
+        };
+        let path = editor_fixture("typing", "draft");
+        host.open_file(&path).expect("open editor document");
+
+        host.on_key(KeyPress {
+            named: None,
+            ch: Some('A'),
+            text: Some("A"),
+            mods: aterm_ui::Mods::default(),
+        });
+        host.on_key(named_key(NamedKey::Enter));
+
+        let document = host.editor().expect("editor view").document;
+        assert_eq!(document.text(), "A\ndraft");
+        assert!(document.is_dirty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_cursor_movement_and_shift_selection_drive_the_shared_editing_core() {
+        let Ok(mut host) = TerminalHost::spawn(&Config::default()) else {
+            return;
+        };
+        let path = editor_fixture("selection", "alpha beta");
+        host.open_file(&path).expect("open editor document");
+
+        host.on_key(named_key(NamedKey::End));
+        for _ in 0..4 {
+            host.on_key(KeyPress {
+                named: Some(NamedKey::ArrowLeft),
+                ch: None,
+                text: None,
+                mods: aterm_ui::Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+            });
+        }
+        host.on_key(KeyPress {
+            named: None,
+            ch: Some('g'),
+            text: Some("gamma"),
+            mods: aterm_ui::Mods::default(),
+        });
+
+        assert_eq!(
+            host.editor().expect("editor view").document.text(),
+            "alpha gamma"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_ime_preedit_is_transient_and_commit_edits_the_document() {
+        let Ok(mut host) = TerminalHost::spawn(&Config::default()) else {
+            return;
+        };
+        let path = editor_fixture("ime", "ko");
+        host.open_file(&path).expect("open editor document");
+        host.on_key(named_key(NamedKey::End));
+
+        host.on_ime(ImeEvent::Preedit {
+            text: "にほ".to_string(),
+            cursor: Some((3, 6)),
+        });
+        let document = host.editor().expect("editor view").document;
+        assert_eq!(document.text(), "ko");
+        assert_eq!(
+            document.preedit().map(|preedit| preedit.text.as_str()),
+            Some("にほ")
+        );
+
+        host.on_ime(ImeEvent::Commit("日本".to_string()));
+        let document = host.editor().expect("editor view").document;
+        assert_eq!(document.text(), "ko日本");
+        assert!(document.preedit().is_none());
         let _ = std::fs::remove_file(path);
     }
 

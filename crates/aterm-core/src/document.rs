@@ -1,13 +1,16 @@
 use std::path::{Path, PathBuf};
 
+use crate::editing::{EditBuffer, EditEvent, Preedit, Selection};
+
 /// A single editable file buffer with derived state kept current behind one small
 /// interface. File transport stays in `aterm-app`; this model is pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     path: PathBuf,
-    text: String,
+    editor: EditBuffer,
     dirty: bool,
     word_count: usize,
+    version: u64,
 }
 
 impl Document {
@@ -17,9 +20,10 @@ impl Document {
         let word_count = text.split_whitespace().count();
         Self {
             path,
-            text,
+            editor: EditBuffer::from_text(text),
             dirty: false,
             word_count,
+            version: 0,
         }
     }
 
@@ -32,7 +36,25 @@ impl Document {
     /// The editable contents.
     #[must_use]
     pub fn text(&self) -> &str {
-        &self.text
+        self.editor.text()
+    }
+
+    /// The primary caret and optional selection anchor.
+    #[must_use]
+    pub fn selection(&self) -> Selection {
+        self.editor.selection()
+    }
+
+    /// Monotonic version of the visible editing state for renderer damage gates.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// The active IME composition, if one is in progress.
+    #[must_use]
+    pub fn preedit(&self) -> Option<&Preedit> {
+        self.editor.preedit()
     }
 
     /// Whether the contents have changed since the last successful save.
@@ -50,13 +72,31 @@ impl Document {
     /// Replace the editable contents as one model transition.
     pub fn replace_text(&mut self, text: String) {
         self.word_count = text.split_whitespace().count();
-        self.text = text;
+        self.editor = EditBuffer::from_text(text);
         self.dirty = true;
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// Apply one inert text edit through the shared editing implementation.
+    pub fn reduce(&mut self, event: EditEvent) -> bool {
+        let editor_version = self.editor.version();
+        let changed = self.editor.reduce(event);
+        if self.editor.version() != editor_version {
+            self.version = self.version.wrapping_add(1);
+        }
+        if changed {
+            self.word_count = self.editor.text().split_whitespace().count();
+            self.dirty = true;
+        }
+        changed
     }
 
     /// Record that an adapter successfully persisted the current contents.
     pub fn mark_saved(&mut self) {
-        self.dirty = false;
+        if self.dirty {
+            self.dirty = false;
+            self.version = self.version.wrapping_add(1);
+        }
     }
 }
 
@@ -65,6 +105,59 @@ mod tests {
     use std::path::PathBuf;
 
     use super::Document;
+    use crate::{EditEvent, Motion, Preedit};
+
+    #[test]
+    fn editing_a_document_updates_text_dirty_state_and_word_count() {
+        let mut document = Document::from_text(PathBuf::from("notes.md"), "draft".to_string());
+        let version = document.version();
+
+        assert!(document.reduce(EditEvent::Insert("first ".to_string())));
+
+        assert_eq!(document.text(), "first draft");
+        assert_eq!(document.word_count(), 2);
+        assert!(document.is_dirty());
+        assert!(document.version() > version);
+    }
+
+    #[test]
+    fn document_selection_is_replaced_as_one_undoable_edit() {
+        let mut document = Document::from_text(PathBuf::from("notes.md"), "alpha beta".to_string());
+        document.reduce(EditEvent::Move(Motion::BufferEnd, false));
+        document.reduce(EditEvent::Move(Motion::WordLeft, false));
+        document.reduce(EditEvent::Move(Motion::End, true));
+        assert_eq!(document.selection().start(), 6);
+        assert_eq!(document.selection().end(), 10);
+
+        document.reduce(EditEvent::Insert("gamma".to_string()));
+        assert_eq!(document.text(), "alpha gamma");
+
+        document.reduce(EditEvent::Undo);
+        assert_eq!(document.text(), "alpha beta");
+    }
+
+    #[test]
+    fn document_preedit_is_transient_and_commit_is_one_undo_unit() {
+        let mut document = Document::from_text(PathBuf::from("notes.md"), "ko".to_string());
+        document.reduce(EditEvent::Move(Motion::BufferEnd, false));
+
+        document.reduce(EditEvent::SetPreedit(Some(Preedit {
+            text: "に".to_string(),
+            cursor: None,
+        })));
+        assert_eq!(document.text(), "ko");
+        assert_eq!(
+            document.preedit().map(|preedit| preedit.text.as_str()),
+            Some("に")
+        );
+
+        document.reduce(EditEvent::CommitIme("に".to_string()));
+        assert_eq!(document.text(), "koに");
+        assert!(document.preedit().is_none());
+
+        document.reduce(EditEvent::Undo);
+        assert_eq!(document.text(), "ko");
+    }
 
     #[test]
     fn opened_document_reports_its_path_text_and_word_count_without_being_dirty() {

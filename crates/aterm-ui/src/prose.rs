@@ -250,6 +250,22 @@ impl ProseShaper {
         measure_px: f32,
         line_height_px: f32,
     ) -> ProseLayout {
+        self.layout_with_last_line_width(text, family, face, px, measure_px, line_height_px)
+            .0
+    }
+
+    /// Editor-facing variant that also returns the final visual line's advance. Keeping
+    /// this crate-private avoids widening the general prose interface merely for caret
+    /// placement while still using the exact same shaping and wrapping implementation.
+    pub(crate) fn layout_with_last_line_width(
+        &mut self,
+        text: &str,
+        family: FontFamily,
+        face: FaceStyle,
+        px: f32,
+        measure_px: f32,
+        line_height_px: f32,
+    ) -> (ProseLayout, f32) {
         // Round the size ONCE here (the source) so we shape, place pens, AND later
         // rasterize at the same integer px - hinted glyphs map 1:1 under the atlas's
         // Nearest sampler, exactly as the grid rounds its px once (grid_render.rs).
@@ -259,12 +275,14 @@ impl ProseShaper {
         let mut glyphs = Vec::new();
         let mut line_index = 0usize;
         let mut max_width = 0.0f32;
+        let mut last_line_width = 0.0f32;
 
         for hard_line in text.split('\n') {
             let clusters = self.shape_clusters(hard_line, family, face, px);
             if clusters.is_empty() {
                 // A blank hard-line still occupies one line of vertical rhythm.
                 line_index += 1;
+                last_line_width = 0.0;
                 continue;
             }
             let advances: Vec<ClusterAdvance> = clusters
@@ -295,19 +313,23 @@ impl ProseShaper {
                     }
                 }
                 max_width = max_width.max(content_w);
+                last_line_width = content_w;
                 line_index += 1;
             }
         }
 
-        ProseLayout {
-            family,
-            face,
-            px,
-            glyphs,
-            line_count: line_index,
-            width: max_width,
-            height: line_index as f32 * line_height_px,
-        }
+        (
+            ProseLayout {
+                family,
+                face,
+                px,
+                glyphs,
+                line_count: line_index,
+                width: max_width,
+                height: line_index as f32 * line_height_px,
+            },
+            last_line_width,
+        )
     }
 
     /// The Regular-face ascent (px) for `family` - the first baseline offset. Uses the

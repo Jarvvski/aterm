@@ -19,9 +19,8 @@
 //! brain, T-3.3) consume it, and `aterm-ui` cannot depend on `aterm-app` (the arrow
 //! is app -> ui).
 
-/// Maximum undo depth. The buffer is one command line, so this is generous; it
-/// only bounds memory if a user types an enormous amount without submitting.
-const MAX_UNDO: usize = 1024;
+use crate::editing::{EditBuffer, EditEvent};
+pub use crate::editing::{Motion, Preedit, Selection};
 
 /// Which surface the input is currently driving. The hotkey flips ONLY this field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,64 +30,6 @@ pub enum InputMode {
     Shell,
     /// The line is composed as an agent prompt.
     Agent,
-}
-
-/// A caret with an optional selection anchor, as char offsets into the text. When
-/// `anchor == caret` the selection is collapsed (a plain caret). Multi-caret is a
-/// later concern; v1 is a single primary selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Selection {
-    /// The fixed end of the selection (where it started).
-    pub anchor: usize,
-    /// The moving end of the selection (where the caret is).
-    pub caret: usize,
-}
-
-impl Selection {
-    /// A collapsed selection (caret) at `pos`.
-    pub fn at(pos: usize) -> Self {
-        Self {
-            anchor: pos,
-            caret: pos,
-        }
-    }
-
-    /// True when nothing is selected (anchor and caret coincide).
-    pub fn is_empty(&self) -> bool {
-        self.anchor == self.caret
-    }
-
-    /// The lower char offset of the selection.
-    pub fn start(&self) -> usize {
-        self.anchor.min(self.caret)
-    }
-
-    /// The upper char offset of the selection.
-    pub fn end(&self) -> usize {
-        self.anchor.max(self.caret)
-    }
-}
-
-/// A cursor motion. Horizontal/word/line motions clear the vertical "goal column";
-/// `Up`/`Down` set and preserve it so vertical travel keeps a remembered column
-/// across shorter lines (standard editor behavior).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Motion {
-    /// One char left / right.
-    Left,
-    Right,
-    /// To the start of the previous / next whitespace-delimited token.
-    WordLeft,
-    WordRight,
-    /// To the start / end of the current line.
-    Home,
-    End,
-    /// To the start / end of the whole buffer.
-    BufferStart,
-    BufferEnd,
-    /// Up / down one line, preserving the goal column.
-    Up,
-    Down,
 }
 
 /// Events the reducer understands. All are pure state transitions; none performs
@@ -112,18 +53,6 @@ pub enum InputEvent {
     Redo,
     /// Toggle Shell <-> Agent WITHOUT touching text/selection/undo.
     ToggleMode,
-}
-
-/// Active IME composition (ticket T-3.2, via winit `Ime` events). A transient overlay
-/// the renderer splices inline under the caret; the cursor range uses winit's byte
-/// indices. Populated/cleared through [`InputModel::set_preedit`] /
-/// [`InputModel::commit_ime`], never part of the committed buffer until it commits.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Preedit {
-    /// The in-progress composition string.
-    pub text: String,
-    /// The candidate cursor range within `text` (byte indices), per winit.
-    pub cursor: Option<(usize, usize)>,
 }
 
 /// The visual category of a highlighted span - maps to a token color / decoration
@@ -181,31 +110,14 @@ pub struct GhostText {
     pub suggestion: String,
 }
 
-/// A point-in-time copy of the editable state, for undo/redo.
-#[derive(Debug, Clone)]
-struct Snapshot {
-    text: String,
-    sel: Selection,
-}
-
 /// The pure unified-input reducer: text + selection + mode, plus undo history and a
 /// vertical goal column. See the module docs for the caller-owns-submit contract.
 #[derive(Debug, Clone, Default)]
 pub struct InputModel {
-    /// Characters only; never interpreted.
-    text: String,
-    /// Primary caret + optional anchor, as char offsets.
-    sel: Selection,
+    /// Shared inert text editing behavior. Routing-specific state remains in this module.
+    editor: EditBuffer,
     /// Where Enter routes; flipped by the hotkey, text untouched.
     mode: InputMode,
-    /// Remembered column for vertical motion; `None` resets it.
-    goal_col: Option<usize>,
-    /// Undo stack (oldest first); each entry is one edit unit.
-    undo: Vec<Snapshot>,
-    /// Redo stack; cleared by any new edit.
-    redo: Vec<Snapshot>,
-    /// Active IME composition (T-3.2); a transient overlay, never part of the buffer.
-    preedit: Option<Preedit>,
     /// Async syntax-highlight overlay (T-3.5), applied by the off-thread worker via
     /// [`Self::set_highlight`]; the render path only reads it. Empty until computed.
     overlay: Highlight,
@@ -224,17 +136,17 @@ impl InputModel {
 
     /// The current text (consumed by the input widget renderer in `aterm-ui`).
     pub fn text(&self) -> &str {
-        &self.text
+        self.editor.text()
     }
 
     /// The current selection (caret + anchor).
     pub fn selection(&self) -> Selection {
-        self.sel
+        self.editor.selection()
     }
 
     /// The caret position as a char offset (the moving end of the selection).
     pub fn caret(&self) -> usize {
-        self.sel.caret
+        self.editor.caret()
     }
 
     /// The current routing target.
@@ -244,12 +156,12 @@ impl InputModel {
 
     /// True when the buffer holds no text.
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.editor.is_empty()
     }
 
     /// The active IME composition, if any (reserved for T-3.2).
     pub fn preedit(&self) -> Option<&Preedit> {
-        self.preedit.as_ref()
+        self.editor.preedit()
     }
 
     /// The async style overlay (reserved for T-3.5).
@@ -292,14 +204,12 @@ impl InputModel {
     /// - the suggestion still strict-prefixes the current text (a debounced worker can
     ///   lag; a diverged buffer neither shows nor accepts a stale tail).
     pub fn ghost_tail(&self) -> Option<&str> {
-        if self.text.is_empty() || !self.sel.is_empty() || self.sel.caret != self.char_len() {
+        let text = self.editor.text();
+        let selection = self.editor.selection();
+        if text.is_empty() || !selection.is_empty() || selection.caret != text.chars().count() {
             return None;
         }
-        let tail = self
-            .ghost
-            .as_ref()?
-            .suggestion
-            .strip_prefix(self.text.as_str())?;
+        let tail = self.ghost.as_ref()?.suggestion.strip_prefix(text)?;
         if tail.is_empty() {
             None
         } else {
@@ -321,7 +231,7 @@ impl InputModel {
             None => return false,
         };
         self.ghost = None;
-        self.insert(&tail);
+        self.editor.reduce(EditEvent::Insert(tail));
         true
     }
 
@@ -336,7 +246,7 @@ impl InputModel {
     /// The routing brain (T-3.3) reads [`Self::preedit`] first, so while this is `Some`
     /// the IME owns Enter/Tab/Esc and nothing submits or routes.
     pub fn set_preedit(&mut self, preedit: Option<Preedit>) {
-        self.preedit = preedit;
+        self.editor.reduce(EditEvent::SetPreedit(preedit));
     }
 
     /// Commit an IME composition (ticket T-3.2): clear any active preedit, then insert
@@ -346,10 +256,7 @@ impl InputModel {
     /// preedit (no insert, no undo entry), matching the empty-preedit winit sends just
     /// before a commit.
     pub fn commit_ime(&mut self, text: &str) {
-        self.preedit = None;
-        if !text.is_empty() {
-            self.insert(text);
-        }
+        self.editor.reduce(EditEvent::CommitIme(text.to_string()));
     }
 
     // --- the reducer --------------------------------------------------------
@@ -357,12 +264,24 @@ impl InputModel {
     /// Apply an event to the model. Pure: no I/O, no interpretation of the text.
     pub fn reduce(&mut self, event: InputEvent) {
         match event {
-            InputEvent::Insert(s) => self.insert(&s),
-            InputEvent::Backspace => self.backspace(),
-            InputEvent::Delete => self.delete_forward(),
-            InputEvent::Move(motion, extend) => self.move_caret(motion, extend),
-            InputEvent::Undo => self.undo(),
-            InputEvent::Redo => self.redo(),
+            InputEvent::Insert(text) => {
+                self.editor.reduce(EditEvent::Insert(text));
+            }
+            InputEvent::Backspace => {
+                self.editor.reduce(EditEvent::Backspace);
+            }
+            InputEvent::Delete => {
+                self.editor.reduce(EditEvent::Delete);
+            }
+            InputEvent::Move(motion, extend) => {
+                self.editor.reduce(EditEvent::Move(motion, extend));
+            }
+            InputEvent::Undo => {
+                self.editor.reduce(EditEvent::Undo);
+            }
+            InputEvent::Redo => {
+                self.editor.reduce(EditEvent::Redo);
+            }
             InputEvent::ToggleMode => self.toggle_mode(),
         }
     }
@@ -382,12 +301,7 @@ impl InputModel {
     /// preserved. The caller (the routing brain, T-3.3) decides *when* to call this;
     /// the buffer never decides whether Enter submits.
     pub fn take(&mut self) -> String {
-        let line = std::mem::take(&mut self.text);
-        self.sel = Selection::default();
-        self.goal_col = None;
-        self.undo.clear();
-        self.redo.clear();
-        self.preedit = None;
+        let line = self.editor.take();
         // The suggestion + highlight were for the now-submitted line; drop them so they
         // cannot carry onto the fresh empty buffer (the worker recomputes for the new
         // line). Without clearing `overlay` a stale span set would linger on the next
@@ -400,246 +314,6 @@ impl InputModel {
     /// Reset the model to empty, discarding the text (see [`take`](Self::take)).
     pub fn reset(&mut self) {
         let _ = self.take();
-    }
-
-    // --- edits --------------------------------------------------------------
-
-    fn insert(&mut self, s: &str) {
-        if s.is_empty() {
-            return;
-        }
-        // One undo unit covers the whole replace (delete-selection + insert), so a
-        // paste over a selection undoes in one step.
-        self.push_undo();
-        self.delete_selection();
-        let at = self.byte_of(self.sel.caret);
-        self.text.insert_str(at, s);
-        self.sel = Selection::at(self.sel.caret + s.chars().count());
-        self.goal_col = None;
-    }
-
-    fn backspace(&mut self) {
-        if !self.sel.is_empty() {
-            self.push_undo();
-            self.delete_selection();
-            self.goal_col = None;
-            return;
-        }
-        if self.sel.caret == 0 {
-            return;
-        }
-        self.push_undo();
-        let c = self.sel.caret;
-        let (start, end) = (self.byte_of(c - 1), self.byte_of(c));
-        self.text.replace_range(start..end, "");
-        self.sel = Selection::at(c - 1);
-        self.goal_col = None;
-    }
-
-    fn delete_forward(&mut self) {
-        if !self.sel.is_empty() {
-            self.push_undo();
-            self.delete_selection();
-            self.goal_col = None;
-            return;
-        }
-        if self.sel.caret >= self.char_len() {
-            return;
-        }
-        self.push_undo();
-        let c = self.sel.caret;
-        let (start, end) = (self.byte_of(c), self.byte_of(c + 1));
-        self.text.replace_range(start..end, "");
-        self.goal_col = None;
-    }
-
-    /// Remove the selected range (if any) and collapse the caret to its start. Does
-    /// NOT push undo - callers wrap it in a single undo unit.
-    fn delete_selection(&mut self) {
-        if self.sel.is_empty() {
-            return;
-        }
-        let (a, b) = (self.sel.start(), self.sel.end());
-        let (ba, bb) = (self.byte_of(a), self.byte_of(b));
-        self.text.replace_range(ba..bb, "");
-        self.sel = Selection::at(a);
-    }
-
-    // --- undo / redo --------------------------------------------------------
-
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            text: self.text.clone(),
-            sel: self.sel,
-        }
-    }
-
-    fn push_undo(&mut self) {
-        self.undo.push(self.snapshot());
-        if self.undo.len() > MAX_UNDO {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
-    }
-
-    fn undo(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(self.snapshot());
-            self.text = prev.text;
-            self.sel = prev.sel;
-            self.goal_col = None;
-        }
-    }
-
-    fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(self.snapshot());
-            self.text = next.text;
-            self.sel = next.sel;
-            self.goal_col = None;
-        }
-    }
-
-    // --- motions ------------------------------------------------------------
-
-    fn move_caret(&mut self, motion: Motion, extend: bool) {
-        if !matches!(motion, Motion::Up | Motion::Down) {
-            self.goal_col = None;
-        }
-        let len = self.char_len();
-        let caret = self.sel.caret;
-        let target = match motion {
-            Motion::Left => {
-                if !extend && !self.sel.is_empty() {
-                    self.sel.start()
-                } else {
-                    caret.saturating_sub(1)
-                }
-            }
-            Motion::Right => {
-                if !extend && !self.sel.is_empty() {
-                    self.sel.end()
-                } else {
-                    (caret + 1).min(len)
-                }
-            }
-            Motion::WordLeft => self.word_left(caret),
-            Motion::WordRight => self.word_right(caret),
-            Motion::Home => self.line_start(caret),
-            Motion::End => self.line_end(caret),
-            Motion::BufferStart => 0,
-            Motion::BufferEnd => len,
-            Motion::Up => self.vertical(caret, false),
-            Motion::Down => self.vertical(caret, true),
-        };
-        self.sel.caret = target;
-        if !extend {
-            self.sel.anchor = target;
-        }
-    }
-
-    fn word_left(&self, pos: usize) -> usize {
-        let chars: Vec<char> = self.text.chars().collect();
-        let mut i = pos.min(chars.len());
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        i
-    }
-
-    fn word_right(&self, pos: usize) -> usize {
-        let chars: Vec<char> = self.text.chars().collect();
-        let n = chars.len();
-        let mut i = pos.min(n);
-        while i < n && !chars[i].is_whitespace() {
-            i += 1;
-        }
-        while i < n && chars[i].is_whitespace() {
-            i += 1;
-        }
-        i
-    }
-
-    fn line_start(&self, pos: usize) -> usize {
-        let (line, _) = self.line_col(pos);
-        self.lines()[line].0
-    }
-
-    fn line_end(&self, pos: usize) -> usize {
-        let (line, _) = self.line_col(pos);
-        let (start, len) = self.lines()[line];
-        start + len
-    }
-
-    /// Move up (`down == false`) or down one line, preserving the goal column.
-    fn vertical(&mut self, pos: usize, down: bool) -> usize {
-        let lines = self.lines();
-        let (line, col) = self.line_col(pos);
-        let goal = *self.goal_col.get_or_insert(col);
-        if down {
-            if line + 1 >= lines.len() {
-                self.char_len()
-            } else {
-                let (start, line_len) = lines[line + 1];
-                start + goal.min(line_len)
-            }
-        } else if line == 0 {
-            0
-        } else {
-            let (start, line_len) = lines[line - 1];
-            start + goal.min(line_len)
-        }
-    }
-
-    // --- char/line geometry (the buffer is tiny; O(n) scans are fine) -------
-
-    fn char_len(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    /// Byte offset for a given char index (clamped to the end).
-    fn byte_of(&self, char_idx: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(char_idx)
-            .map_or(self.text.len(), |(b, _)| b)
-    }
-
-    /// The (line, column) of a char offset.
-    fn line_col(&self, pos: usize) -> (usize, usize) {
-        let mut line = 0;
-        let mut col = 0;
-        for ch in self.text.chars().take(pos) {
-            if ch == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
-    }
-
-    /// Per-line `(start_char_offset, char_len_excluding_newline)`. Always non-empty
-    /// (an empty buffer yields one zero-length line).
-    fn lines(&self) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
-        let mut start = 0;
-        let mut count = 0;
-        for (i, ch) in self.text.chars().enumerate() {
-            if ch == '\n' {
-                out.push((start, count));
-                start = i + 1;
-                count = 0;
-            } else {
-                count += 1;
-            }
-        }
-        out.push((start, count));
-        out
     }
 }
 
